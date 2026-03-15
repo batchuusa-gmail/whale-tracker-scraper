@@ -24,6 +24,7 @@ CORS(app)
 
 # SEC EDGAR Configuration
 SEC_BASE_URL = "https://www.sec.gov"
+<<<<<<< HEAD
 USER_AGENT = "WhaleTracker/1.0 (contact@whaletracker.app)"
 SEC_HEADERS = {
     'User-Agent': USER_AGENT,
@@ -35,6 +36,20 @@ SEC_HEADERS = {
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'ok', 'timestamp': datetime.now().isoformat()})
+=======
+SEC_ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/daily-index"
+USER_AGENT = "WhaleTracker batchuusa@gmail.com"
+
+# Headers for SEC requests
+SEC_HEADERS = {
+    'User-Agent': USER_AGENT,
+    'Accept-Encoding': 'gzip, deflate',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+}
+
+# Rate limiting
+SEC_DELAY = 1.0  # 1 second between requests
+>>>>>>> 649dc3c (Fix SEC scraper - switch to EDGAR search API)
 
 
 @app.route('/api/top-stocks')
@@ -86,53 +101,36 @@ def _get_top_stocks_data(limit):
                  'SQ', 'UBER', 'SNOW', 'SHOP', 'ORCL', 'CSCO', 'INTC', 'CRM', 'ADBE', 'CRM']
 =======
     def get_daily_index(self, date: datetime) -> list:
-        """Get the daily index for a specific date"""
-        year = date.year
-        month = f"{date.month:02d}"
-        day = f"{date.day:02d}"
+        """Get Form 4 filings using EDGAR full-text search API"""
+        date_str = date.strftime('%Y-%m-%d')
+        url = f"https://efts.sec.gov/LATEST/search-index?q=%22form+4%22&dateRange=custom&startdt={date_str}&enddt={date_str}&forms=4"
         
-        # Daily-index URL format: /Archives/edgar/daily-index/YYYY/QTRM/MASTER.IDX
-        quarter = (date.month - 1) // 3 + 1
-        url = f"{SEC_ARCHIVE_URL}/{year}/QTR{quarter}/master.idx"
-        
-        logger.info(f"Fetching: {url}")
+        logger.info(f"Fetching EDGAR search: {date_str}")
         self.rate_limit()
         
         try:
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
+            data = response.json()
             
-            # Parse the index file
-            lines = response.text.split('\n')
             filings = []
+            hits = data.get('hits', {}).get('hits', [])
             
-            for line in lines[10:]:  # Skip header lines
-                if not line.strip():
-                    continue
-                
-                parts = line.split('|')
-                if len(parts) >= 5:
-                    cik = parts[0].strip()
-                    name = parts[1].strip()
-                    form = parts[2].strip()
-                    date_filed = parts[3].strip()
-                    filename = parts[4].strip()
-                    
-                    # Filter for Form 4 (insider trading)
-                    if form in ['4', '4/A']:
-                        filings.append({
-                            'cik': cik,
-                            'name': name,
-                            'form': form,
-                            'date_filed': date_filed,
-                            'filename': filename
-                        })
+            for hit in hits:
+                src = hit.get('_source', {})
+                filings.append({
+                    'cik': src.get('entity_id', ''),
+                    'name': src.get('display_names', [''])[0] if src.get('display_names') else '',
+                    'form': src.get('form_type', '4'),
+                    'date_filed': src.get('file_date', date_str),
+                    'filename': src.get('file_num', '')
+                })
             
             logger.info(f"Found {len(filings)} Form 4 filings")
             return filings
             
         except Exception as e:
-            logger.error(f"Error fetching daily index: {e}")
+            logger.error(f"Error fetching EDGAR search: {e}")
             return []
 >>>>>>> 2e32494 (Fix quarter attribute)
     
