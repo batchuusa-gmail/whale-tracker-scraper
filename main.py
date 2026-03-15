@@ -24,7 +24,6 @@ CORS(app)
 
 # SEC EDGAR Configuration
 SEC_BASE_URL = "https://www.sec.gov"
-<<<<<<< HEAD
 USER_AGENT = "WhaleTracker/1.0 (contact@whaletracker.app)"
 SEC_HEADERS = {
     'User-Agent': USER_AGENT,
@@ -36,7 +35,6 @@ SEC_HEADERS = {
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'ok', 'timestamp': datetime.now().isoformat()})
-=======
 SEC_ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/daily-index"
 USER_AGENT = "WhaleTracker batchuusa@gmail.com"
 
@@ -49,7 +47,6 @@ SEC_HEADERS = {
 
 # Rate limiting
 SEC_DELAY = 1.0  # 1 second between requests
->>>>>>> 649dc3c (Fix SEC scraper - switch to EDGAR search API)
 
 
 @app.route('/api/top-stocks')
@@ -95,11 +92,9 @@ def _get_top_stocks_data(limit):
         {'ticker': 'NFLX', 'name': 'Netflix Inc.', 'sector': 'Communication Services', 'price': 605.00, 'change': 8.50, 'changePercent': 1.42, 'volume': 5500000, 'marketCap': 265000000000},
     ]
     
-<<<<<<< HEAD
     # Add more stocks to reach limit
     additional = ['JPM', 'V', 'JNJ', 'WMT', 'PG', 'UNH', 'HD', 'MA', 'DIS', 'PYPL', 
                  'SQ', 'UBER', 'SNOW', 'SHOP', 'ORCL', 'CSCO', 'INTC', 'CRM', 'ADBE', 'CRM']
-=======
     def get_daily_index(self, date: datetime) -> list:
         """Get Form 4 filings using EDGAR full-text search API"""
         date_str = date.strftime('%Y-%m-%d')
@@ -132,7 +127,6 @@ def _get_top_stocks_data(limit):
         except Exception as e:
             logger.error(f"Error fetching EDGAR search: {e}")
             return []
->>>>>>> 2e32494 (Fix quarter attribute)
     
     for i, t in enumerate(additional):
         base_stocks.append({
@@ -241,9 +235,7 @@ def _get_sample_filings(limit):
             'value': random.randint(10000, 2000000)
         })
     
-<<<<<<< HEAD
     return filings
-=======
     @app.route('/api/top-stocks')
     def get_top_stocks():
         """Get top traded stocks"""
@@ -278,7 +270,6 @@ def run_scheduler():
     while True:
         schedule.run_pending()
         time.sleep(60)
->>>>>>> 2e32494 (Fix quarter attribute)
 
 
 if __name__ == '__main__':
