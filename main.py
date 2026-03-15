@@ -2,6 +2,7 @@
 """
 SEC Form 4 Insider Trading Scraper - Flask API
 Deployed on Railway
+v1.0 - Fixed for Railway deployment
 """
 
 import os
