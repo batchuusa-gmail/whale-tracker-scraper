@@ -80,9 +80,61 @@ def _get_top_stocks_data(limit):
         {'ticker': 'NFLX', 'name': 'Netflix Inc.', 'sector': 'Communication Services', 'price': 605.00, 'change': 8.50, 'changePercent': 1.42, 'volume': 5500000, 'marketCap': 265000000000},
     ]
     
+<<<<<<< HEAD
     # Add more stocks to reach limit
     additional = ['JPM', 'V', 'JNJ', 'WMT', 'PG', 'UNH', 'HD', 'MA', 'DIS', 'PYPL', 
                  'SQ', 'UBER', 'SNOW', 'SHOP', 'ORCL', 'CSCO', 'INTC', 'CRM', 'ADBE', 'CRM']
+=======
+    def get_daily_index(self, date: datetime) -> list:
+        """Get the daily index for a specific date"""
+        year = date.year
+        month = f"{date.month:02d}"
+        day = f"{date.day:02d}"
+        
+        # Daily-index URL format: /Archives/edgar/daily-index/YYYY/QTRM/MASTER.IDX
+        quarter = (date.month - 1) // 3 + 1
+        url = f"{SEC_ARCHIVE_URL}/{year}/QTR{quarter}/master.idx"
+        
+        logger.info(f"Fetching: {url}")
+        self.rate_limit()
+        
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            
+            # Parse the index file
+            lines = response.text.split('\n')
+            filings = []
+            
+            for line in lines[10:]:  # Skip header lines
+                if not line.strip():
+                    continue
+                
+                parts = line.split('|')
+                if len(parts) >= 5:
+                    cik = parts[0].strip()
+                    name = parts[1].strip()
+                    form = parts[2].strip()
+                    date_filed = parts[3].strip()
+                    filename = parts[4].strip()
+                    
+                    # Filter for Form 4 (insider trading)
+                    if form in ['4', '4/A']:
+                        filings.append({
+                            'cik': cik,
+                            'name': name,
+                            'form': form,
+                            'date_filed': date_filed,
+                            'filename': filename
+                        })
+            
+            logger.info(f"Found {len(filings)} Form 4 filings")
+            return filings
+            
+        except Exception as e:
+            logger.error(f"Error fetching daily index: {e}")
+            return []
+>>>>>>> 2e32494 (Fix quarter attribute)
     
     for i, t in enumerate(additional):
         base_stocks.append({
@@ -191,7 +243,44 @@ def _get_sample_filings(limit):
             'value': random.randint(10000, 2000000)
         })
     
+<<<<<<< HEAD
     return filings
+=======
+    @app.route('/api/top-stocks')
+    def get_top_stocks():
+        """Get top traded stocks"""
+        return jsonify({
+            'stocks': scraper.get_top_traded_stocks()
+        })
+    
+    @app.route('/api/company/<ticker>')
+    def get_company(ticker):
+        """Get company analysis"""
+        return jsonify(scraper.get_company_analysis(ticker))
+    
+    return app
+
+
+def run_scheduler():
+    """Run the scraper on a schedule"""
+    scraper = SECScraper()
+    
+    # Run every hour
+    schedule.every().hour.do(scraper.run)
+    
+    # Also run at specific times
+    schedule.every().day.at("09:00").do(scraper.run)  # Market open
+    schedule.every().day.at("16:00").do(scraper.run)  # Market close
+    
+    logger.info("Scheduler started")
+    
+    # Run once on startup
+    scraper.run()
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+>>>>>>> 2e32494 (Fix quarter attribute)
 
 
 if __name__ == '__main__':
