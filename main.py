@@ -75,7 +75,8 @@ class SECScraper:
         day = f"{date.day:02d}"
         
         # Daily-index URL format: /Archives/edgar/daily-index/YYYY/QTRM/MASTER.IDX
-        url = f"{SEC_ARCHIVE_URL}/{year}/QTR{date.quarter}/master.idx"
+        quarter = (date.month - 1) // 3 + 1
+        url = f"{SEC_ARCHIVE_URL}/{year}/QTR{quarter}/master.idx"
         
         logger.info(f"Fetching: {url}")
         self.rate_limit()
@@ -332,8 +333,8 @@ def run_scheduler():
     schedule.every().hour.do(scraper.run)
     
     # Also run at specific times
-    schedule.every().day().at("09:00").do(scraper.run)  # Market open
-    schedule.every().day().at("16:00").do(scraper.run)  # Market close
+    schedule.every().day.at("09:00").do(scraper.run)  # Market open
+    schedule.every().day.at("16:00").do(scraper.run)  # Market close
     
     logger.info("Scheduler started")
     
