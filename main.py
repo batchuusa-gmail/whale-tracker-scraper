@@ -115,7 +115,15 @@ class SECScraper:
 
     def _parse_xml_into(self, filing, xml_text):
         try:
-            root = ET.fromstring(xml_text)
+            # Try standard parser first, fall back to lxml recover mode
+            try:
+                root = ET.fromstring(xml_text)
+            except ET.ParseError:
+                from lxml import etree as lxml_et
+                parser = lxml_et.XMLParser(recover=True)
+                lxml_root = lxml_et.fromstring(xml_text.encode(), parser)
+                xml_text = lxml_et.tostring(lxml_root).decode()
+                root = ET.fromstring(xml_text)
             def ft(path):
                 el = root.find(path)
                 return el.text.strip() if el is not None and el.text else ''
