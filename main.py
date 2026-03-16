@@ -253,3 +253,7 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port, debug=False)
     else:
         run_scheduler()
+
+
+# Module-level app for gunicorn: gunicorn --bind 0.0.0.0:$PORT main:app
+app = create_app()
