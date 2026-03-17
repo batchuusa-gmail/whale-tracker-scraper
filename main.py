@@ -194,22 +194,52 @@ class SECScraper:
             filing_url = filing.get('filing_url', '')
             if not filing_url:
                 return filing
-            self.rate_limit()
-            resp = self.session.get(filing_url, timeout=15)
-            if resp.status_code != 200:
+
+            # Extract accession number from URL
+            # URL format: .../edgar/data/{cik}/{accession}-index.htm
+            acc_match = re.search(r'/(\d+)/(\d{18}|\d{10}-\d{2}-\d{6})-index', filing_url)
+            if not acc_match:
                 return filing
-            soup = BeautifulSoup(resp.content, 'html.parser')
-            xml_link = None
-            for a in soup.find_all('a', href=True):
-                h = a['href']
-                if h.endswith('.xml') and '/Archives/' in h:
-                    xml_link = f"{SEC_BASE_URL}{h}" if h.startswith('/') else h
-                    break
-            if xml_link:
+
+            cik = acc_match.group(1)
+            raw_acc = acc_match.group(2).replace('-', '')
+            # Format: XXXXXXXXXX-YY-ZZZZZZ
+            formatted = f"{raw_acc[:10]}-{raw_acc[10:12]}-{raw_acc[12:]}"
+            clean = raw_acc  # no dashes
+
+            # Try direct XML URL patterns
+            xml_urls = [
+                f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{clean}/{formatted}.xml",
+                f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{clean}/xslF345X05/{formatted}.xml",
+            ]
+
+            xml_text = None
+            for xml_url in xml_urls:
                 self.rate_limit()
-                xr = self.session.get(xml_link, timeout=15)
-                if xr.status_code == 200:
-                    self._parse_xml_into(filing, xr.text)
+                xr = self.session.get(xml_url, timeout=15)
+                if xr.status_code == 200 and '<ownershipDocument' in xr.text:
+                    xml_text = xr.text
+                    break
+
+            # If direct URL failed, try index page to find XML
+            if not xml_text:
+                self.rate_limit()
+                resp = self.session.get(filing_url, timeout=15)
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.content, 'html.parser')
+                    for a in soup.find_all('a', href=True):
+                        h = a['href']
+                        if h.endswith('.xml'):
+                            xml_url = f"{SEC_BASE_URL}{h}" if h.startswith('/') else h
+                            self.rate_limit()
+                            xr = self.session.get(xml_url, timeout=15)
+                            if xr.status_code == 200 and len(xr.text) > 100:
+                                xml_text = xr.text
+                                break
+
+            if xml_text:
+                self._parse_xml_into(filing, xml_text)
+
         except Exception as e:
             logger.error(f"Enrich error: {e}")
         return filing
