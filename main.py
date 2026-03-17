@@ -309,6 +309,9 @@ class SECScraper:
                 elif is_ten_pct.strip() == '1':
                     filing['owner_type'] = '10% Owner'
 
+            # DEBUG: log first 500 chars of XML to see structure
+            logger.info(f"XML preview: {xml_text[:500]}")
+
             # Find all elements and build a flat dict for easy access
             all_elements = {}
             for elem in root.iter():
