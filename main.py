@@ -446,10 +446,25 @@ class SECScraper:
                 f['stock_price'] = quotes[ticker]['stock_price']
                 f['stock_change_pct'] = quotes[ticker]['stock_change_pct']
 
+        # Deduplicate by accession number (last part of filing_url)
+        seen_accessions = set()
+        deduped = []
+        for f in enriched:
+            url = f.get('filing_url', '')
+            # Extract accession number from URL
+            acc_match = re.search(r'(\d{10}-\d{2}-\d{6})', url)
+            accession = acc_match.group(1) if acc_match else url
+            key = f"{accession}_{f.get('owner_name', '')}"
+            if key not in seen_accessions:
+                seen_accessions.add(key)
+                deduped.append(f)
+
+        logger.info(f"Deduplicated: {len(enriched)} -> {len(deduped)} filings")
+
         # Save to Supabase
         rows_to_save = []
-        for f in enriched:
-            if f.get('filing_url'):
+        for f in deduped:
+            if f.get('filing_url') and f.get('ticker'):
                 rows_to_save.append({
                     'ticker': f.get('ticker', ''),
                     'company_name': f.get('company_name', ''),
@@ -470,7 +485,7 @@ class SECScraper:
         if rows_to_save:
             self.db.upsert('filings', rows_to_save)
 
-        _filings_cache = enriched
+        _filings_cache = deduped
         _last_updated = datetime.now().isoformat()
         logger.info(f"Done — cached {len(_filings_cache)} filings, saved to Supabase")
         return {'filings_found': len(_filings_cache), 'timestamp': _last_updated}
