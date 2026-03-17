@@ -195,50 +195,66 @@ class SECScraper:
             if not filing_url:
                 return filing
 
-            # Extract accession number from URL
-            # URL format: .../edgar/data/{cik}/{accession}-index.htm
-            acc_match = re.search(r'/(\d+)/(\d{18}|\d{10}-\d{2}-\d{6})-index', filing_url)
-            if not acc_match:
+            # Step 1: fetch the index page
+            self.rate_limit()
+            resp = self.session.get(filing_url, timeout=15)
+            if resp.status_code != 200:
                 return filing
 
-            cik = acc_match.group(1)
-            raw_acc = acc_match.group(2).replace('-', '')
-            # Format: XXXXXXXXXX-YY-ZZZZZZ
-            formatted = f"{raw_acc[:10]}-{raw_acc[10:12]}-{raw_acc[12:]}"
-            clean = raw_acc  # no dashes
+            soup = BeautifulSoup(resp.content, 'html.parser')
 
-            # Try direct XML URL patterns
-            xml_urls = [
-                f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{clean}/{formatted}.xml",
-                f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{clean}/xslF345X05/{formatted}.xml",
-            ]
+            # Step 2: find the XML document link from the filing index table
+            # SEC index pages have a table with document type, description, and link
+            xml_url = None
 
-            xml_text = None
-            for xml_url in xml_urls:
+            # Look for rows in the document table
+            for row in soup.find_all('tr'):
+                cells = row.find_all('td')
+                if len(cells) >= 3:
+                    # Check if this row contains an XML file for Form 4
+                    row_text = row.get_text().lower()
+                    for cell in cells:
+                        a = cell.find('a', href=True)
+                        if a:
+                            href = a['href']
+                            # Find .xml that is NOT the stylesheet (xsl)
+                            if (href.endswith('.xml') and
+                                'xsl' not in href.lower() and
+                                'R9999' not in href):
+                                xml_url = f"{SEC_BASE_URL}{href}" if href.startswith('/') else href
+                                break
+                    if xml_url:
+                        break
+
+            # Fallback: find any .xml link that looks like form 4 data
+            if not xml_url:
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    if (href.endswith('.xml') and
+                        '/Archives/edgar/' in href and
+                        'xsl' not in href.lower()):
+                        xml_url = f"{SEC_BASE_URL}{href}" if href.startswith('/') else href
+                        break
+
+            # Step 3: fetch the actual XML
+            if xml_url:
                 self.rate_limit()
                 xr = self.session.get(xml_url, timeout=15)
-                if xr.status_code == 200 and '<ownershipDocument' in xr.text:
-                    xml_text = xr.text
-                    break
-
-            # If direct URL failed, try index page to find XML
-            if not xml_text:
-                self.rate_limit()
-                resp = self.session.get(filing_url, timeout=15)
-                if resp.status_code == 200:
-                    soup = BeautifulSoup(resp.content, 'html.parser')
-                    for a in soup.find_all('a', href=True):
-                        h = a['href']
-                        if h.endswith('.xml'):
-                            xml_url = f"{SEC_BASE_URL}{h}" if h.startswith('/') else h
-                            self.rate_limit()
-                            xr = self.session.get(xml_url, timeout=15)
-                            if xr.status_code == 200 and len(xr.text) > 100:
-                                xml_text = xr.text
-                                break
-
-            if xml_text:
-                self._parse_xml_into(filing, xml_text)
+                if xr.status_code == 200:
+                    # Verify it's actual Form 4 XML not HTML
+                    if '<ownershipDocument' in xr.text or '<XML>' in xr.text:
+                        xml_text = xr.text
+                        # Handle wrapped XML (inside <XML> tags)
+                        if '<XML>' in xml_text:
+                            start = xml_text.find('<XML>') + 5
+                            end = xml_text.find('</XML>')
+                            if end > start:
+                                xml_text = xml_text[start:end].strip()
+                        self._parse_xml_into(filing, xml_text)
+                    else:
+                        logger.warning(f"Got HTML instead of XML from {xml_url}")
+            else:
+                logger.warning(f"No XML link found in index: {filing_url}")
 
         except Exception as e:
             logger.error(f"Enrich error: {e}")
@@ -308,9 +324,6 @@ class SECScraper:
                     filing['owner_type'] = 'Director'
                 elif is_ten_pct.strip() == '1':
                     filing['owner_type'] = '10% Owner'
-
-            # DEBUG: log first 500 chars of XML to see structure
-            logger.info(f"XML preview: {xml_text[:500]}")
 
             # Find all elements and build a flat dict for easy access
             all_elements = {}
