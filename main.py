@@ -30,7 +30,7 @@ SUPABASE_HEADERS = {
     'apikey': SUPABASE_KEY,
     'Authorization': f'Bearer {SUPABASE_KEY}',
     'Content-Type': 'application/json',
-    'Prefer': 'resolution=ignore-duplicates,return=minimal',
+    'Prefer': 'resolution=merge-duplicates,return=minimal',
 }
 
 _filings_cache = []
@@ -309,68 +309,95 @@ class SECScraper:
                 elif is_ten_pct.strip() == '1':
                     filing['owner_type'] = '10% Owner'
 
-            # Find transactions — try multiple tag names
+            # Find all elements and build a flat dict for easy access
+            all_elements = {}
+            for elem in root.iter():
+                tag = elem.tag.lower().strip()
+                if elem.text and elem.text.strip():
+                    all_elements[tag] = elem.text.strip()
+
+            # Extract ticker - try multiple variations
+            ticker_keys = ['issuertradingsymbol', 'tradingsymbol', 'ticker']
+            for key in ticker_keys:
+                if key in all_elements and all_elements[key]:
+                    filing['ticker'] = all_elements[key].upper().strip()
+                    break
+
+            # Extract issuer name
+            name_keys = ['issuername', 'companyname', 'entityname']
+            for key in name_keys:
+                if key in all_elements and all_elements[key]:
+                    filing['company_name'] = all_elements[key].strip()
+                    break
+
+            # Extract owner name
+            owner_keys = ['rptownername', 'ownername', 'reportingownername']
+            for key in owner_keys:
+                if key in all_elements and all_elements[key]:
+                    filing['owner_name'] = all_elements[key].strip()
+                    break
+
+            # Owner type
+            if all_elements.get('isofficer') == '1':
+                filing['owner_type'] = all_elements.get('officertitle', 'Officer')
+            elif all_elements.get('isdirector') == '1':
+                filing['owner_type'] = 'Director'
+            elif all_elements.get('istenpercentowner') == '1':
+                filing['owner_type'] = '10% Owner'
+
+            logger.info(f"Parsed: ticker={filing.get('ticker')} owner={filing.get('owner_name')} company={filing.get('company_name')}")
+
+            # Find transactions - check both nonDerivative and derivative
             txs = root.findall('.//nonDerivativeTransaction')
             if not txs:
-                txs = [e for e in root.iter() if 'nonderivativetransaction' in e.tag.lower()]
+                txs = root.findall('.//derivativeTransaction')
+            if not txs:
+                # Try case-insensitive search
+                txs = [e for e in root.iter() if 'transaction' in e.tag.lower()
+                       and e.tag.lower() not in ('transactioncode', 'transactiondate',
+                       'transactionshares', 'transactionpricepershare', 'transactiontimeliness')]
 
             if txs:
                 tx = txs[0]
-                # Find transaction code
-                code = ''
+                tx_elements = {}
                 for elem in tx.iter():
-                    if 'transactioncode' in elem.tag.lower() and elem.text:
-                        code = elem.text.strip()
-                        break
+                    tag = elem.tag.lower().strip()
+                    if elem.text and elem.text.strip():
+                        tx_elements[tag] = elem.text.strip()
+                    # Also check value sub-elements
+                    val = elem.find('value')
+                    if val is not None and val.text and val.text.strip():
+                        tx_elements[tag + '_value'] = val.text.strip()
 
-                # Find shares
+                code = tx_elements.get('transactioncode', '')
                 shares = 0
-                for elem in tx.iter():
-                    if 'transactionshares' in elem.tag.lower():
-                        val = elem.find('value') or elem.find('.//value')
-                        if val is not None and val.text:
-                            try: shares = float(val.text)
-                            except: pass
-                        break
-
-                # Find price
                 price = 0
-                for elem in tx.iter():
-                    if 'transactionpricepershare' in elem.tag.lower():
-                        val = elem.find('value') or elem.find('.//value')
-                        if val is not None and val.text:
-                            try: price = float(val.text)
-                            except: pass
-                        break
-
-                # Find date
                 tx_date = None
-                for elem in tx.iter():
-                    if 'transactiondate' in elem.tag.lower():
-                        val = elem.find('value') or elem.find('.//value')
-                        if val is not None and val.text:
-                            tx_date = val.text.strip()
-                        break
-
-                # Find shares owned after
                 owned = 0
-                for elem in tx.iter():
-                    if 'sharesownedfollowingtransaction' in elem.tag.lower():
-                        val = elem.find('value') or elem.find('.//value')
-                        if val is not None and val.text:
-                            try: owned = float(val.text)
-                            except: pass
-                        break
 
-                filing['transaction_type'] = 'Buy' if code in ('P', 'A') else 'Sell' if code in ('S', 'D', 'F') else code
+                try: shares = float(tx_elements.get('transactionshares_value') or tx_elements.get('transactionshares', 0))
+                except: pass
+                try: price = float(tx_elements.get('transactionpricepershare_value') or tx_elements.get('transactionpricepershare', 0))
+                except: pass
+                try: tx_date = tx_elements.get('transactiondate_value') or tx_elements.get('transactiondate')
+                except: pass
+                try: owned = float(tx_elements.get('sharesownedfollowingtransaction_value') or tx_elements.get('sharesownedfollowingtransaction', 0))
+                except: pass
+
+                # For derivatives, use underlying shares if available
+                if shares == 0:
+                    try: shares = float(tx_elements.get('underlyingsecuritiestransacted_value', 0))
+                    except: pass
+
+                filing['transaction_type'] = 'Buy' if code in ('P', 'A', 'M') else 'Sell' if code in ('S', 'D', 'F', 'X') else code
                 filing['shares'] = int(shares)
                 filing['price'] = round(price, 2)
                 filing['value'] = round(shares * price, 2)
                 filing['transaction_date'] = tx_date
                 filing['shares_owned_after'] = int(owned)
-                logger.info(f"Transaction: type={filing['transaction_type']} shares={filing['shares']} price={filing['price']} value={filing['value']}")
+                logger.info(f"Transaction: code={code} type={filing['transaction_type']} shares={filing['shares']} price={filing['price']} value={filing['value']}")
             else:
-                logger.warning(f"No nonDerivativeTransaction found for {filing.get('ticker', '?')}")
+                logger.warning(f"No transactions found for {filing.get('ticker', '?')}")
 
         except Exception as e:
             logger.error(f"XML parse error: {e}", exc_info=True)
