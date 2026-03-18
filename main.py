@@ -146,7 +146,7 @@ class SECScraper:
     def rate_limit(self):
         time.sleep(SEC_DELAY + random.uniform(0, 0.3))
 
-    def fetch_atom_feed(self, limit=50):
+    def fetch_atom_feed(self, limit=100):
         results = []
         try:
             url = f"{SEC_BASE_URL}/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count={limit}&search_text=&output=atom"
@@ -423,7 +423,7 @@ class SECScraper:
         logger.info("=" * 50)
         logger.info("Fetching Form 4 filings from SEC EDGAR...")
 
-        filings = self.fetch_atom_feed(limit=60)
+        filings = self.fetch_atom_feed(limit=100)
         enriched = []
         for i, f in enumerate(filings):
             try:
@@ -446,17 +446,20 @@ class SECScraper:
                 f['stock_price'] = quotes[ticker]['stock_price']
                 f['stock_change_pct'] = quotes[ticker]['stock_change_pct']
 
-        # Deduplicate by accession number (last part of filing_url)
-        seen_accessions = set()
+        # Deduplicate by ticker + owner + transaction_type + date
+        seen = set()
         deduped = []
         for f in enriched:
-            url = f.get('filing_url', '')
-            # Extract accession number from URL
-            acc_match = re.search(r'(\d{10}-\d{2}-\d{6})', url)
-            accession = acc_match.group(1) if acc_match else url
-            key = f"{accession}_{f.get('owner_name', '')}"
-            if key not in seen_accessions:
-                seen_accessions.add(key)
+            ticker = f.get('ticker', '')
+            owner = f.get('owner_name', '')
+            tx_type = f.get('transaction_type', '')
+            date = f.get('transaction_date', f.get('filed_at', ''))
+            shares = f.get('shares', 0)
+            # Use ticker+owner+shares as key to avoid true duplicates
+            # but keep different insiders from same company
+            key = f"{ticker}_{owner}_{shares}_{tx_type}"
+            if key not in seen:
+                seen.add(key)
                 deduped.append(f)
 
         logger.info(f"Deduplicated: {len(enriched)} -> {len(deduped)} filings")
