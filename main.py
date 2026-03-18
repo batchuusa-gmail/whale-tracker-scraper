@@ -439,12 +439,20 @@ class SECScraper:
         logger.info(f"Fetching Yahoo Finance prices for {len(tickers)} tickers...")
         quotes = YahooFinance.get_quotes_batch(tickers[:30])  # limit to 30
 
-        # Add stock prices to filings
+        # Add stock prices to filings + calculate value for RSU/option exercises
         for f in enriched:
             ticker = f.get('ticker', '')
             if ticker in quotes:
                 f['stock_price'] = quotes[ticker]['stock_price']
                 f['stock_change_pct'] = quotes[ticker]['stock_change_pct']
+                # Fix RSU/option exercises with no price (code M, A, F)
+                # Use current stock price to estimate value
+                if f.get('value', 0) == 0 and f.get('shares', 0) > 0:
+                    stock_price = quotes[ticker]['stock_price']
+                    if stock_price > 0:
+                        f['price'] = stock_price
+                        f['value'] = round(f['shares'] * stock_price, 2)
+                        logger.info(f"Calculated RSU value for {ticker}: {f['shares']} shares × ${stock_price} = ${f['value']}")
 
         # Deduplicate by ticker + owner + transaction_type + date
         seen = set()
@@ -588,6 +596,32 @@ def create_app():
         else:
             results = db.get_recent('filings', limit=limit)
         return jsonify({'filings': results, 'total': len(results)})
+
+    @app.route('/api/chart/<ticker>')
+    def chart(ticker):
+        """Get Yahoo Finance chart data for a ticker"""
+        try:
+            period = request.args.get('period', '1mo')
+            interval = request.args.get('interval', '1d')
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={period}"
+            headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'}
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data.get('chart', {}).get('result', [{}])[0]
+                timestamps = result.get('timestamp', [])
+                closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
+                meta = result.get('meta', {})
+                points = [{'t': t, 'c': round(c, 2)} for t, c in zip(timestamps, closes) if c is not None]
+                return jsonify({
+                    'ticker': ticker.upper(),
+                    'points': points,
+                    'current': meta.get('regularMarketPrice', 0),
+                    'prev_close': meta.get('chartPreviousClose', 0),
+                })
+        except Exception as e:
+            logger.error(f"Chart error for {ticker}: {e}")
+        return jsonify({'ticker': ticker.upper(), 'points': [], 'current': 0, 'prev_close': 0})
 
     def startup():
         time.sleep(3)
