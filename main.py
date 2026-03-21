@@ -1,656 +1,528 @@
-#!/usr/bin/env python3
-"""
-SEC Form 4 Insider Trading Scraper
-- Real data from SEC EDGAR ATOM feed
-- Saves to Supabase for historical storage
-- Enriches with Yahoo Finance stock prices
-"""
-import os, re, json, time, random, requests, threading
+import os
+import json
+import time
+import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request
-from flask_cors import CORS
-import schedule
+from supabase import create_client, Client
+import yfinance as yf
+from apscheduler.schedulers.background import BackgroundScheduler
+import threading
 import logging
-from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-load_dotenv()
 
-SEC_BASE_URL = "https://www.sec.gov"
-USER_AGENT = "WhaleTracker batchuusa@gmail.com"
-SEC_HEADERS = {'User-Agent': USER_AGENT, 'Accept-Encoding': 'gzip, deflate', 'Accept': '*/*'}
-SEC_DELAY = 0.6
+app = Flask(__name__)
 
-SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg')
-SUPABASE_HEADERS = {
-    'apikey': SUPABASE_KEY,
-    'Authorization': f'Bearer {SUPABASE_KEY}',
-    'Content-Type': 'application/json',
-    'Prefer': 'resolution=merge-duplicates,return=minimal',
+# ── Supabase ──────────────────────────────────────────────────
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ── Major tickers to track historically ──────────────────────
+MAJOR_TICKERS = [
+    # Big Tech
+    'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'META', 'NVDA', 'TSLA',
+    'NFLX', 'ORCL', 'CRM', 'ADBE', 'INTC', 'AMD', 'QCOM', 'AVGO',
+    'TXN', 'MU', 'AMAT', 'LRCX', 'KLAC', 'SNOW', 'PLTR', 'COIN',
+    # Finance
+    'JPM', 'BAC', 'WFC', 'GS', 'MS', 'BLK', 'V', 'MA', 'PYPL', 'AXP',
+    'C', 'USB', 'PNC', 'TFC', 'SCHW', 'BX', 'KKR', 'APO',
+    # Healthcare
+    'JNJ', 'PFE', 'MRK', 'ABBV', 'LLY', 'BMY', 'AMGN', 'GILD',
+    'MRNA', 'BNTX', 'REGN', 'VRTX', 'ILMN', 'ISRG',
+    # Energy
+    'XOM', 'CVX', 'COP', 'SLB', 'EOG', 'PXD', 'OXY', 'VLO', 'MPC',
+    # Consumer
+    'WMT', 'COST', 'TGT', 'HD', 'LOW', 'NKE', 'SBUX', 'MCD',
+    'KO', 'PEP', 'PM', 'MO', 'CL', 'PG', 'UL',
+    # EV & Mobility
+    'RIVN', 'LCID', 'F', 'GM', 'UBER', 'LYFT',
+    # Communication
+    'DIS', 'CMCSA', 'T', 'VZ', 'TMUS', 'CHTR',
+    # Other majors
+    'BRK-B', 'UNH', 'LMT', 'RTX', 'BA', 'CAT', 'DE', 'HON',
+    'ABNB', 'BKNG', 'EXPE', 'RBLX', 'HOOD', 'SOFI',
+    'SHOP', 'SQ', 'TWLO', 'ZM', 'DOCU', 'OKTA',
+    'SPCE', 'ASTS', 'RKLB', 'LUNR',
+]
+
+SEC_HEADERS = {
+    'User-Agent': 'WhaleTracker contact@whaletracker.app',
+    'Accept-Encoding': 'gzip, deflate',
 }
 
-_filings_cache = []
-_last_updated = None
+# ── Helper: get stock price ───────────────────────────────────
+def get_stock_price(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.fast_info
+        price = float(info.last_price or 0)
+        prev = float(info.previous_close or 0)
+        change_pct = ((price - prev) / prev * 100) if prev else 0
+        return round(price, 2), round(change_pct, 2)
+    except:
+        return 0.0, 0.0
 
+# ── Parse SEC Form 4 XML ──────────────────────────────────────
+def parse_form4_xml(xml_url):
+    """Parse a Form 4 XML file and return list of transactions"""
+    try:
+        r = requests.get(xml_url, headers=SEC_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
 
-# ─── Supabase ────────────────────────────────────────────────────
+        def ft(el, *tags):
+            for tag in tags:
+                found = el.find(f'.//{tag}')
+                if found is not None and found.text:
+                    return found.text.strip()
+            return ''
 
-class SupabaseClient:
-    def __init__(self):
-        self.base = f"{SUPABASE_URL}/rest/v1"
+        issuer = root.find('.//issuer')
+        ticker = ft(issuer, 'issuerTradingSymbol') if issuer else ''
+        company = ft(issuer, 'issuerName') if issuer else ''
+        if not ticker:
+            return []
 
-    def upsert(self, table, rows):
-        if not rows:
-            return
-        try:
-            resp = requests.post(
-                f"{self.base}/{table}",
-                headers=SUPABASE_HEADERS,
-                json=rows,
-                timeout=15,
-            )
-            if resp.status_code in (200, 201, 204):
-                logger.info(f"Saved {len(rows)} rows to Supabase {table}")
-            else:
-                logger.error(f"Supabase upsert error: {resp.status_code} {resp.text[:200]}")
-        except Exception as e:
-            logger.error(f"Supabase upsert exception: {e}")
+        owner = root.find('.//reportingOwner')
+        owner_name = ft(owner, 'rptOwnerName') if owner else ''
+        officer_title = ft(owner, 'officerTitle') if owner else ''
+        is_director = ft(owner, 'isDirector') if owner else '0'
+        is_officer = ft(owner, 'isOfficer') if owner else '0'
+        is_ten_pct = ft(owner, 'isTenPercentOwner') if owner else '0'
 
-    def get_recent(self, table, limit=100):
-        try:
-            resp = requests.get(
-                f"{self.base}/{table}?order=filed_at.desc&limit={limit}",
-                headers=SUPABASE_HEADERS,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            logger.error(f"Supabase get error: {e}")
-        return []
+        if officer_title:
+            owner_type = officer_title
+        elif is_director == '1':
+            owner_type = 'Director'
+        elif is_ten_pct == '1':
+            owner_type = '10% Owner'
+        elif is_officer == '1':
+            owner_type = 'Officer'
+        else:
+            owner_type = 'Insider'
 
-    def get_summary(self):
-        try:
-            resp = requests.get(
-                f"{self.base}/filings?select=transaction_type,value",
-                headers=SUPABASE_HEADERS,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            logger.error(f"Supabase summary error: {e}")
-        return []
-
-    def get_by_ticker(self, ticker, limit=50):
-        try:
-            resp = requests.get(
-                f"{self.base}/filings?ticker=eq.{ticker}&order=filed_at.desc&limit={limit}",
-                headers=SUPABASE_HEADERS,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            logger.error(f"Supabase ticker error: {e}")
-        return []
-
-
-# ─── Yahoo Finance ───────────────────────────────────────────────
-
-class YahooFinance:
-    HEADERS = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'}
-
-    @staticmethod
-    def get_quote(ticker):
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d"
-            resp = requests.get(url, headers=YahooFinance.HEADERS, timeout=8)
-            if resp.status_code == 200:
-                data = resp.json()
-                result = data.get('chart', {}).get('result', [{}])[0]
-                meta = result.get('meta', {})
-                price = meta.get('regularMarketPrice', 0)
-                prev = meta.get('chartPreviousClose', meta.get('previousClose', price))
-                change_pct = ((price - prev) / prev * 100) if prev else 0
-                return {
-                    'stock_price': round(float(price), 2),
-                    'stock_change_pct': round(float(change_pct), 2),
-                }
-        except Exception as e:
-            logger.error(f"Yahoo Finance error for {ticker}: {e}")
-        return {'stock_price': 0.0, 'stock_change_pct': 0.0}
-
-    @staticmethod
-    def get_quotes_batch(tickers):
-        results = {}
-        for ticker in tickers:
-            if ticker:
-                results[ticker] = YahooFinance.get_quote(ticker)
-                time.sleep(0.2)
-        return results
-
-
-# ─── SEC Scraper ─────────────────────────────────────────────────
-
-class SECScraper:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update(SEC_HEADERS)
-        self.db = SupabaseClient()
-
-    def rate_limit(self):
-        time.sleep(SEC_DELAY + random.uniform(0, 0.3))
-
-    def fetch_atom_feed(self, limit=100):
-        results = []
-        try:
-            url = f"{SEC_BASE_URL}/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count={limit}&search_text=&output=atom"
-            self.rate_limit()
-            resp = self.session.get(url, timeout=20)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            ns = {'atom': 'http://www.w3.org/2005/Atom'}
-            entries = root.findall('atom:entry', ns)
-            logger.info(f"ATOM feed: {len(entries)} entries")
-            for entry in entries:
-                try:
-                    title = entry.findtext('atom:title', '', ns)
-                    updated = entry.findtext('atom:updated', '', ns)
-                    link_el = entry.find('atom:link', ns)
-                    filing_url = link_el.get('href', '') if link_el is not None else ''
-                    ticker_match = re.search(r'\(([A-Z]{1,5})\)', title)
-                    company_match = re.search(r'4\s*-\s*(.+?)\s*\(', title)
-                    ticker = ticker_match.group(1) if ticker_match else ''
-                    company = company_match.group(1).strip() if company_match else title
-                    results.append({
-                        'ticker': ticker,
-                        'company_name': company,
-                        'filing_url': filing_url,
-                        'filed_at': updated[:10] if updated else '',
-                        'owner_name': '',
-                        'owner_type': '',
-                        'transaction_type': '',
-                        'shares': 0,
-                        'price': 0.0,
-                        'value': 0.0,
-                        'transaction_date': None,
-                        'shares_owned_after': 0,
-                        'stock_price': 0.0,
-                        'stock_change_pct': 0.0,
-                    })
-                except Exception as e:
-                    logger.error(f"Entry parse error: {e}")
-        except Exception as e:
-            logger.error(f"ATOM feed error: {e}")
-        return results
-
-    def enrich_from_xml(self, filing):
-        try:
-            filing_url = filing.get('filing_url', '')
-            if not filing_url:
-                return filing
-
-            # Step 1: fetch the index page
-            self.rate_limit()
-            resp = self.session.get(filing_url, timeout=15)
-            if resp.status_code != 200:
-                return filing
-
-            soup = BeautifulSoup(resp.content, 'html.parser')
-
-            # Step 2: find the XML document link from the filing index table
-            # SEC index pages have a table with document type, description, and link
-            xml_url = None
-
-            # Look for rows in the document table
-            for row in soup.find_all('tr'):
-                cells = row.find_all('td')
-                if len(cells) >= 3:
-                    # Check if this row contains an XML file for Form 4
-                    row_text = row.get_text().lower()
-                    for cell in cells:
-                        a = cell.find('a', href=True)
-                        if a:
-                            href = a['href']
-                            # Find .xml that is NOT the stylesheet (xsl)
-                            if (href.endswith('.xml') and
-                                'xsl' not in href.lower() and
-                                'R9999' not in href):
-                                xml_url = f"{SEC_BASE_URL}{href}" if href.startswith('/') else href
-                                break
-                    if xml_url:
-                        break
-
-            # Fallback: find any .xml link that looks like form 4 data
-            if not xml_url:
-                for a in soup.find_all('a', href=True):
-                    href = a['href']
-                    if (href.endswith('.xml') and
-                        '/Archives/edgar/' in href and
-                        'xsl' not in href.lower()):
-                        xml_url = f"{SEC_BASE_URL}{href}" if href.startswith('/') else href
-                        break
-
-            # Step 3: fetch the actual XML
-            if xml_url:
-                self.rate_limit()
-                xr = self.session.get(xml_url, timeout=15)
-                if xr.status_code == 200:
-                    # Verify it's actual Form 4 XML not HTML
-                    if '<ownershipDocument' in xr.text or '<XML>' in xr.text:
-                        xml_text = xr.text
-                        # Handle wrapped XML (inside <XML> tags)
-                        if '<XML>' in xml_text:
-                            start = xml_text.find('<XML>') + 5
-                            end = xml_text.find('</XML>')
-                            if end > start:
-                                xml_text = xml_text[start:end].strip()
-                        self._parse_xml_into(filing, xml_text)
-                    else:
-                        logger.warning(f"Got HTML instead of XML from {xml_url}")
-            else:
-                logger.warning(f"No XML link found in index: {filing_url}")
-
-        except Exception as e:
-            logger.error(f"Enrich error: {e}")
-        return filing
-
-    def _parse_xml_into(self, filing, xml_text):
-        try:
-            # Try to parse XML, use lxml recovery if needed
-            root = None
+        transactions = []
+        for tx in root.findall('.//nonDerivativeTransaction'):
             try:
-                root = ET.fromstring(xml_text)
-            except ET.ParseError:
-                try:
-                    from lxml import etree as lxml_et
-                    parser = lxml_et.XMLParser(recover=True)
-                    lxml_root = lxml_et.fromstring(xml_text.encode(), parser)
-                    xml_text = lxml_et.tostring(lxml_root).decode()
-                    root = ET.fromstring(xml_text)
-                except Exception as ex:
-                    logger.error(f"XML recovery failed: {ex}")
-                    return
-
-            if root is None:
-                return
-
-            def ft(path):
-                # Try with and without namespace
-                el = root.find(path)
-                if el is None:
-                    # Try finding by tag name only
-                    tag = path.split('/')[-1]
-                    for elem in root.iter():
-                        if elem.tag.lower().endswith(tag.lower()):
-                            return elem.text.strip() if elem.text else ''
-                return el.text.strip() if el is not None and el.text else ''
-
-            # Always extract from XML — don't rely on ATOM title
-            ticker = ft('.//issuerTradingSymbol') or ft('issuerTradingSymbol')
-            issuer_name = ft('.//issuerName') or ft('issuerName')
-            owner_name = ft('.//rptOwnerName') or ft('rptOwnerName')
-
-            if ticker:
-                filing['ticker'] = ticker.upper().strip()
-            if issuer_name:
-                filing['company_name'] = issuer_name.strip()
-            if owner_name:
-                filing['owner_name'] = owner_name.strip()
-
-            logger.info(f"Parsed: ticker={filing.get('ticker')} owner={filing.get('owner_name')} company={filing.get('company_name')}")
-
-            # Owner relationship
-            rel = root.find('.//reportingOwnerRelationship')
-            if rel is None:
-                for elem in root.iter():
-                    if 'relationship' in elem.tag.lower():
-                        rel = elem
-                        break
-
-            if rel is not None:
-                is_officer = rel.findtext('isOfficer') or rel.findtext('.//isOfficer') or ''
-                is_director = rel.findtext('isDirector') or rel.findtext('.//isDirector') or ''
-                is_ten_pct = rel.findtext('isTenPercentOwner') or rel.findtext('.//isTenPercentOwner') or ''
-                officer_title = rel.findtext('officerTitle') or rel.findtext('.//officerTitle') or ''
-                if is_officer.strip() == '1':
-                    filing['owner_type'] = officer_title or 'Officer'
-                elif is_director.strip() == '1':
-                    filing['owner_type'] = 'Director'
-                elif is_ten_pct.strip() == '1':
-                    filing['owner_type'] = '10% Owner'
-
-            # Find all elements and build a flat dict for easy access
-            all_elements = {}
-            for elem in root.iter():
-                tag = elem.tag.lower().strip()
-                if elem.text and elem.text.strip():
-                    all_elements[tag] = elem.text.strip()
-
-            # Extract ticker - try multiple variations
-            ticker_keys = ['issuertradingsymbol', 'tradingsymbol', 'ticker']
-            for key in ticker_keys:
-                if key in all_elements and all_elements[key]:
-                    filing['ticker'] = all_elements[key].upper().strip()
-                    break
-
-            # Extract issuer name
-            name_keys = ['issuername', 'companyname', 'entityname']
-            for key in name_keys:
-                if key in all_elements and all_elements[key]:
-                    filing['company_name'] = all_elements[key].strip()
-                    break
-
-            # Extract owner name
-            owner_keys = ['rptownername', 'ownername', 'reportingownername']
-            for key in owner_keys:
-                if key in all_elements and all_elements[key]:
-                    filing['owner_name'] = all_elements[key].strip()
-                    break
-
-            # Owner type
-            if all_elements.get('isofficer') == '1':
-                filing['owner_type'] = all_elements.get('officertitle', 'Officer')
-            elif all_elements.get('isdirector') == '1':
-                filing['owner_type'] = 'Director'
-            elif all_elements.get('istenpercentowner') == '1':
-                filing['owner_type'] = '10% Owner'
-
-            logger.info(f"Parsed: ticker={filing.get('ticker')} owner={filing.get('owner_name')} company={filing.get('company_name')}")
-
-            # Find transactions - check both nonDerivative and derivative
-            txs = root.findall('.//nonDerivativeTransaction')
-            if not txs:
-                txs = root.findall('.//derivativeTransaction')
-            if not txs:
-                # Try case-insensitive search
-                txs = [e for e in root.iter() if 'transaction' in e.tag.lower()
-                       and e.tag.lower() not in ('transactioncode', 'transactiondate',
-                       'transactionshares', 'transactionpricepershare', 'transactiontimeliness')]
-
-            if txs:
-                tx = txs[0]
-                tx_elements = {}
-                for elem in tx.iter():
-                    tag = elem.tag.lower().strip()
-                    if elem.text and elem.text.strip():
-                        tx_elements[tag] = elem.text.strip()
-                    # Also check value sub-elements
-                    val = elem.find('value')
-                    if val is not None and val.text and val.text.strip():
-                        tx_elements[tag + '_value'] = val.text.strip()
-
-                code = tx_elements.get('transactioncode', '')
-                shares = 0
-                price = 0
-                tx_date = None
-                owned = 0
-
-                try: shares = float(tx_elements.get('transactionshares_value') or tx_elements.get('transactionshares', 0))
-                except: pass
-                try: price = float(tx_elements.get('transactionpricepershare_value') or tx_elements.get('transactionpricepershare', 0))
-                except: pass
-                try: tx_date = tx_elements.get('transactiondate_value') or tx_elements.get('transactiondate')
-                except: pass
-                try: owned = float(tx_elements.get('sharesownedfollowingtransaction_value') or tx_elements.get('sharesownedfollowingtransaction', 0))
-                except: pass
-
-                # For derivatives, use underlying shares if available
-                if shares == 0:
-                    try: shares = float(tx_elements.get('underlyingsecuritiestransacted_value', 0))
-                    except: pass
-
-                filing['transaction_type'] = 'Buy' if code in ('P', 'A', 'M') else 'Sell' if code in ('S', 'D', 'F', 'X') else code
-                filing['shares'] = int(shares)
-                filing['price'] = round(price, 2)
-                filing['value'] = round(shares * price, 2)
-                filing['transaction_date'] = tx_date
-                filing['shares_owned_after'] = int(owned)
-                logger.info(f"Transaction: code={code} type={filing['transaction_type']} shares={filing['shares']} price={filing['price']} value={filing['value']}")
-            else:
-                logger.warning(f"No transactions found for {filing.get('ticker', '?')}")
-
-        except Exception as e:
-            logger.error(f"XML parse error: {e}", exc_info=True)
-
-    def run(self):
-        global _filings_cache, _last_updated
-        logger.info("=" * 50)
-        logger.info("Fetching Form 4 filings from SEC EDGAR...")
-
-        filings = self.fetch_atom_feed(limit=100)
-        enriched = []
-        for i, f in enumerate(filings):
-            try:
-                enriched.append(self.enrich_from_xml(f))
-                if i % 5 == 0:
-                    logger.info(f"Enriched {i+1}/{len(filings)}")
+                code = ft(tx, 'transactionCode')
+                if code not in ['P', 'S']:
+                    continue
+                shares = float(ft(tx, 'transactionShares') or ft(tx, 'value') or '0')
+                price = float(ft(tx, 'transactionPricePerShare') or '0')
+                date = ft(tx, 'transactionDate')
+                shares_after = float(ft(tx, 'sharesOwnedFollowingTransaction') or '0')
+                value = shares * price
+                if shares <= 0:
+                    continue
+                transactions.append({
+                    'ticker': ticker.upper().strip(),
+                    'company_name': company,
+                    'owner_name': owner_name,
+                    'owner_type': owner_type,
+                    'transaction_type': 'Buy' if code == 'P' else 'Sell',
+                    'shares': shares,
+                    'price': price,
+                    'value': value,
+                    'transaction_date': date,
+                    'filed_at': datetime.now().strftime('%Y-%m-%d'),
+                    'filing_url': xml_url,
+                    'shares_owned_after': shares_after,
+                    'stock_price': 0.0,
+                    'stock_change_pct': 0.0,
+                })
             except Exception as e:
-                logger.error(f"Error enriching {i}: {e}")
-                enriched.append(f)
+                logger.error(f'TX parse error: {e}')
+        return transactions
+    except Exception as e:
+        logger.error(f'XML parse error {xml_url}: {e}')
+        return []
 
-        # Get unique tickers and fetch stock prices
-        tickers = list(set(f['ticker'] for f in enriched if f.get('ticker')))
-        logger.info(f"Fetching Yahoo Finance prices for {len(tickers)} tickers...")
-        quotes = YahooFinance.get_quotes_batch(tickers[:30])  # limit to 30
+# ── Get filings index for a CIK ──────────────────────────────
+def get_cik_for_ticker(ticker):
+    """Get SEC CIK number for a ticker"""
+    try:
+        url = f'https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&dateRange=custom&startdt=2020-01-01&forms=4'
+        r = requests.get(url, headers=SEC_HEADERS, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            hits = data.get('hits', {}).get('hits', [])
+            if hits:
+                return hits[0].get('_source', {}).get('period_of_report', '')
+    except:
+        pass
 
-        # Add stock prices to filings + calculate value for RSU/option exercises
-        for f in enriched:
-            ticker = f.get('ticker', '')
-            if ticker in quotes:
-                f['stock_price'] = quotes[ticker]['stock_price']
-                f['stock_change_pct'] = quotes[ticker]['stock_change_pct']
-                # Fix RSU/option exercises with no price (code M, A, F)
-                # Use current stock price to estimate value
-                if f.get('value', 0) == 0 and f.get('shares', 0) > 0:
-                    stock_price = quotes[ticker]['stock_price']
-                    if stock_price > 0:
-                        f['price'] = stock_price
-                        f['value'] = round(f['shares'] * stock_price, 2)
-                        logger.info(f"Calculated RSU value for {ticker}: {f['shares']} shares × ${stock_price} = ${f['value']}")
+    # Try company search
+    try:
+        url = f'https://www.sec.gov/cgi-bin/browse-edgar?company=&CIK={ticker}&type=4&dateb=&owner=include&count=1&search_text=&action=getcompany&output=atom'
+        r = requests.get(url, headers=SEC_HEADERS, timeout=10)
+        if r.status_code == 200:
+            root = ET.fromstring(r.content)
+            entries = root.findall('.//{http://www.w3.org/2005/Atom}entry')
+            if entries:
+                link = entries[0].find('{http://www.w3.org/2005/Atom}link')
+                if link is not None:
+                    href = link.get('href', '')
+                    # Extract CIK from URL
+                    import re
+                    match = re.search(r'CIK=(\d+)', href)
+                    if match:
+                        return match.group(1)
+    except:
+        pass
+    return None
 
-        # Deduplicate by ticker + owner + transaction_type + date
-        seen = set()
-        deduped = []
-        for f in enriched:
-            ticker = f.get('ticker', '')
-            owner = f.get('owner_name', '')
-            tx_type = f.get('transaction_type', '')
-            date = f.get('transaction_date', f.get('filed_at', ''))
-            shares = f.get('shares', 0)
-            # Use ticker+owner+shares as key to avoid true duplicates
-            # but keep different insiders from same company
-            key = f"{ticker}_{owner}_{shares}_{tx_type}"
-            if key not in seen:
-                seen.add(key)
-                deduped.append(f)
+def get_historical_filings_for_ticker(ticker, years_back=3):
+    """Pull all Form 4 filings for a specific ticker going back N years"""
+    logger.info(f'Pulling historical filings for {ticker}...')
+    all_filings = []
 
-        logger.info(f"Deduplicated: {len(enriched)} -> {len(deduped)} filings")
+    try:
+        # Use SEC EDGAR full-text search
+        url = f'https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&forms=4&dateRange=custom&startdt={(datetime.now() - timedelta(days=365*years_back)).strftime("%Y-%m-%d")}&enddt={datetime.now().strftime("%Y-%m-%d")}'
+        r = requests.get(url, headers=SEC_HEADERS, timeout=15)
 
-        # Save to Supabase
-        rows_to_save = []
-        for f in deduped:
-            if f.get('filing_url') and f.get('ticker'):
-                rows_to_save.append({
-                    'ticker': f.get('ticker', ''),
-                    'company_name': f.get('company_name', ''),
-                    'owner_name': f.get('owner_name', ''),
-                    'owner_type': f.get('owner_type', ''),
-                    'transaction_type': f.get('transaction_type', ''),
-                    'shares': f.get('shares', 0),
-                    'price': f.get('price', 0),
-                    'value': f.get('value', 0),
-                    'transaction_date': f.get('transaction_date'),
-                    'filed_at': f.get('filed_at') or None,
-                    'filing_url': f.get('filing_url', ''),
-                    'shares_owned_after': f.get('shares_owned_after', 0),
-                    'stock_price': f.get('stock_price', 0),
-                    'stock_change_pct': f.get('stock_change_pct', 0),
-                })
+        if r.status_code == 200:
+            data = r.json()
+            hits = data.get('hits', {}).get('hits', [])
+            logger.info(f'{ticker}: found {len(hits)} filings in search')
 
-        if rows_to_save:
-            self.db.upsert('filings', rows_to_save)
+            for hit in hits[:50]:  # Max 50 per ticker
+                try:
+                    source = hit.get('_source', {})
+                    file_date = source.get('file_date', '')
+                    entity_id = source.get('entity_id', '')
+                    accession = hit.get('_id', '').replace('-', '')
 
-        _filings_cache = deduped
-        _last_updated = datetime.now().isoformat()
-        logger.info(f"Done — cached {len(_filings_cache)} filings, saved to Supabase")
-        return {'filings_found': len(_filings_cache), 'timestamp': _last_updated}
+                    if entity_id and accession:
+                        # Build XML URL
+                        xml_url = f'https://www.sec.gov/Archives/edgar/data/{entity_id}/{accession}/{accession}-index.htm'
+                        # Try to find the actual XML
+                        idx_r = requests.get(xml_url, headers=SEC_HEADERS, timeout=10)
+                        if idx_r.status_code == 200:
+                            import re
+                            xml_files = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_r.text)
+                            for xf in xml_files:
+                                filings = parse_form4_xml('https://www.sec.gov' + xf)
+                                if filings:
+                                    # Update filed_at with actual date
+                                    for f in filings:
+                                        f['filed_at'] = file_date or f['filed_at']
+                                    all_filings.extend(filings)
+                                    break
+                    time.sleep(0.1)
+                except Exception as e:
+                    logger.error(f'Hit parse error: {e}')
+                    continue
 
+    except Exception as e:
+        logger.error(f'Historical fetch error for {ticker}: {e}')
 
-# ─── Flask API ────────────────────────────────────────────────────
-
-def create_app():
-    app = Flask(__name__)
-    CORS(app)
-    scraper = SECScraper()
-    db = SupabaseClient()
-
-    @app.route('/api/health')
-    def health():
-        return jsonify({
-            'status': 'ok',
-            'timestamp': datetime.now().isoformat(),
-            'filings_cached': len(_filings_cache),
-            'last_updated': _last_updated,
-        })
-
-    @app.route('/api/filings')
-    def get_filings():
-        limit = request.args.get('limit', 50, type=int)
-        tx_type = request.args.get('type', '')
-        ticker = request.args.get('ticker', '')
-        source = request.args.get('source', 'cache')  # 'cache' or 'db'
-
-        if source == 'db':
-            results = db.get_recent('filings', limit=limit)
-        else:
-            results = list(_filings_cache)
-
-        if tx_type:
-            results = [f for f in results if f.get('transaction_type', '').lower() == tx_type.lower()]
-        if ticker:
-            results = [f for f in results if f.get('ticker', '').upper() == ticker.upper()]
-
-        return jsonify({'filings': results[:limit], 'total': len(results), 'last_updated': _last_updated})
-
-    @app.route('/api/filings/refresh')
-    def refresh():
-        thread = threading.Thread(target=scraper.run, daemon=True)
-        thread.start()
-        return jsonify({'status': 'refreshing'})
-
-    @app.route('/api/summary')
-    def summary():
-        # Use Supabase for accurate historical summary
-        all_rows = db.get_summary()
-        buys = [r for r in all_rows if r.get('transaction_type') == 'Buy']
-        sells = [r for r in all_rows if r.get('transaction_type') == 'Sell']
-        total_value = sum(float(r.get('value', 0) or 0) for r in all_rows)
-
-        # Top buys/sells from cache for speed
-        cache_buys = sorted([f for f in _filings_cache if f.get('transaction_type') == 'Buy'],
-                            key=lambda x: x.get('value', 0), reverse=True)[:5]
-        cache_sells = sorted([f for f in _filings_cache if f.get('transaction_type') == 'Sell'],
-                             key=lambda x: x.get('value', 0), reverse=True)[:5]
-
-        return jsonify({
-            'total_filings': len(all_rows) or len(_filings_cache),
-            'buys': len(buys) or len([f for f in _filings_cache if f.get('transaction_type') == 'Buy']),
-            'sells': len(sells) or len([f for f in _filings_cache if f.get('transaction_type') == 'Sell']),
-            'total_value': total_value,
-            'top_buys': cache_buys,
-            'top_sells': cache_sells,
-            'last_updated': _last_updated,
-        })
-
-    @app.route('/api/company/<ticker>')
-    def company(ticker):
-        # Check Supabase first for historical data
-        results = db.get_by_ticker(ticker.upper(), limit=50)
-        if not results:
-            results = [f for f in _filings_cache if f.get('ticker', '').upper() == ticker.upper()]
-        return jsonify({'ticker': ticker.upper(), 'filings': results, 'count': len(results)})
-
-    @app.route('/api/top-stocks')
-    def top_stocks():
-        counts = {}
-        for f in _filings_cache:
-            t = f.get('ticker', '')
-            if t:
-                counts[t] = counts.get(t, 0) + 1
-        sorted_t = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-        return jsonify({'stocks': [{'ticker': t, 'count': c} for t, c in sorted_t[:30]]})
-
-    @app.route('/api/history')
-    def history():
-        """Get historical filings from Supabase"""
-        limit = request.args.get('limit', 100, type=int)
-        ticker = request.args.get('ticker', '')
-        if ticker:
-            results = db.get_by_ticker(ticker.upper(), limit=limit)
-        else:
-            results = db.get_recent('filings', limit=limit)
-        return jsonify({'filings': results, 'total': len(results)})
-
-    @app.route('/api/chart/<ticker>')
-    def chart(ticker):
-        """Get Yahoo Finance chart data for a ticker"""
+    # Fallback: use EDGAR RSS for ticker
+    if not all_filings:
         try:
-            period = request.args.get('period', '1mo')
-            interval = request.args.get('interval', '1d')
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={period}"
-            headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'}
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                result = data.get('chart', {}).get('result', [{}])[0]
-                timestamps = result.get('timestamp', [])
-                closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
-                meta = result.get('meta', {})
-                points = [{'t': t, 'c': round(c, 2)} for t, c in zip(timestamps, closes) if c is not None]
-                return jsonify({
-                    'ticker': ticker.upper(),
-                    'points': points,
-                    'current': meta.get('regularMarketPrice', 0),
-                    'prev_close': meta.get('chartPreviousClose', 0),
-                })
+            url = f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=&CIK={ticker}&type=4&dateb=&owner=include&count=40&search_text=&output=atom'
+            r = requests.get(url, headers=SEC_HEADERS, timeout=15)
+            if r.status_code == 200:
+                root = ET.fromstring(r.content)
+                entries = root.findall('.//{http://www.w3.org/2005/Atom}entry')
+                logger.info(f'{ticker} RSS: found {len(entries)} entries')
+
+                for entry in entries[:20]:
+                    try:
+                        link = entry.find('{http://www.w3.org/2005/Atom}link')
+                        if link is None:
+                            continue
+                        filing_index_url = link.get('href', '')
+                        if not filing_index_url:
+                            continue
+
+                        # Get the index page and find XML
+                        idx_r = requests.get(filing_index_url, headers=SEC_HEADERS, timeout=10)
+                        if idx_r.status_code != 200:
+                            continue
+
+                        import re
+                        xml_files = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_r.text)
+                        for xf in xml_files:
+                            filings = parse_form4_xml('https://www.sec.gov' + xf)
+                            if filings:
+                                all_filings.extend(filings)
+                                break
+                        time.sleep(0.1)
+                    except Exception as e:
+                        logger.error(f'RSS entry error: {e}')
+                        continue
         except Exception as e:
-            logger.error(f"Chart error for {ticker}: {e}")
-        return jsonify({'ticker': ticker.upper(), 'points': [], 'current': 0, 'prev_close': 0})
+            logger.error(f'RSS fallback error for {ticker}: {e}')
 
-    def startup():
-        time.sleep(3)
-        scraper.run()
+    logger.info(f'{ticker}: total {len(all_filings)} transactions found')
+    return all_filings
 
-    threading.Thread(target=startup, daemon=True).start()
-    return app
+def scrape_recent_feed(max_entries=500):
+    """Scrape recent SEC EDGAR Form 4 feed"""
+    all_filings = []
+    seen_urls = set()
+    import re
 
+    feeds = [
+        f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=100&start={i*100}&output=atom'
+        for i in range(5)
+    ]
 
-def run_scheduler():
-    scraper = SECScraper()
-    schedule.every(30).minutes.do(scraper.run)
-    schedule.every().day.at("09:30").do(scraper.run)
-    schedule.every().day.at("12:00").do(scraper.run)
-    schedule.every().day.at("16:00").do(scraper.run)
-    logger.info("Scheduler started")
-    scraper.run()
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    for feed_url in feeds:
+        if len(all_filings) >= max_entries:
+            break
+        try:
+            r = requests.get(feed_url, headers=SEC_HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.content)
+            entries = root.findall('.//{http://www.w3.org/2005/Atom}entry')
+            logger.info(f'Feed {feed_url[-20:]}: {len(entries)} entries')
 
+            for entry in entries:
+                if len(all_filings) >= max_entries:
+                    break
+                link = entry.find('{http://www.w3.org/2005/Atom}link')
+                if link is None:
+                    continue
+                url = link.get('href', '')
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
 
-# For gunicorn
-app = create_app()
+                idx_r = requests.get(url, headers=SEC_HEADERS, timeout=10)
+                if idx_r.status_code != 200:
+                    continue
+
+                xml_files = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_r.text)
+                for xf in xml_files:
+                    filings = parse_form4_xml('https://www.sec.gov' + xf)
+                    if filings:
+                        all_filings.extend(filings)
+                        break
+                time.sleep(0.1)
+        except Exception as e:
+            logger.error(f'Feed error: {e}')
+
+    logger.info(f'Recent feed total: {len(all_filings)}')
+    return all_filings
+
+def store_filings(filings):
+    """Deduplicate and store filings in Supabase"""
+    if not filings:
+        return 0
+
+    # Get stock prices in batch
+    price_cache = {}
+    stored = 0
+
+    for f in filings:
+        try:
+            ticker = f['ticker']
+            if ticker not in price_cache:
+                price, chg = get_stock_price(ticker)
+                price_cache[ticker] = (price, chg)
+                time.sleep(0.05)
+
+            f['stock_price'] = price_cache[ticker][0]
+            f['stock_change_pct'] = price_cache[ticker][1]
+
+            supabase.table('filings').upsert(
+                f,
+                on_conflict='ticker,owner_name,transaction_date,transaction_type,shares'
+            ).execute()
+            stored += 1
+        except Exception as e:
+            logger.error(f'Store error: {e}')
+
+    logger.info(f'Stored {stored}/{len(filings)} filings')
+    return stored
+
+def pull_historical_major_tickers():
+    """Pull 3 years of history for all major tickers"""
+    logger.info('=== PULLING HISTORICAL DATA FOR MAJOR TICKERS ===')
+    all_filings = []
+
+    for i, ticker in enumerate(MAJOR_TICKERS):
+        logger.info(f'[{i+1}/{len(MAJOR_TICKERS)}] Pulling history for {ticker}')
+        filings = get_historical_filings_for_ticker(ticker, years_back=3)
+        all_filings.extend(filings)
+
+        # Store in batches of 50
+        if len(all_filings) >= 50:
+            store_filings(all_filings)
+            all_filings = []
+        time.sleep(0.2)
+
+    # Store remaining
+    if all_filings:
+        store_filings(all_filings)
+
+    logger.info('=== HISTORICAL PULL COMPLETE ===')
+
+def full_refresh():
+    """Pull recent filings + major ticker history"""
+    logger.info('=== FULL REFRESH STARTED ===')
+
+    # 1. Pull recent feed (last 500 filings)
+    recent = scrape_recent_feed(500)
+    store_filings(recent)
+
+    # 2. Pull major ticker history in background
+    threading.Thread(target=pull_historical_major_tickers, daemon=True).start()
+
+    logger.info('=== REFRESH INITIATED ===')
+
+# ── API Routes ─────────────────────────────────────────────────
+@app.route('/api/health')
+def health():
+    return jsonify({'status': 'ok', 'timestamp': datetime.now().isoformat()})
+
+@app.route('/api/summary')
+def summary():
+    try:
+        result = supabase.table('filings').select('*').order('filed_at', desc=True).limit(1000).execute()
+        filings = result.data or []
+        buys = [f for f in filings if f.get('transaction_type') == 'Buy']
+        sells = [f for f in filings if f.get('transaction_type') == 'Sell']
+        return jsonify({
+            'total_filings': len(filings),
+            'total_buys': len(buys),
+            'total_sells': len(sells),
+            'total_value': sum(f.get('value', 0) for f in filings),
+            'buy_value': sum(f.get('value', 0) for f in buys),
+            'sell_value': sum(f.get('value', 0) for f in sells),
+            'sentiment': 'Bullish' if len(buys) > len(sells) else 'Bearish',
+            'last_updated': filings[0].get('filed_at', '') if filings else '',
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/filings')
+def get_filings():
+    try:
+        limit = min(int(request.args.get('limit', 100)), 500)
+        tx_type = request.args.get('type', '')
+        ticker = request.args.get('ticker', '').upper()
+        query = supabase.table('filings').select('*').order('filed_at', desc=True)
+        if tx_type:
+            query = query.eq('transaction_type', tx_type)
+        if ticker:
+            query = query.eq('ticker', ticker)
+        result = query.limit(limit).execute()
+        return jsonify(result.data or [])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/filings/refresh')
+def refresh():
+    threading.Thread(target=full_refresh, daemon=True).start()
+    return jsonify({'status': 'started', 'message': 'Pulling recent filings + 3 years history for 70+ major tickers'})
+
+@app.route('/api/filings/history-pull')
+def history_pull():
+    """Trigger historical pull for major tickers only"""
+    threading.Thread(target=pull_historical_major_tickers, daemon=True).start()
+    return jsonify({'status': 'started', 'message': f'Pulling 3yr history for {len(MAJOR_TICKERS)} major tickers'})
+
+@app.route('/api/company/<ticker>')
+def get_company(ticker):
+    try:
+        result = supabase.table('filings').select('*')\
+            .eq('ticker', ticker.upper())\
+            .order('transaction_date', desc=True)\
+            .limit(50).execute()
+        return jsonify(result.data or [])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/top-stocks')
+def top_stocks():
+    try:
+        result = supabase.table('filings').select('ticker,company_name,transaction_type,value')\
+            .order('value', desc=True).limit(500).execute()
+        ticker_data = {}
+        for f in (result.data or []):
+            t = f['ticker']
+            if t not in ticker_data:
+                ticker_data[t] = {'ticker': t, 'company_name': f['company_name'],
+                    'buy_value': 0, 'sell_value': 0, 'buy_count': 0, 'sell_count': 0}
+            if f['transaction_type'] == 'Buy':
+                ticker_data[t]['buy_value'] += f.get('value', 0)
+                ticker_data[t]['buy_count'] += 1
+            else:
+                ticker_data[t]['sell_value'] += f.get('value', 0)
+                ticker_data[t]['sell_count'] += 1
+        stocks = sorted(ticker_data.values(),
+            key=lambda x: x['buy_value'] + x['sell_value'], reverse=True)[:20]
+        return jsonify(stocks)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/history')
+def history():
+    try:
+        days = int(request.args.get('days', 30))
+        since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        result = supabase.table('filings').select('*')\
+            .gte('transaction_date', since)\
+            .order('transaction_date', desc=True)\
+            .limit(500).execute()
+        return jsonify(result.data or [])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/chart/<ticker>')
+def chart(ticker):
+    try:
+        period = request.args.get('period', '1mo')
+        interval = request.args.get('interval', '1d')
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period, interval=interval)
+        if hist.empty:
+            return jsonify({'error': 'No data', 'points': []}), 404
+        points = [{'o': round(float(r['Open']),2), 'h': round(float(r['High']),2),
+            'l': round(float(r['Low']),2), 'c': round(float(r['Close']),2),
+            'v': int(r['Volume']), 't': ts.isoformat()}
+            for ts, r in hist.iterrows()]
+        current = round(float(hist['Close'].iloc[-1]), 2)
+        prev_close = round(float(hist['Close'].iloc[-2]), 2) if len(hist) > 1 else current
+        return jsonify({'ticker': ticker.upper(), 'period': period,
+            'interval': interval, 'current': current, 'prev_close': prev_close, 'points': points})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/search')
+def search():
+    try:
+        q = request.args.get('q', '').upper()
+        if not q:
+            return jsonify([])
+        result = supabase.table('filings').select('ticker,company_name')\
+            .or_(f'ticker.ilike.%{q}%,company_name.ilike.%{q}%').limit(20).execute()
+        seen = set()
+        stocks = []
+        for f in (result.data or []):
+            if f['ticker'] not in seen:
+                seen.add(f['ticker'])
+                stocks.append({'ticker': f['ticker'], 'company_name': f['company_name']})
+        return jsonify(stocks)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── Auto refresh every 6 hours ────────────────────────────────
+scheduler = BackgroundScheduler()
+scheduler.add_job(full_refresh, 'interval', hours=6)
+scheduler.start()
 
 if __name__ == '__main__':
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == 'api':
-        port = int(os.getenv('PORT', 5000))
-        app.run(host='0.0.0.0', port=port, debug=False)
-    else:
-        run_scheduler()
+    # Pull history on startup
+    threading.Thread(target=full_refresh, daemon=True).start()
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
