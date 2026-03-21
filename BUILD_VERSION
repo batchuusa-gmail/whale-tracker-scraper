@@ -1,3 +1,3 @@
 # Build cache bust
 # This file forces Railway to rebuild
-VERSION=2
+VERSION=3
