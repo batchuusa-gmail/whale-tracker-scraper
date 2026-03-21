@@ -335,7 +335,7 @@ def store_filings(filings):
 
             supabase.table('filings').upsert(
                 f,
-                on_conflict='ticker,owner_name,transaction_date,transaction_type,shares'
+                on_conflict='filing_url'
             ).execute()
             stored += 1
         except Exception as e:
