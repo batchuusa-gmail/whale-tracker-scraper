@@ -36,6 +36,41 @@ SUPABASE_HEADERS = {
 _filings_cache = []
 _last_updated = None
 
+# ─── Historical Pull Globals ──────────────────────────────────────
+
+MAJOR_TICKERS = [
+    # Big Tech
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'NFLX',
+    'ORCL', 'CRM', 'ADBE', 'INTC', 'AMD', 'QCOM', 'AVGO', 'TXN',
+    'MU', 'AMAT', 'LRCX', 'KLAC', 'SNOW', 'PLTR', 'COIN', 'UBER',
+    'ABNB', 'DASH', 'RBLX', 'HOOD', 'SOFI', 'RIVN',
+    # Finance
+    'JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'BLK', 'SCHW', 'V', 'MA',
+    'PYPL', 'AXP', 'USB', 'PNC', 'TFC',
+    # Healthcare / Biotech
+    'JNJ', 'PFE', 'MRNA', 'LLY', 'ABBV', 'MRK', 'BMY', 'AMGN',
+    'GILD', 'REGN', 'VRTX', 'BIIB', 'ISRG',
+    # Energy
+    'XOM', 'CVX', 'COP', 'OXY', 'SLB', 'PSX', 'VLO',
+    # Consumer / Retail
+    'WMT', 'COST', 'HD', 'TGT', 'NKE', 'MCD', 'SBUX', 'DIS', 'CMCSA',
+    # Industrial / Defense
+    'BA', 'CAT', 'GE', 'HON', 'RTX', 'LMT', 'NOC', 'MMM',
+    # EV / Auto
+    'F', 'GM',
+]
+
+_history_pull_status = {
+    'running': False,
+    'current_ticker': '',
+    'tickers_done': 0,
+    'tickers_total': 0,
+    'filings_saved': 0,
+    'started_at': None,
+    'completed_at': None,
+    'error': None,
+}
+
 
 # ─── Supabase ────────────────────────────────────────────────────
 
@@ -501,6 +536,167 @@ class SECScraper:
         logger.info(f"Done — cached {len(_filings_cache)} filings, saved to Supabase")
         return {'filings_found': len(_filings_cache), 'timestamp': _last_updated}
 
+    # ── Historical pull helpers ──────────────────────────────────
+
+    def fetch_ticker_atom_pages(self, ticker, days_back=1095):
+        """Fetch Form 4 ATOM feed pages for a single ticker, up to days_back days back."""
+        cutoff = datetime.now() - timedelta(days=days_back)
+        results = []
+        start = 0
+        count = 40
+
+        while True:
+            url = (
+                f"{SEC_BASE_URL}/cgi-bin/browse-edgar"
+                f"?action=getcompany&CIK={ticker}&type=4&dateb=&owner=include"
+                f"&count={count}&start={start}&search_text=&output=atom"
+            )
+            self.rate_limit()
+            try:
+                resp = self.session.get(url, timeout=20)
+                resp.raise_for_status()
+                root = ET.fromstring(resp.content)
+                ns = {'atom': 'http://www.w3.org/2005/Atom'}
+                entries = root.findall('atom:entry', ns)
+                if not entries:
+                    break
+
+                stop = False
+                for entry in entries:
+                    try:
+                        title = entry.findtext('atom:title', '', ns)
+                        updated = entry.findtext('atom:updated', '', ns)
+                        link_el = entry.find('atom:link', ns)
+                        filing_url = link_el.get('href', '') if link_el is not None else ''
+
+                        if updated:
+                            entry_date = datetime.fromisoformat(updated[:10])
+                            if entry_date < cutoff:
+                                stop = True
+                                break
+
+                        ticker_match = re.search(r'\(([A-Z]{1,5})\)', title)
+                        company_match = re.search(r'4\s*-\s*(.+?)\s*\(', title)
+                        entry_ticker = ticker_match.group(1) if ticker_match else ticker.upper()
+                        company = company_match.group(1).strip() if company_match else title
+
+                        results.append({
+                            'ticker': entry_ticker,
+                            'company_name': company,
+                            'filing_url': filing_url,
+                            'filed_at': updated[:10] if updated else '',
+                            'owner_name': '',
+                            'owner_type': '',
+                            'transaction_type': '',
+                            'shares': 0,
+                            'price': 0.0,
+                            'value': 0.0,
+                            'transaction_date': None,
+                            'shares_owned_after': 0,
+                            'stock_price': 0.0,
+                            'stock_change_pct': 0.0,
+                        })
+                    except Exception as e:
+                        logger.error(f"Historical entry parse error ({ticker}): {e}")
+
+                logger.info(f"{ticker}: fetched {len(results)} filings so far (page start={start})")
+
+                if stop or len(entries) < count:
+                    break
+                start += count
+
+            except Exception as e:
+                logger.error(f"ATOM page error for {ticker} start={start}: {e}")
+                break
+
+        return results
+
+    def run_historical_pull(self, tickers=None):
+        """Pull 3 years of Form 4 data for each ticker and upsert to Supabase."""
+        global _history_pull_status
+
+        if tickers is None:
+            tickers = MAJOR_TICKERS
+
+        _history_pull_status.update({
+            'running': True,
+            'current_ticker': '',
+            'tickers_done': 0,
+            'tickers_total': len(tickers),
+            'filings_saved': 0,
+            'started_at': datetime.now().isoformat(),
+            'completed_at': None,
+            'error': None,
+        })
+
+        total_saved = 0
+        try:
+            for i, ticker in enumerate(tickers):
+                _history_pull_status['current_ticker'] = ticker
+                logger.info(f"[history] {ticker} ({i+1}/{len(tickers)})")
+                try:
+                    filings = self.fetch_ticker_atom_pages(ticker, days_back=1095)
+                    logger.info(f"[history] {ticker}: enriching {len(filings)} filings")
+
+                    enriched = []
+                    for j, f in enumerate(filings):
+                        try:
+                            enriched.append(self.enrich_from_xml(f))
+                        except Exception as e:
+                            logger.error(f"[history] enrich error {ticker}[{j}]: {e}")
+                            enriched.append(f)
+
+                    # One price fetch per ticker
+                    quote = YahooFinance.get_quote(ticker)
+                    for f in enriched:
+                        if not f.get('stock_price'):
+                            f['stock_price'] = quote.get('stock_price', 0.0)
+                            f['stock_change_pct'] = quote.get('stock_change_pct', 0.0)
+                        if f.get('value', 0) == 0 and f.get('shares', 0) > 0 and quote.get('stock_price', 0) > 0:
+                            f['price'] = quote['stock_price']
+                            f['value'] = round(f['shares'] * quote['stock_price'], 2)
+
+                    rows = [
+                        {
+                            'ticker': f.get('ticker', ''),
+                            'company_name': f.get('company_name', ''),
+                            'owner_name': f.get('owner_name', ''),
+                            'owner_type': f.get('owner_type', ''),
+                            'transaction_type': f.get('transaction_type', ''),
+                            'shares': f.get('shares', 0),
+                            'price': f.get('price', 0),
+                            'value': f.get('value', 0),
+                            'transaction_date': f.get('transaction_date'),
+                            'filed_at': f.get('filed_at') or None,
+                            'filing_url': f.get('filing_url', ''),
+                            'shares_owned_after': f.get('shares_owned_after', 0),
+                            'stock_price': f.get('stock_price', 0),
+                            'stock_change_pct': f.get('stock_change_pct', 0),
+                        }
+                        for f in enriched
+                        if f.get('filing_url') and f.get('ticker')
+                    ]
+
+                    # Upsert in batches of 20 to stay within Supabase limits
+                    for k in range(0, len(rows), 20):
+                        self.db.upsert('filings', rows[k:k + 20])
+                    total_saved += len(rows)
+                    _history_pull_status['filings_saved'] = total_saved
+                    logger.info(f"[history] {ticker}: saved {len(rows)} rows (total={total_saved})")
+
+                except Exception as e:
+                    logger.error(f"[history] error processing {ticker}: {e}")
+
+                _history_pull_status['tickers_done'] = i + 1
+
+        except Exception as e:
+            _history_pull_status['error'] = str(e)
+            logger.error(f"[history] fatal error: {e}")
+        finally:
+            _history_pull_status['running'] = False
+            _history_pull_status['completed_at'] = datetime.now().isoformat()
+            logger.info(f"[history] complete — {total_saved} total filings saved")
+
 
 # ─── Flask API ────────────────────────────────────────────────────
 
@@ -622,6 +818,34 @@ def create_app():
         except Exception as e:
             logger.error(f"Chart error for {ticker}: {e}")
         return jsonify({'ticker': ticker.upper(), 'points': [], 'current': 0, 'prev_close': 0})
+
+    @app.route('/api/filings/history-pull', methods=['POST'])
+    def history_pull():
+        """Trigger a 3-year historical pull for MAJOR_TICKERS (or a custom list).
+        POST body (optional JSON): {"tickers": ["AAPL", "TSLA"]}
+        """
+        if _history_pull_status.get('running'):
+            return jsonify({'status': 'already_running', 'progress': _history_pull_status}), 409
+        tickers = None
+        if request.is_json and request.json:
+            tickers = request.json.get('tickers') or None
+        thread = threading.Thread(
+            target=scraper.run_historical_pull,
+            args=(tickers,),
+            daemon=True,
+        )
+        thread.start()
+        return jsonify({
+            'status': 'started',
+            'tickers': tickers or MAJOR_TICKERS,
+            'ticker_count': len(tickers or MAJOR_TICKERS),
+            'message': 'Historical pull running in background. Poll /api/filings/history-status for progress.',
+        })
+
+    @app.route('/api/filings/history-status')
+    def history_status():
+        """Return current progress of the background historical pull."""
+        return jsonify(_history_pull_status)
 
     def startup():
         time.sleep(3)
