@@ -748,11 +748,24 @@ def create_app():
         sells = [r for r in all_rows if r.get('transaction_type') == 'Sell']
         total_value = sum(float(r.get('value', 0) or 0) for r in all_rows)
 
-        # Top buys/sells from cache for speed
-        cache_buys = sorted([f for f in _filings_cache if f.get('transaction_type') == 'Buy'],
-                            key=lambda x: x.get('value', 0), reverse=True)[:5]
-        cache_sells = sorted([f for f in _filings_cache if f.get('transaction_type') == 'Sell'],
-                             key=lambda x: x.get('value', 0), reverse=True)[:5]
+        # Top buys/sells from cache — deduplicated by ticker, max 1 per company
+        def _top_deduped(tx_type, limit=10):
+            sorted_all = sorted(
+                [f for f in _filings_cache if f.get('transaction_type') == tx_type],
+                key=lambda x: x.get('value', 0), reverse=True
+            )
+            seen, result = set(), []
+            for f in sorted_all:
+                t = f.get('ticker', '')
+                if t and t not in seen:
+                    seen.add(t)
+                    result.append(f)
+                if len(result) >= limit:
+                    break
+            return result
+
+        cache_buys = _top_deduped('Buy', 10)
+        cache_sells = _top_deduped('Sell', 10)
 
         return jsonify({
             'total_filings': len(all_rows) or len(_filings_cache),
