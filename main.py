@@ -1107,6 +1107,133 @@ def create_app():
             logger.error(f"Sectors error: {e}")
             return jsonify([])
 
+    @app.route('/api/sectors/heatmap')
+    def sectors_heatmap():
+        _mock = [
+            {'sector':'Semiconductors','stocks':[
+                {'ticker':'NVDA','price':875.40,'change_pct':3.21,'market_cap':2150000000000},
+                {'ticker':'AVGO','price':162.80,'change_pct':1.45,'market_cap':760000000000},
+                {'ticker':'AMD','price':162.30,'change_pct':2.10,'market_cap':262000000000},
+                {'ticker':'QCOM','price':168.90,'change_pct':-0.80,'market_cap':188000000000},
+                {'ticker':'MU','price':88.50,'change_pct':1.20,'market_cap':98000000000},
+                {'ticker':'AMAT','price':188.20,'change_pct':0.95,'market_cap':158000000000},
+                {'ticker':'KLAC','price':720.10,'change_pct':1.60,'market_cap':98000000000},
+                {'ticker':'LRCX','price':820.30,'change_pct':2.30,'market_cap':108000000000},
+                {'ticker':'TXN','price':182.40,'change_pct':-1.20,'market_cap':166000000000},
+                {'ticker':'INTC','price':21.80,'change_pct':-2.40,'market_cap':93000000000},
+                {'ticker':'ADI','price':215.60,'change_pct':0.40,'market_cap':112000000000},
+            ]},
+            {'sector':'Software','stocks':[
+                {'ticker':'MSFT','price':415.50,'change_pct':0.85,'market_cap':3090000000000},
+                {'ticker':'ORCL','price':132.20,'change_pct':1.10,'market_cap':362000000000},
+                {'ticker':'CRM','price':282.40,'change_pct':-0.60,'market_cap':272000000000},
+                {'ticker':'ADBE','price':442.10,'change_pct':-1.30,'market_cap':194000000000},
+                {'ticker':'PLTR','price':24.80,'change_pct':4.20,'market_cap':52000000000},
+                {'ticker':'SNOW','price':148.20,'change_pct':2.80,'market_cap':48000000000},
+                {'ticker':'PANW','price':318.60,'change_pct':1.50,'market_cap':103000000000},
+                {'ticker':'CRWD','price':332.10,'change_pct':3.10,'market_cap':80000000000},
+            ]},
+            {'sector':'Communication','stocks':[
+                {'ticker':'GOOGL','price':172.30,'change_pct':1.20,'market_cap':2130000000000},
+                {'ticker':'META','price':512.80,'change_pct':2.40,'market_cap':1310000000000},
+                {'ticker':'NFLX','price':628.40,'change_pct':3.80,'market_cap':270000000000},
+                {'ticker':'DIS','price':112.60,'change_pct':-0.40,'market_cap':206000000000},
+                {'ticker':'T','price':17.80,'change_pct':-0.80,'market_cap':127000000000},
+                {'ticker':'VZ','price':40.20,'change_pct':-1.10,'market_cap':169000000000},
+                {'ticker':'TMUS','price':162.40,'change_pct':0.60,'market_cap':196000000000},
+            ]},
+            {'sector':'Financial','stocks':[
+                {'ticker':'JPM','price':198.20,'change_pct':0.90,'market_cap':570000000000},
+                {'ticker':'BAC','price':38.40,'change_pct':0.50,'market_cap':301000000000},
+                {'ticker':'GS','price':482.10,'change_pct':1.80,'market_cap':162000000000},
+                {'ticker':'MS','price':98.40,'change_pct':1.20,'market_cap':162000000000},
+                {'ticker':'V','price':274.80,'change_pct':0.70,'market_cap':560000000000},
+                {'ticker':'MA','price':468.20,'change_pct':0.90,'market_cap':432000000000},
+                {'ticker':'AXP','price':228.60,'change_pct':-0.30,'market_cap':164000000000},
+                {'ticker':'BLK','price':862.40,'change_pct':1.40,'market_cap':130000000000},
+                {'ticker':'WFC','price':56.80,'change_pct':0.20,'market_cap':195000000000},
+            ]},
+            {'sector':'Consumer Cyclical','stocks':[
+                {'ticker':'AMZN','price':185.60,'change_pct':1.30,'market_cap':1960000000000},
+                {'ticker':'TSLA','price':182.40,'change_pct':-3.20,'market_cap':580000000000},
+                {'ticker':'HD','price':368.20,'change_pct':0.40,'market_cap':363000000000},
+                {'ticker':'MCD','price':282.60,'change_pct':-0.20,'market_cap':201000000000},
+                {'ticker':'NKE','price':76.80,'change_pct':-1.80,'market_cap':115000000000},
+                {'ticker':'SBUX','price':84.20,'change_pct':-0.60,'market_cap':95000000000},
+                {'ticker':'BKNG','price':3842.00,'change_pct':2.10,'market_cap':148000000000},
+            ]},
+            {'sector':'Healthcare','stocks':[
+                {'ticker':'LLY','price':798.40,'change_pct':2.80,'market_cap':758000000000},
+                {'ticker':'JNJ','price':157.20,'change_pct':-0.40,'market_cap':378000000000},
+                {'ticker':'ABBV','price':182.60,'change_pct':0.80,'market_cap':323000000000},
+                {'ticker':'MRK','price':112.40,'change_pct':0.20,'market_cap':284000000000},
+                {'ticker':'AMGN','price':268.20,'change_pct':1.10,'market_cap':144000000000},
+                {'ticker':'GILD','price':88.40,'change_pct':0.60,'market_cap':111000000000},
+                {'ticker':'ISRG','price':498.60,'change_pct':1.90,'market_cap':176000000000},
+            ]},
+            {'sector':'Energy','stocks':[
+                {'ticker':'XOM','price':108.20,'change_pct':-0.60,'market_cap':432000000000},
+                {'ticker':'CVX','price':152.80,'change_pct':-1.20,'market_cap':281000000000},
+                {'ticker':'COP','price':108.60,'change_pct':-0.80,'market_cap':134000000000},
+                {'ticker':'SLB','price':40.20,'change_pct':-1.60,'market_cap':56000000000},
+                {'ticker':'EOG','price':122.40,'change_pct':-0.40,'market_cap':72000000000},
+            ]},
+            {'sector':'Industrials','stocks':[
+                {'ticker':'GE','price':162.80,'change_pct':1.60,'market_cap':177000000000},
+                {'ticker':'CAT','price':368.40,'change_pct':0.80,'market_cap':181000000000},
+                {'ticker':'BA','price':172.60,'change_pct':-1.40,'market_cap':103000000000},
+                {'ticker':'LMT','price':462.80,'change_pct':0.60,'market_cap':111000000000},
+                {'ticker':'RTX','price':118.40,'change_pct':1.20,'market_cap':158000000000},
+                {'ticker':'HON','price':198.60,'change_pct':0.40,'market_cap':128000000000},
+                {'ticker':'DE','price':378.20,'change_pct':-0.80,'market_cap':113000000000},
+            ]},
+            {'sector':'Consumer Defensive','stocks':[
+                {'ticker':'WMT','price':92.40,'change_pct':0.60,'market_cap':747000000000},
+                {'ticker':'PG','price':162.80,'change_pct':0.30,'market_cap':383000000000},
+                {'ticker':'KO','price':62.40,'change_pct':0.20,'market_cap':269000000000},
+                {'ticker':'PEP','price':158.20,'change_pct':-0.10,'market_cap':217000000000},
+                {'ticker':'COST','price':888.40,'change_pct':1.40,'market_cap':394000000000},
+                {'ticker':'MO','price':42.60,'change_pct':-0.30,'market_cap':74000000000},
+            ]},
+        ]
+        try:
+            import yfinance as yf
+            SECTOR_STOCKS = {
+                'Semiconductors': ['NVDA','AVGO','MU','AMD','INTC','QCOM','ADI','TXN','AMAT','KLAC','LRCX'],
+                'Software': ['MSFT','ORCL','CRM','ADBE','PLTR','SNOW','PANW','CRWD'],
+                'Communication': ['GOOGL','META','NFLX','DIS','T','VZ','TMUS'],
+                'Financial': ['JPM','BAC','WFC','GS','MS','V','MA','AXP','BLK'],
+                'Consumer Cyclical': ['AMZN','TSLA','HD','MCD','NKE','SBUX','BKNG'],
+                'Healthcare': ['LLY','JNJ','ABBV','MRK','AMGN','GILD','ISRG'],
+                'Energy': ['XOM','CVX','COP','SLB','EOG'],
+                'Industrials': ['GE','CAT','BA','LMT','RTX','HON','DE'],
+                'Consumer Defensive': ['WMT','PG','KO','PEP','COST','MO'],
+            }
+            result = []
+            for sector, tickers in SECTOR_STOCKS.items():
+                stocks = []
+                for ticker in tickers:
+                    try:
+                        t = yf.Ticker(ticker)
+                        fi = t.fast_info
+                        price = float(fi.last_price or 0)
+                        prev = float(fi.previous_close or 0)
+                        chg = round((price - prev) / prev * 100, 2) if prev else 0
+                        mktcap = float(fi.market_cap or 1_000_000_000)
+                        stocks.append({'ticker': ticker, 'price': round(price, 2),
+                                       'change_pct': chg, 'market_cap': mktcap})
+                    except Exception as e:
+                        logger.error(f"heatmap stock error {ticker}: {e}")
+                result.append({'sector': sector, 'stocks': stocks})
+            has_data = any(len(s['stocks']) > 0 for s in result)
+            if has_data:
+                return jsonify(result)
+            logger.info("Heatmap: yfinance blocked, serving mock data")
+            return jsonify(_mock)
+        except Exception as e:
+            logger.error(f"Heatmap error: {e}")
+            return jsonify(_mock)
+
     return app
 
 
