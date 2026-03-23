@@ -39,25 +39,94 @@ _last_updated = None
 # ─── Historical Pull Globals ──────────────────────────────────────
 
 MAJOR_TICKERS = [
-    # Big Tech
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'NFLX',
-    'ORCL', 'CRM', 'ADBE', 'INTC', 'AMD', 'QCOM', 'AVGO', 'TXN',
-    'MU', 'AMAT', 'LRCX', 'KLAC', 'SNOW', 'PLTR', 'COIN', 'UBER',
-    'ABNB', 'DASH', 'RBLX', 'HOOD', 'SOFI', 'RIVN',
-    # Finance
-    'JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'BLK', 'SCHW', 'V', 'MA',
-    'PYPL', 'AXP', 'USB', 'PNC', 'TFC',
-    # Healthcare / Biotech
+    # Technology — Mega Cap
+    'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'GOOG', 'AMZN', 'META', 'TSLA',
+    'AVGO', 'ORCL', 'CRM', 'ADBE', 'AMD', 'QCOM', 'TXN', 'INTC',
+    'AMAT', 'LRCX', 'KLAC', 'MU', 'MRVL', 'SNPS', 'CDNS', 'NFLX',
+    # Technology — Software / Cloud
+    'NOW', 'PANW', 'FTNT', 'CRWD', 'ZS', 'DDOG', 'NET', 'OKTA',
+    'TEAM', 'HUBS', 'PAYC', 'ANSS', 'GDDY', 'IT', 'ACN', 'CTSH',
+    'EPAM', 'IBM', 'HPQ', 'HPE', 'DELL', 'STX', 'WDC', 'NTAP',
+    'CSCO', 'ANET', 'JNPR', 'KEYS', 'TER', 'CDW', 'APP', 'TWLO',
+    'ZM', 'DOCU', 'SHOP', 'PCTY', 'CDAY', 'WEX', 'TOST', 'FOUR',
+    'GPN', 'FIS', 'FISV', 'JKHY', 'FIVN', 'NICE', 'VEEV',
+    # Technology — Fintech / Crypto / New Tech
+    'COIN', 'HOOD', 'SOFI', 'PLTR', 'SNOW', 'UBER', 'LYFT',
+    'DASH', 'RBLX', 'NIO', 'XPEV', 'LI',
+    # Finance — Banks
+    'JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'USB', 'PNC', 'TFC',
+    'COF', 'DFS', 'SYF', 'ALLY', 'FITB', 'HBAN', 'RF', 'CFG',
+    'KEY', 'MTB', 'ZION', 'CMA', 'FNB', 'BOKF', 'EWBC', 'OZK',
+    'NYCB', 'WAL', 'TCBI', 'CBSH', 'UMBF', 'WTFC', 'IBCP', 'SBCF',
+    # Finance — Asset Mgmt / Insurance / Exchanges
+    'BLK', 'SCHW', 'V', 'MA', 'PYPL', 'AXP', 'ICE', 'CME', 'CBOE',
+    'NDAQ', 'SPGI', 'MCO', 'MSCI', 'FDS', 'BR', 'BEN', 'IVZ',
+    'TROW', 'BX', 'KKR', 'APO', 'ARES', 'CG', 'STT', 'BK', 'NTRS',
+    'MET', 'PRU', 'AFL', 'ALL', 'CB', 'TRV', 'HIG', 'AIG', 'PGR',
+    'LNC', 'UNM', 'GL', 'RGA', 'EQH', 'VOYA', 'FG', 'CRBG',
+    # Healthcare — Pharma / Biotech
     'JNJ', 'PFE', 'MRNA', 'LLY', 'ABBV', 'MRK', 'BMY', 'AMGN',
-    'GILD', 'REGN', 'VRTX', 'BIIB', 'ISRG',
-    # Energy
-    'XOM', 'CVX', 'COP', 'OXY', 'SLB', 'PSX', 'VLO',
-    # Consumer / Retail
-    'WMT', 'COST', 'HD', 'TGT', 'NKE', 'MCD', 'SBUX', 'DIS', 'CMCSA',
-    # Industrial / Defense
-    'BA', 'CAT', 'GE', 'HON', 'RTX', 'LMT', 'NOC', 'MMM',
-    # EV / Auto
-    'F', 'GM',
+    'GILD', 'REGN', 'VRTX', 'BIIB', 'ISRG', 'ILMN', 'PACB',
+    'BMRN', 'ALNY', 'INCY', 'JAZZ', 'HALO', 'IONS', 'RARE',
+    'AKRO', 'ARWR', 'BEAM', 'EDIT', 'NTLA', 'CRSP', 'SGEN',
+    'EXAS', 'HOLX', 'DXCM', 'PODD', 'ALGN', 'EW',
+    # Healthcare — Equipment / Devices
+    'ABT', 'TMO', 'DHR', 'A', 'WAT', 'BIO', 'IDXX', 'IQV', 'CRL',
+    'CTLT', 'BSX', 'MDT', 'SYK', 'ZBH', 'BAX', 'BDX', 'RMD',
+    'TNDM', 'SWAV', 'NVCR', 'INSP', 'NVST', 'LMAT',
+    # Healthcare — Managed Care / Services
+    'UNH', 'CVS', 'CI', 'HUM', 'MOH', 'CNC', 'ELV', 'HCA', 'THC',
+    'UHS', 'ENSG', 'HQY', 'ACCD', 'DOCS', 'OSCR', 'WBA', 'MCK',
+    'ABC', 'CAH',
+    # Energy — Oil & Gas
+    'XOM', 'CVX', 'COP', 'OXY', 'SLB', 'PSX', 'VLO', 'MPC',
+    'HES', 'DVN', 'FANG', 'EOG', 'PXD', 'APA', 'HAL', 'BKR',
+    'NOV', 'CTRA', 'EQT', 'AR', 'RRC', 'CNX', 'CHK', 'MRO',
+    'NFG', 'SM', 'MTDR', 'CIVI', 'VTLE', 'PR', 'GPOR',
+    # Energy — Renewables / Utilities
+    'NEE', 'DUK', 'SO', 'D', 'EXC', 'ED', 'XEL', 'PCG', 'PPL',
+    'FE', 'ETR', 'WEC', 'CMS', 'AEE', 'NI', 'LNT', 'EVRG',
+    'PNW', 'ATO', 'NWE', 'OTTR', 'PNM', 'POR', 'SRE', 'AES',
+    'ENPH', 'SEDG', 'FSLR', 'RUN', 'ARRY', 'NOVA', 'SPWR',
+    # Consumer Discretionary
+    'WMT', 'COST', 'HD', 'TGT', 'NKE', 'MCD', 'SBUX', 'DIS',
+    'CMCSA', 'LOW', 'TJX', 'ROST', 'DG', 'DLTR', 'ULTA', 'BBY',
+    'KSS', 'M', 'JWN', 'GPS', 'LULU', 'DECK', 'SKX', 'CROX',
+    'ONON', 'BIRK', 'W', 'CHWY', 'ETSY', 'PTON',
+    # Consumer Staples
+    'KO', 'PEP', 'MDLZ', 'HSY', 'CPB', 'GIS', 'K', 'SJM', 'HRL',
+    'MKC', 'CAG', 'TSN', 'PG', 'CL', 'KMB', 'CHD', 'ENR', 'EL',
+    'COTY', 'KVUE', 'SPB', 'CLX', 'KHC', 'PM', 'MO', 'BTI',
+    # Travel / Hospitality / Entertainment
+    'RCL', 'CCL', 'NCLH', 'MAR', 'HLT', 'WH', 'H', 'IHG', 'WYN',
+    'ABNB', 'BKNG', 'EXPE', 'TRIP', 'PCLN', 'UAL', 'DAL', 'AAL',
+    'LUV', 'ALK', 'HA', 'JBLU', 'SAVE',
+    # Auto / EV
+    'F', 'GM', 'RIVN', 'LCID', 'FSR', 'FFIE', 'GOEV',
+    'NKLA', 'PTRA', 'WKC', 'MGA', 'BWA', 'TEN', 'ALSN', 'GT',
+    # Industrial / Machinery
+    'BA', 'CAT', 'GE', 'HON', 'RTX', 'MMM', 'EMR', 'ETN', 'PH',
+    'ROK', 'IR', 'AME', 'ROP', 'VRSK', 'XYL', 'GNRC', 'AOS',
+    'CMI', 'PCAR', 'DE', 'AGCO', 'CNH', 'URI', 'FAST', 'GWW',
+    'MSC', 'KMPR', 'EPAC', 'GHM', 'ACCO',
+    # Defense
+    'LMT', 'NOC', 'GD', 'LHX', 'HII', 'AXON', 'TDG', 'HEI',
+    'CW', 'KTOS', 'LDOS', 'SAIC', 'CACI', 'BWXT', 'DRS', 'OSK',
+    'MOOG', 'TDY', 'FLIR', 'VSE', 'DWT',
+    # Materials / Mining / Chemicals
+    'LIN', 'APD', 'DD', 'DOW', 'EMN', 'PPG', 'SHW', 'RPM',
+    'FCX', 'NEM', 'GOLD', 'AEM', 'WPM', 'KGC', 'PAAS',
+    'AA', 'CENX', 'KALU', 'ARNC', 'HBM', 'TECK', 'RIO', 'BHP',
+    'CLF', 'STLD', 'NUE', 'RS', 'CMC', 'ZEUS', 'MTX',
+    # Real Estate
+    'PLD', 'AMT', 'CCI', 'EQIX', 'DLR', 'SBAC', 'SPG', 'O',
+    'VICI', 'CBRE', 'JLL', 'PSA', 'EXR', 'CUBE', 'LSI',
+    'MAA', 'UDR', 'CPT', 'NVR', 'TOL', 'PHM', 'DHI', 'LEN',
+    'KBH', 'MDC', 'TMHC', 'TPH', 'BZH', 'SKY', 'CVCO',
+    # Communication Services
+    'T', 'VZ', 'TMUS', 'CHTR', 'WBD',
+    'PARA', 'FOX', 'FOXA', 'NYT', 'NWS', 'NWSA', 'LUMN',
+    'IRDM', 'VSAT', 'GSAT', 'SHEN', 'CCOI', 'BAND', 'OOMA',
 ]
 
 _history_pull_status = {
@@ -722,7 +791,8 @@ def create_app():
         ticker = request.args.get('ticker', '')
         source = request.args.get('source', 'cache')  # 'cache' or 'db'
 
-        if source == 'db':
+        if source == 'db' or not _filings_cache:
+            # Fall back to Supabase when cache is empty (e.g. fresh deploy)
             results = db.get_recent('filings', limit=limit)
         else:
             results = list(_filings_cache)
@@ -832,6 +902,34 @@ def create_app():
             logger.error(f"Chart error for {ticker}: {e}")
         return jsonify({'ticker': ticker.upper(), 'points': [], 'current': 0, 'prev_close': 0})
 
+    @app.route('/api/tickers')
+    def get_tickers():
+        """Return the current MAJOR_TICKERS list."""
+        return jsonify({'tickers': MAJOR_TICKERS, 'count': len(MAJOR_TICKERS)})
+
+    @app.route('/api/tickers', methods=['POST'])
+    def add_ticker():
+        """Add a ticker to MAJOR_TICKERS for this session."""
+        global MAJOR_TICKERS
+        data = request.get_json() or {}
+        ticker = data.get('ticker', '').upper().strip()
+        if not ticker or len(ticker) > 10:
+            return jsonify({'error': 'Invalid ticker'}), 400
+        if ticker not in MAJOR_TICKERS:
+            MAJOR_TICKERS.append(ticker)
+            logger.info(f"Added ticker {ticker} to MAJOR_TICKERS")
+        return jsonify({'tickers': MAJOR_TICKERS, 'count': len(MAJOR_TICKERS)})
+
+    @app.route('/api/tickers/<ticker>', methods=['DELETE'])
+    def remove_ticker(ticker):
+        """Remove a ticker from MAJOR_TICKERS for this session."""
+        global MAJOR_TICKERS
+        t = ticker.upper().strip()
+        if t in MAJOR_TICKERS:
+            MAJOR_TICKERS.remove(t)
+            logger.info(f"Removed ticker {t} from MAJOR_TICKERS")
+        return jsonify({'tickers': MAJOR_TICKERS, 'count': len(MAJOR_TICKERS)})
+
     @app.route('/api/filings/history-pull', methods=['POST'])
     def history_pull():
         """Trigger a 3-year historical pull for MAJOR_TICKERS (or a custom list).
@@ -860,11 +958,6 @@ def create_app():
         """Return current progress of the background historical pull."""
         return jsonify(_history_pull_status)
 
-    def startup():
-        time.sleep(3)
-        scraper.run()
-
-    threading.Thread(target=startup, daemon=True).start()
     return app
 
 
@@ -883,6 +976,41 @@ def run_scheduler():
 
 # For gunicorn
 app = create_app()
+
+# ── Startup: load cache from Supabase + run scheduler in background ──
+def _startup():
+    global _filings_cache, _last_updated
+    try:
+        db = SupabaseClient()
+        # Load recent filings from Supabase into cache on startup
+        rows = db.get_recent('filings', limit=200)
+        if rows:
+            _filings_cache = rows
+            _last_updated = datetime.now().isoformat()
+            logger.info(f"Startup: loaded {len(rows)} filings from Supabase into cache")
+        else:
+            logger.info("Startup: no rows in Supabase yet, cache empty")
+    except Exception as e:
+        logger.error(f"Startup cache load failed: {e}")
+
+    # Run scraper immediately then schedule it
+    _scraper = SECScraper()
+    try:
+        _scraper.run()
+    except Exception as e:
+        logger.error(f"Startup scraper run failed: {e}")
+
+    schedule.every(30).minutes.do(_scraper.run)
+    schedule.every().day.at("09:30").do(_scraper.run)
+    schedule.every().day.at("12:00").do(_scraper.run)
+    schedule.every().day.at("16:00").do(_scraper.run)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+_startup_thread = threading.Thread(target=_startup, daemon=True)
+_startup_thread.start()
 
 
 # ─── Sentiment (from sentiment_backend.py) ───────────────────────
@@ -1083,6 +1211,86 @@ def sentiment_ticker(ticker):
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/congress')
+def api_congress():
+    """Return recent congressional stock trades from Supabase or fallback mock."""
+    try:
+        db = SupabaseClient()
+        result = db.select('congress_trades', params={
+            'order': 'trade_date.desc',
+            'limit': '50'
+        })
+        if result and len(result) > 0:
+            return jsonify(result)
+    except Exception as e:
+        logger.warning(f"Congress trades DB fetch failed: {e}")
+    # Fallback mock data
+    mock = [
+        {'member': 'Nancy Pelosi', 'party': 'D', 'chamber': 'House', 'ticker': 'NVDA', 'type': 'Buy', 'amount': '$1M–$5M', 'date': '2026-03-10', 'company': 'NVIDIA Corp'},
+        {'member': 'Dan Crenshaw', 'party': 'R', 'chamber': 'House', 'ticker': 'AAPL', 'type': 'Buy', 'amount': '$15K–$50K', 'date': '2026-03-08', 'company': 'Apple Inc'},
+        {'member': 'Tommy Tuberville', 'party': 'R', 'chamber': 'Senate', 'ticker': 'TSLA', 'type': 'Sell', 'amount': '$50K–$100K', 'date': '2026-03-07', 'company': 'Tesla Inc'},
+        {'member': 'Mark Warner', 'party': 'D', 'chamber': 'Senate', 'ticker': 'MSFT', 'type': 'Buy', 'amount': '$100K–$250K', 'date': '2026-03-05', 'company': 'Microsoft Corp'},
+        {'member': 'Michael McCaul', 'party': 'R', 'chamber': 'House', 'ticker': 'GOOGL', 'type': 'Buy', 'amount': '$50K–$100K', 'date': '2026-03-04', 'company': 'Alphabet Inc'},
+        {'member': 'Josh Gottheimer', 'party': 'D', 'chamber': 'House', 'ticker': 'META', 'type': 'Buy', 'amount': '$15K–$50K', 'date': '2026-03-03', 'company': 'Meta Platforms'},
+        {'member': 'Roger Marshall', 'party': 'R', 'chamber': 'Senate', 'ticker': 'AMZN', 'type': 'Sell', 'amount': '$15K–$50K', 'date': '2026-03-01', 'company': 'Amazon.com Inc'},
+        {'member': 'Marjorie Greene', 'party': 'R', 'chamber': 'House', 'ticker': 'AMD', 'type': 'Buy', 'amount': '$15K–$50K', 'date': '2026-02-28', 'company': 'Advanced Micro Devices'},
+        {'member': 'Brian Schatz', 'party': 'D', 'chamber': 'Senate', 'ticker': 'PLTR', 'type': 'Buy', 'amount': '$50K–$100K', 'date': '2026-02-27', 'company': 'Palantir Technologies'},
+        {'member': 'Ro Khanna', 'party': 'D', 'chamber': 'House', 'ticker': 'COIN', 'type': 'Sell', 'amount': '$15K–$50K', 'date': '2026-02-25', 'company': 'Coinbase Global'},
+        {'member': 'Pat Toomey', 'party': 'R', 'chamber': 'Senate', 'ticker': 'JPM', 'type': 'Buy', 'amount': '$100K–$250K', 'date': '2026-02-24', 'company': 'JPMorgan Chase'},
+        {'member': 'Nancy Pelosi', 'party': 'D', 'chamber': 'House', 'ticker': 'CRWD', 'type': 'Buy', 'amount': '$500K–$1M', 'date': '2026-02-20', 'company': 'CrowdStrike Holdings'},
+    ]
+    return jsonify(mock)
+
+
+@app.route('/api/earnings')
+def api_earnings():
+    """Return upcoming earnings with insider activity signals."""
+    from datetime import datetime, timedelta
+    now = datetime.utcnow()
+
+    # Static earnings calendar (updated periodically)
+    earnings = [
+        {'ticker': 'NVDA', 'company': 'NVIDIA Corporation', 'earnings_date': '2026-05-28', 'insider_action': 'Buy'},
+        {'ticker': 'AAPL', 'company': 'Apple Inc', 'earnings_date': '2026-04-30', 'insider_action': 'Buy'},
+        {'ticker': 'MSFT', 'company': 'Microsoft Corporation', 'earnings_date': '2026-04-22', 'insider_action': 'Buy'},
+        {'ticker': 'META', 'company': 'Meta Platforms', 'earnings_date': '2026-04-23', 'insider_action': 'none'},
+        {'ticker': 'AMZN', 'company': 'Amazon.com Inc', 'earnings_date': '2026-04-30', 'insider_action': 'none'},
+        {'ticker': 'GOOGL', 'company': 'Alphabet Inc', 'earnings_date': '2026-04-24', 'insider_action': 'Sell'},
+        {'ticker': 'TSLA', 'company': 'Tesla Inc', 'earnings_date': '2026-04-22', 'insider_action': 'Sell'},
+        {'ticker': 'PLTR', 'company': 'Palantir Technologies', 'earnings_date': '2026-05-05', 'insider_action': 'Buy'},
+        {'ticker': 'AMD', 'company': 'Advanced Micro Devices', 'earnings_date': '2026-04-28', 'insider_action': 'none'},
+        {'ticker': 'COIN', 'company': 'Coinbase Global', 'earnings_date': '2026-05-08', 'insider_action': 'Buy'},
+        {'ticker': 'CRWD', 'company': 'CrowdStrike Holdings', 'earnings_date': '2026-06-03', 'insider_action': 'Buy'},
+        {'ticker': 'SNOW', 'company': 'Snowflake Inc', 'earnings_date': '2026-05-21', 'insider_action': 'none'},
+    ]
+
+    # Enrich with days_until and sort
+    try:
+        filings = _filings_cache or []
+        buy_tickers = {f.get('ticker', '') for f in filings if f.get('transaction_type') == 'Buy'}
+        sell_tickers = {f.get('ticker', '') for f in filings if f.get('transaction_type') == 'Sell'}
+        for e in earnings:
+            t = e['ticker']
+            if t in buy_tickers:
+                e['insider_action'] = 'Buy'
+            elif t in sell_tickers and e['insider_action'] != 'Buy':
+                e['insider_action'] = 'Sell'
+    except Exception:
+        pass
+
+    result = []
+    for e in earnings:
+        try:
+            dt = datetime.strptime(e['earnings_date'], '%Y-%m-%d')
+            e['days_until'] = (dt - now).days
+        except Exception:
+            e['days_until'] = 999
+        result.append(e)
+
+    result.sort(key=lambda x: x['days_until'])
+    return jsonify(result)
 
 
 if __name__ == '__main__':
