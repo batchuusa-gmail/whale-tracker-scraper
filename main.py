@@ -812,18 +812,27 @@ def create_app():
 
     @app.route('/api/summary')
     def summary():
-        # Use Supabase for accurate historical summary
-        all_rows = db.get_summary()
-        buys = [r for r in all_rows if r.get('transaction_type') == 'Buy']
-        sells = [r for r in all_rows if r.get('transaction_type') == 'Sell']
-        total_value = sum(float(r.get('value', 0) or 0) for r in all_rows)
+        cutoff_7d = (datetime.now() - timedelta(days=7)).date().isoformat()
+        today_str = datetime.now().date().isoformat()
 
-        # Top buys/sells from cache — deduplicated by ticker, max 1 per company
-        def _top_deduped(tx_type, limit=10):
-            sorted_all = sorted(
-                [f for f in _filings_cache if f.get('transaction_type') == tx_type],
-                key=lambda x: x.get('value', 0), reverse=True
-            )
+        # Pull recent filings from Supabase or cache
+        source_rows = db.get_recent('filings', limit=500) if not _filings_cache else list(_filings_cache)
+
+        # 7-day filtered rows
+        def _in_7d(f):
+            tx = f.get('transaction_date') or f.get('filed_at') or ''
+            if tx:
+                tx = str(tx)[:10]
+            return tx >= cutoff_7d
+
+        rows_7d = [f for f in source_rows if _in_7d(f)]
+        buys_7d = [f for f in rows_7d if f.get('transaction_type') == 'Buy']
+        sells_7d = [f for f in rows_7d if f.get('transaction_type') == 'Sell']
+        total_value = sum(float(f.get('value', 0) or 0) for f in rows_7d)
+
+        # Top buys/sells — deduplicated by ticker, sorted by value desc
+        def _top_deduped(items, limit=10):
+            sorted_all = sorted(items, key=lambda x: float(x.get('value', 0) or 0), reverse=True)
             seen, result = set(), []
             for f in sorted_all:
                 t = f.get('ticker', '')
@@ -834,16 +843,27 @@ def create_app():
                     break
             return result
 
-        cache_buys = _top_deduped('Buy', 10)
-        cache_sells = _top_deduped('Sell', 10)
+        top_buys = _top_deduped(buys_7d, 10)
+        top_sells = _top_deduped(sells_7d, 10)
+
+        # Today's filings
+        def _is_today(f):
+            filed = f.get('filed_at') or f.get('transaction_date') or ''
+            return str(filed)[:10] == today_str
+
+        today_filings = sorted(
+            [f for f in source_rows if _is_today(f)],
+            key=lambda x: float(x.get('value', 0) or 0), reverse=True
+        )[:20]
 
         return jsonify({
-            'total_filings': len(all_rows) or len(_filings_cache),
-            'buys': len(buys) or len([f for f in _filings_cache if f.get('transaction_type') == 'Buy']),
-            'sells': len(sells) or len([f for f in _filings_cache if f.get('transaction_type') == 'Sell']),
+            'total_filings': len(rows_7d),
+            'buys': len(buys_7d),
+            'sells': len(sells_7d),
             'total_value': total_value,
-            'top_buys': cache_buys,
-            'top_sells': cache_sells,
+            'top_buys': top_buys,
+            'top_sells': top_sells,
+            'today': today_filings,
             'last_updated': _last_updated,
         })
 
