@@ -978,6 +978,120 @@ def create_app():
         """Return current progress of the background historical pull."""
         return jsonify(_history_pull_status)
 
+    @app.route('/api/options/flow')
+    def options_flow():
+        try:
+            import yfinance as yf
+            from supabase_client import get_supabase
+            sc = SupabaseClient()
+            rows = sc.get_recent('filings', limit=50)
+            tickers = list(set([f['ticker'] for f in rows if f.get('ticker')]))[:15]
+            flow = []
+            for ticker in tickers:
+                try:
+                    t = yf.Ticker(ticker)
+                    exps = t.options
+                    if not exps:
+                        continue
+                    for exp in exps[:2]:
+                        try:
+                            chain = t.option_chain(exp)
+                            avg_call_vol = chain.calls['volume'].mean() if len(chain.calls) > 0 else 1
+                            avg_put_vol = chain.puts['volume'].mean() if len(chain.puts) > 0 else 1
+                            for _, row in chain.calls.iterrows():
+                                vol = int(row.get('volume') or 0)
+                                if vol > 100:
+                                    flow.append({
+                                        'ticker': ticker,
+                                        'type': 'CALL',
+                                        'strike': float(row.get('strike', 0)),
+                                        'expiry': exp,
+                                        'volume': vol,
+                                        'openInterest': int(row.get('openInterest') or 0),
+                                        'premium': round(float(row.get('lastPrice') or 0) * vol * 100, 2),
+                                        'unusual': avg_call_vol > 0 and vol > avg_call_vol * 3,
+                                    })
+                            for _, row in chain.puts.iterrows():
+                                vol = int(row.get('volume') or 0)
+                                if vol > 100:
+                                    flow.append({
+                                        'ticker': ticker,
+                                        'type': 'PUT',
+                                        'strike': float(row.get('strike', 0)),
+                                        'expiry': exp,
+                                        'volume': vol,
+                                        'openInterest': int(row.get('openInterest') or 0),
+                                        'premium': round(float(row.get('lastPrice') or 0) * vol * 100, 2),
+                                        'unusual': avg_put_vol > 0 and vol > avg_put_vol * 3,
+                                    })
+                        except Exception as e:
+                            logger.error(f"Options chain error {ticker} {exp}: {e}")
+                except Exception as e:
+                    logger.error(f"Options ticker error {ticker}: {e}")
+            flow.sort(key=lambda x: x['premium'], reverse=True)
+            return jsonify(flow[:50])
+        except Exception as e:
+            logger.error(f"Options flow error: {e}")
+            return jsonify([])
+
+    @app.route('/api/shorts/<ticker>')
+    def short_interest(ticker):
+        try:
+            import yfinance as yf
+            t = yf.Ticker(ticker.upper())
+            info = t.info
+            short_pct = info.get('shortPercentOfFloat', 0) or 0
+            return jsonify({
+                'ticker': ticker.upper(),
+                'short_ratio': round(float(info.get('shortRatio', 0) or 0), 2),
+                'short_percent': round(float(short_pct) * 100, 2),
+                'shares_short': int(info.get('sharesShort', 0) or 0),
+                'float_shares': int(info.get('floatShares', 0) or 0),
+            })
+        except Exception as e:
+            logger.error(f"Short interest error {ticker}: {e}")
+            return jsonify({'ticker': ticker.upper(), 'error': str(e), 'short_percent': 0, 'short_ratio': 0, 'shares_short': 0, 'float_shares': 0})
+
+    @app.route('/api/sectors')
+    def sectors():
+        SECTORS = {
+            'AAPL':'Technology','MSFT':'Technology','GOOGL':'Technology','NVDA':'Technology',
+            'META':'Technology','AMZN':'Consumer','WMT':'Consumer','TGT':'Consumer',
+            'NFLX':'Technology','CRM':'Technology','ORCL':'Technology','ADBE':'Technology',
+            'JPM':'Finance','BAC':'Finance','GS':'Finance','MS':'Finance','V':'Finance',
+            'MA':'Finance','BLK':'Finance','SCHW':'Finance',
+            'JNJ':'Healthcare','PFE':'Healthcare','ABBV':'Healthcare','MRK':'Healthcare',
+            'LLY':'Healthcare','AMGN':'Healthcare','UNH':'Healthcare',
+            'XOM':'Energy','CVX':'Energy','COP':'Energy','SLB':'Energy',
+            'LMT':'Industrial','BA':'Industrial','CAT':'Industrial','GE':'Industrial',
+            'HON':'Industrial','RTX':'Industrial',
+        }
+        try:
+            rows = db.get_recent('filings', limit=500)
+            sector_data = {}
+            for f in rows:
+                sector = SECTORS.get(f.get('ticker', ''), 'Other')
+                if sector not in sector_data:
+                    sector_data[sector] = {
+                        'sector': sector,
+                        'buy_value': 0.0, 'sell_value': 0.0,
+                        'buy_count': 0, 'sell_count': 0,
+                    }
+                val = float(f.get('value') or 0)
+                if f.get('transaction_type') == 'Buy':
+                    sector_data[sector]['buy_value'] += val
+                    sector_data[sector]['buy_count'] += 1
+                else:
+                    sector_data[sector]['sell_value'] += val
+                    sector_data[sector]['sell_count'] += 1
+            for s in sector_data.values():
+                s['net_value'] = s['buy_value'] - s['sell_value']
+            result = sorted(sector_data.values(), key=lambda x: abs(x['net_value']), reverse=True)
+            return jsonify(result)
+        except Exception as e:
+            logger.error(f"Sectors error: {e}")
+            return jsonify([])
+
     return app
 
 
