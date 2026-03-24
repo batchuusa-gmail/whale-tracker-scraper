@@ -1311,185 +1311,119 @@ _startup_thread = threading.Thread(target=_startup, daemon=True)
 _startup_thread.start()
 
 
-# ─── Sentiment (from sentiment_backend.py) ───────────────────────
-
-## ── ADD THIS TO YOUR main.py ────────────────────────────────
-## No Reddit API credentials needed - uses public JSON endpoints
-## Just add these functions and routes to main.py
+# ─── Sentiment — StockTwits ───────────────────────────────────────
 
 import re as _re
 
-REDDIT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 WhaleTracker/1.0 (contact@whaletracker.app)',
-}
+ST_HEADERS = {'User-Agent': 'WhaleTracker/1.0'}
+ST_BASE = 'https://api.stocktwits.com/api/2'
 
-BULLISH_WORDS = [
-    'buy', 'bull', 'bullish', 'moon', 'rocket', 'calls', 'long', 'up',
-    'gain', 'green', 'pump', 'squeeze', 'breakout', 'undervalued', 'strong',
-    'beat', 'upgrade', 'outperform', 'ath', 'hold', 'hodl', 'diamond hands',
-    'to the moon', 'buying', 'loading', 'accumulate', 'dip', 'cheap',
+# Top tracked tickers for trending sentiment
+TRACKED_TICKERS = [
+    'NVDA','MSFT','AAPL','AMZN','GOOGL','META','TSLA','AMD','PLTR','CRWD',
+    'JPM','V','LLY','XOM','AVGO','CRM','NFLX','UNH','BAC','GS',
+    'INTC','MU','QCOM','NOW','ORCL','ABBV','HD','CAT','GE','CVX',
 ]
 
-BEARISH_WORDS = [
-    'sell', 'bear', 'bearish', 'puts', 'short', 'down', 'crash', 'dump',
-    'loss', 'red', 'overvalued', 'miss', 'downgrade', 'underperform',
-    'bubble', 'correction', 'bag', 'rekt', 'bankrupt', 'falling', 'weak',
-    'overbought', 'shorting', 'drop', 'tank',
-]
-
-IGNORE_WORDS = {
-    'I', 'A', 'THE', 'FOR', 'AND', 'OR', 'IN', 'IS', 'IT', 'TO', 'BE',
-    'AS', 'AT', 'SO', 'WE', 'BY', 'DO', 'IF', 'ON', 'UP', 'DD', 'PE',
-    'EPS', 'CEO', 'IPO', 'ETF', 'SEC', 'IMO', 'WSB', 'RH', 'US', 'EU',
-    'UK', 'AM', 'PM', 'TV', 'AI', 'AR', 'VR', 'ER', 'PR', 'HR', 'IT',
-    'UI', 'UX', 'YOY', 'QOQ', 'ATH', 'DCA', 'ROI', 'PNL', 'YTD', 'LOL',
-    'OMG', 'WTF', 'IMO', 'IMHO', 'TLDR', 'ETA', 'FYI', 'AMA', 'EOD',
-}
-
-SUBREDDITS = ['wallstreetbets', 'stocks', 'investing', 'stockmarket', 'options']
-
-def analyze_sentiment_text(text):
-    text_lower = text.lower()
-    bull = sum(1 for w in BULLISH_WORDS if w in text_lower)
-    bear = sum(1 for w in BEARISH_WORDS if w in text_lower)
-    total = bull + bear
-    if total == 0:
-        return 0.0
-    return round((bull - bear) / total, 2)
-
-def extract_tickers(text):
-    dollar_tickers = set(_re.findall(r'\$([A-Z]{1,5})\b', text.upper()))
-    return {t for t in dollar_tickers if t not in IGNORE_WORDS and len(t) >= 2}
-
-def fetch_subreddit_posts(subreddit, sort='hot', limit=100, time_filter='day'):
+def _st_fetch(ticker):
+    """Fetch StockTwits messages for a ticker. Returns list of message dicts."""
     try:
-        url = f'https://www.reddit.com/r/{subreddit}/{sort}.json'
-        params = {'limit': limit, 't': time_filter}
-        r = requests.get(url, headers=REDDIT_HEADERS, params=params, timeout=15)
+        r = requests.get(
+            f'{ST_BASE}/streams/symbol/{ticker}.json',
+            headers=ST_HEADERS, timeout=10,
+        )
         if r.status_code == 200:
-            posts = r.json().get('data', {}).get('children', [])
-            return [p['data'] for p in posts]
-        logger.warning(f'Reddit {subreddit} returned {r.status_code}')
+            return r.json().get('messages', [])
+        logger.warning(f'StockTwits {ticker} returned {r.status_code}')
     except Exception as e:
-        logger.error(f'Reddit fetch error {subreddit}: {e}')
+        logger.error(f'StockTwits fetch error {ticker}: {e}')
     return []
 
+def _parse_messages(messages):
+    """Parse StockTwits messages into bullish/bearish/neutral counts."""
+    bullish = bearish = neutral = 0
+    posts = []
+    for m in messages:
+        sentiment = (m.get('entities') or {}).get('sentiment') or {}
+        label = (sentiment.get('basic') or '').lower()
+        if label == 'bullish':
+            bullish += 1
+        elif label == 'bearish':
+            bearish += 1
+        else:
+            neutral += 1
+        posts.append({
+            'body': m.get('body', '')[:200],
+            'sentiment': label or 'neutral',
+            'likes': (m.get('likes') or {}).get('total', 0),
+            'created_at': m.get('created_at', ''),
+            'username': (m.get('user') or {}).get('username', ''),
+        })
+    return bullish, bearish, neutral, posts
+
 def get_trending_sentiment(period='24h'):
-    sort = 'new' if period == '24h' else 'hot'
-    time_filter = 'day' if period == '24h' else 'week' if period == '7d' else 'month'
-    ticker_data = {}
-
-    for subreddit in SUBREDDITS:
-        posts = fetch_subreddit_posts(subreddit, sort=sort, limit=100, time_filter=time_filter)
-        logger.info(f'r/{subreddit}: {len(posts)} posts')
-        for post in posts:
-            title = post.get('title', '')
-            body = post.get('selftext', '')
-            text = f'{title} {body}'
-            upvotes = post.get('ups', 0)
-            comments = post.get('num_comments', 0)
-            tickers = extract_tickers(text)
-            if not tickers:
-                continue
-            score = analyze_sentiment_text(text)
-            for ticker in tickers:
-                if ticker not in ticker_data:
-                    ticker_data[ticker] = {
-                        'ticker': ticker, 'mentions': 0, 'scores': [],
-                        'subreddits': set(), 'top_post': '', 'top_upvotes': 0,
-                        'total_upvotes': 0, 'total_comments': 0,
-                    }
-                ticker_data[ticker]['mentions'] += 1
-                ticker_data[ticker]['scores'].append(score)
-                ticker_data[ticker]['subreddits'].add(subreddit)
-                ticker_data[ticker]['total_upvotes'] += upvotes
-                ticker_data[ticker]['total_comments'] += comments
-                if upvotes > ticker_data[ticker]['top_upvotes']:
-                    ticker_data[ticker]['top_upvotes'] = upvotes
-                    ticker_data[ticker]['top_post'] = title[:150]
-        time.sleep(1)
-
     results = []
-    for ticker, data in ticker_data.items():
-        if data['mentions'] < 3:
+    db = SupabaseClient()
+    filings_cache = db.get_recent('filings', limit=200)
+    filing_tickers = {f.get('ticker', '').upper() for f in filings_cache}
+
+    # Prioritise tickers with recent filings, then fill from tracked list
+    tickers = list(filing_tickers & set(TRACKED_TICKERS)) + \
+              [t for t in TRACKED_TICKERS if t not in filing_tickers]
+    tickers = tickers[:25]
+
+    for ticker in tickers:
+        messages = _st_fetch(ticker)
+        if not messages:
             continue
-        scores = data['scores']
-        avg_score = sum(scores) / len(scores) if scores else 0
-        bullish = len([s for s in scores if s > 0.2])
-        bearish = len([s for s in scores if s < -0.2])
-        neutral = len(scores) - bullish - bearish
-        total = len(scores)
-
-        insider_buy = False
-        company_name = ''
-        try:
-            result = supabase.table('filings').select('transaction_type')\
-                .eq('ticker', ticker).eq('transaction_type', 'Buy')\
-                .gte('transaction_date', (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'))\
-                .limit(1).execute()
-            insider_buy = len(result.data or []) > 0
-            r2 = supabase.table('filings').select('company_name')\
-                .eq('ticker', ticker).limit(1).execute()
-            if r2.data:
-                company_name = r2.data[0].get('company_name', '')
-        except:
-            pass
-
+        bullish, bearish, neutral, _ = _parse_messages(messages)
+        total = bullish + bearish + neutral
+        if total == 0:
+            continue
+        score = round((bullish - bearish) / total, 2)
+        insider_buy = any(
+            f.get('ticker') == ticker and f.get('transaction_type') == 'Buy'
+            for f in filings_cache
+        )
+        company_name = next(
+            (f.get('company_name', '') for f in filings_cache if f.get('ticker') == ticker), ''
+        )
         results.append({
-            'ticker': ticker, 'company_name': company_name,
-            'mentions': data['mentions'],
-            'sentiment_score': round(avg_score, 2),
-            'bullish_pct': round(bullish / total * 100) if total else 0,
-            'bearish_pct': round(bearish / total * 100) if total else 0,
-            'neutral_pct': round(neutral / total * 100) if total else 0,
-            'subreddits': list(data['subreddits']),
-            'top_post': data['top_post'],
-            'total_upvotes': data['total_upvotes'],
-            'total_comments': data['total_comments'],
+            'ticker': ticker,
+            'company_name': company_name,
+            'mentions': total,
+            'sentiment_score': score,
+            'bullish_pct': round(bullish / total * 100),
+            'bearish_pct': round(bearish / total * 100),
+            'neutral_pct': round(neutral / total * 100),
+            'source': 'stocktwits',
             'insider_buy': insider_buy,
         })
+        time.sleep(0.3)
 
-    results.sort(key=lambda x: (x['mentions'], x['total_upvotes']), reverse=True)
+    results.sort(key=lambda x: x['mentions'], reverse=True)
     return results[:30]
 
 def get_ticker_sentiment(ticker, period='24h'):
-    sort = 'new' if period == '24h' else 'hot'
-    time_filter = 'day' if period == '24h' else 'week' if period == '7d' else 'month'
-    all_posts = []
-
-    for subreddit in SUBREDDITS:
-        posts = fetch_subreddit_posts(subreddit, sort=sort, limit=100, time_filter=time_filter)
-        for post in posts:
-            title = post.get('title', '')
-            body = post.get('selftext', '')
-            text = f'{title} {body}'
-            if f'${ticker}' not in text.upper() and not _re.search(rf'\b{ticker}\b', text.upper()):
-                continue
-            score = analyze_sentiment_text(text)
-            all_posts.append({
-                'subreddit': subreddit, 'title': title[:200],
-                'sentiment_score': score,
-                'upvotes': post.get('ups', 0),
-                'comments': post.get('num_comments', 0),
-                'url': f"https://reddit.com{post.get('permalink', '')}",
-            })
-        time.sleep(0.5)
-
-    if not all_posts:
-        return {'ticker': ticker, 'mentions': 0, 'posts': [], 'sentiment_score': 0}
-
-    scores = [p['sentiment_score'] for p in all_posts]
-    avg = sum(scores) / len(scores)
-    bullish = len([s for s in scores if s > 0.2])
-    bearish = len([s for s in scores if s < -0.2])
-
+    messages = _st_fetch(ticker.upper())
+    if not messages:
+        return {
+            'ticker': ticker.upper(), 'mentions': 0, 'sentiment_score': 0,
+            'bullish_pct': 0, 'bearish_pct': 0, 'neutral_pct': 0,
+            'posts': [], 'source': 'stocktwits',
+        }
+    bullish, bearish, neutral, posts = _parse_messages(messages)
+    total = bullish + bearish + neutral
+    score = round((bullish - bearish) / total, 2) if total else 0
     return {
-        'ticker': ticker.upper(), 'mentions': len(all_posts),
-        'sentiment_score': round(avg, 2),
-        'bullish_pct': round(bullish / len(scores) * 100),
-        'bearish_pct': round(bearish / len(scores) * 100),
-        'neutral_pct': round((len(scores) - bullish - bearish) / len(scores) * 100),
-        'posts': sorted(all_posts, key=lambda x: x['upvotes'], reverse=True)[:10],
+        'ticker': ticker.upper(),
+        'mentions': total,
+        'sentiment_score': score,
+        'bullish_pct': round(bullish / total * 100) if total else 0,
+        'bearish_pct': round(bearish / total * 100) if total else 0,
+        'neutral_pct': round(neutral / total * 100) if total else 0,
+        'posts': sorted(posts, key=lambda x: x['likes'], reverse=True)[:10],
+        'source': 'stocktwits',
     }
 
 @app.route('/api/sentiment/trending')
