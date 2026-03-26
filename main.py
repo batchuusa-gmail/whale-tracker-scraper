@@ -1683,11 +1683,59 @@ def heatmap():
         stocks = sorted([s for s in stocks if s['change_pct'] > 0], key=lambda x: x['change_pct'], reverse=True)
     elif filter_type == 'losers':
         stocks = sorted([s for s in stocks if s['change_pct'] < 0], key=lambda x: x['change_pct'])
-    elif filter_type == '52w_gainers':
-        stocks = sorted(stocks, key=lambda x: x['change_pct'], reverse=True)
-    elif filter_type == '52w_losers':
-        stocks = sorted(stocks, key=lambda x: x['change_pct'])
-    else:
+    elif filter_type in ('52w_gainers', '52w_losers'):
+        # Fetch 52-week performance via Alpaca bars (1 year of daily data)
+        w52 = {}
+        if ALPACA_KEY and ALPACA_SECRET:
+            try:
+                hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+                syms = [s['ticker'] for s in stocks]
+                from datetime import datetime, timedelta
+                end = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                start = (datetime.utcnow() - timedelta(days=365)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                r52 = requests.get(
+                    'https://data.alpaca.markets/v2/stocks/bars',
+                    headers=hdrs,
+                    params={'symbols': ','.join(syms), 'timeframe': '1Day',
+                            'start': start, 'end': end, 'limit': 2, 'sort': 'asc', 'feed': 'sip'},
+                    timeout=12,
+                )
+                if r52.status_code == 200:
+                    bars_data = r52.json().get('bars', {})
+                    for sym, bars in bars_data.items():
+                        if len(bars) >= 2:
+                            open_52w = float(bars[0].get('o', 0))
+                            latest = next((s['price'] for s in stocks if s['ticker'] == sym), 0)
+                            if open_52w > 0 and latest > 0:
+                                w52[sym] = round((latest - open_52w) / open_52w * 100, 2)
+            except Exception as e:
+                logger.error(f'52w bars error: {e}')
+        # Attach 52w_pct; fall back to daily change_pct if bars unavailable
+        for s in stocks:
+            s['w52_pct'] = w52.get(s['ticker'], s['change_pct'])
+        if filter_type == '52w_gainers':
+            stocks = sorted(stocks, key=lambda x: x['w52_pct'], reverse=True)
+        else:
+            stocks = sorted(stocks, key=lambda x: x['w52_pct'])
+    elif filter_type == 'insider_buys':
+        # Pull recent insider buys from our own filings table and surface those tickers
+        try:
+            from datetime import datetime, timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d')
+            resp = supabase.table('insider_filings') \
+                .select('ticker') \
+                .eq('transaction_type', 'Buy') \
+                .gte('transaction_date', cutoff) \
+                .execute()
+            insider_tickers = {r['ticker'] for r in (resp.data or [])}
+            if insider_tickers:
+                insider = [s for s in stocks if s['ticker'] in insider_tickers]
+                rest    = [s for s in stocks if s['ticker'] not in insider_tickers]
+                stocks  = sorted(insider, key=lambda x: x['change_pct'], reverse=True) + rest
+        except Exception as e:
+            logger.error(f'insider_buys filter error: {e}')
+            stocks = sorted(stocks, key=lambda x: abs(x['change_pct']), reverse=True)
+    else:  # active — most movement
         stocks = sorted(stocks, key=lambda x: abs(x['change_pct']), reverse=True)
     return jsonify(stocks[:40])
 
