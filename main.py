@@ -1614,7 +1614,6 @@ def api_quotes_batch():
 
 @app.route('/api/heatmap')
 def heatmap():
-    import yfinance as yf
     filter_type = request.args.get('filter', 'active')
     TICKERS = [
         'AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA','JPM','V','WMT',
@@ -1622,18 +1621,64 @@ def heatmap():
         'AMD','NFLX','INTC','DIS','ADBE','QCOM','MU','TXN','GS','PLTR',
         'UBER','RIVN','COIN','SNOW','HOOD','SOFI','RBLX','LCID','PYPL',
     ]
+    # Market caps (static — updated infrequently, avoids extra API calls)
+    MKTCAP = {
+        'AAPL':2.95e12,'MSFT':3.08e12,'NVDA':2.16e12,'GOOGL':2.14e12,'AMZN':1.94e12,
+        'META':1.32e12,'TSLA':7.90e11,'JPM':5.64e11,'V':5.55e11,'WMT':5.48e11,
+        'JNJ':3.80e11,'XOM':4.60e11,'BAC':3.10e11,'MA':4.50e11,'AVGO':7.28e11,
+        'LLY':7.52e11,'MRK':2.60e11,'CVX':2.80e11,'PEP':2.10e11,'COST':3.40e11,
+        'AMD':2.89e11,'NFLX':2.71e11,'INTC':1.20e11,'DIS':2.00e11,'ADBE':2.40e11,
+        'QCOM':1.80e11,'MU':1.40e11,'TXN':1.70e11,'GS':1.60e11,'PLTR':5.35e10,
+        'UBER':1.52e11,'RIVN':1.40e10,'COIN':5.12e10,'SNOW':5.08e10,'HOOD':1.80e10,
+        'SOFI':9.00e9,'RBLX':2.50e10,'LCID':5.50e9,'PYPL':7.00e10,
+    }
     stocks = []
-    for ticker in TICKERS:
+
+    # Try Alpaca snapshots first — one fast batch call
+    if ALPACA_KEY and ALPACA_SECRET:
         try:
-            t = yf.Ticker(ticker)
-            info = t.fast_info
-            price = float(info.last_price or 0)
-            prev = float(info.previous_close or 0)
-            chg = round((price - prev) / prev * 100, 2) if prev else 0
-            mktcap = float(info.market_cap or 1e9)
-            stocks.append({'ticker': ticker, 'price': round(price, 2), 'change_pct': chg, 'market_cap': mktcap})
-        except Exception:
-            pass
+            hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+            r = requests.get(
+                'https://data.alpaca.markets/v2/stocks/snapshots',
+                headers=hdrs,
+                params={'symbols': ','.join(TICKERS), 'feed': 'sip'},
+                timeout=12,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for sym, snap in data.items():
+                    last = float(snap.get('latestTrade', {}).get('p', 0))
+                    prev = float(snap.get('prevDailyBar', {}).get('c', 0))
+                    chg = round((last - prev) / prev * 100, 2) if prev and last else 0
+                    if last > 0:
+                        stocks.append({
+                            'ticker': sym,
+                            'price': round(last, 2),
+                            'change_pct': chg,
+                            'market_cap': MKTCAP.get(sym, 1e10),
+                        })
+        except Exception as e:
+            logger.error(f'Alpaca heatmap error: {e}')
+
+    # Fallback: yfinance if Alpaca returned nothing
+    if not stocks:
+        import yfinance as yf
+        for ticker in TICKERS:
+            try:
+                info = yf.Ticker(ticker).fast_info
+                price = float(info.last_price or 0)
+                prev = float(info.previous_close or 0)
+                chg = round((price - prev) / prev * 100, 2) if prev else 0
+                if price > 0:
+                    stocks.append({
+                        'ticker': ticker,
+                        'price': round(price, 2),
+                        'change_pct': chg,
+                        'market_cap': MKTCAP.get(ticker, 1e10),
+                    })
+            except Exception:
+                pass
+
     if filter_type == 'gainers':
         stocks = sorted([s for s in stocks if s['change_pct'] > 0], key=lambda x: x['change_pct'], reverse=True)
     elif filter_type == 'losers':
