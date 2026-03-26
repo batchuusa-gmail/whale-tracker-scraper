@@ -6,6 +6,7 @@ SEC Form 4 Insider Trading Scraper
 - Enriches with Yahoo Finance stock prices
 """
 import os, re, json, time, random, requests, threading
+import alpaca_trade_api as tradeapi
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
@@ -24,13 +25,16 @@ USER_AGENT = "WhaleTracker batchuusa@gmail.com"
 SEC_HEADERS = {'User-Agent': USER_AGENT, 'Accept-Encoding': 'gzip, deflate', 'Accept': '*/*'}
 SEC_DELAY = 0.6
 
-ALPACA_KEY    = os.getenv('ALPACA_KEY', '')
-ALPACA_SECRET = os.getenv('ALPACA_SECRET', '')
-ALPACA_BASE   = 'https://data.alpaca.markets/v2'
-ALPACA_HEADERS = {
-    'APCA-API-KEY-ID': ALPACA_KEY,
-    'APCA-API-SECRET-KEY': ALPACA_SECRET,
-}
+ALPACA_KEY    = os.environ.get('ALPACA_KEY', '')
+ALPACA_SECRET = os.environ.get('ALPACA_SECRET', '')
+
+def get_alpaca_client():
+    return tradeapi.REST(
+        key_id=ALPACA_KEY,
+        secret_key=ALPACA_SECRET,
+        base_url='https://paper-api.alpaca.markets',
+        api_version='v2',
+    )
 
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg')
@@ -249,107 +253,39 @@ class YahooFinance:
 
 # ─── Alpaca Market Data ──────────────────────────────────────────
 
-def alpaca_quote(ticker):
-    """Fetch real-time quote from Alpaca SIP feed. Returns bid/ask/last/change_pct."""
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        return None
-    try:
-        # Latest trade (last price)
-        trade_r = requests.get(
-            f'{ALPACA_BASE}/stocks/{ticker}/trades/latest',
-            headers=ALPACA_HEADERS,
-            params={'feed': 'sip'},
-            timeout=6,
-        )
-        # Latest quote (bid/ask)
-        quote_r = requests.get(
-            f'{ALPACA_BASE}/stocks/{ticker}/quotes/latest',
-            headers=ALPACA_HEADERS,
-            params={'feed': 'sip'},
-            timeout=6,
-        )
-        # Previous close (for change %)
-        snap_r = requests.get(
-            f'{ALPACA_BASE}/stocks/{ticker}/snapshot',
-            headers=ALPACA_HEADERS,
-            params={'feed': 'sip'},
-            timeout=6,
-        )
-
-        last_price = 0.0
-        bid = 0.0
-        ask = 0.0
-        prev_close = 0.0
-        change_pct = 0.0
-
-        if trade_r.status_code == 200:
-            t = trade_r.json().get('trade', {})
-            last_price = float(t.get('p', 0))
-
-        if quote_r.status_code == 200:
-            q = quote_r.json().get('quote', {})
-            bid = float(q.get('bp', 0))
-            ask = float(q.get('ap', 0))
-
-        if snap_r.status_code == 200:
-            snap = snap_r.json()
-            prev_close = float(snap.get('prevDailyBar', {}).get('c', 0))
-            if prev_close and last_price:
-                change_pct = round((last_price - prev_close) / prev_close * 100, 2)
-
-        if last_price == 0 and bid > 0 and ask > 0:
-            last_price = round((bid + ask) / 2, 2)
-
-        return {
-            'ticker': ticker,
-            'last': round(last_price, 2),
-            'bid': round(bid, 2),
-            'ask': round(ask, 2),
-            'prev_close': round(prev_close, 2),
-            'change_pct': change_pct,
-            'source': 'alpaca_sip',
-        }
-    except Exception as e:
-        logger.error(f'Alpaca quote error for {ticker}: {e}')
-        return None
-
-
 def alpaca_quotes_batch(tickers):
-    """Fetch snapshots for up to 100 tickers in one Alpaca call."""
+    """Fetch latest trades+quotes for up to 100 tickers via alpaca-trade-api."""
     if not ALPACA_KEY or not ALPACA_SECRET or not tickers:
         return {}
     try:
-        r = requests.get(
-            f'{ALPACA_BASE}/stocks/snapshots',
-            headers=ALPACA_HEADERS,
-            params={'symbols': ','.join(tickers[:100]), 'feed': 'sip'},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return {}
-        data = r.json()
+        api = get_alpaca_client()
+        quotes = api.get_latest_quotes(tickers[:100])
+        trades = api.get_latest_trades(tickers[:100])
         results = {}
-        for sym, snap in data.items():
-            last_price = float(snap.get('latestTrade', {}).get('p', 0))
-            bid = float(snap.get('latestQuote', {}).get('bp', 0))
-            ask = float(snap.get('latestQuote', {}).get('ap', 0))
-            prev_close = float(snap.get('prevDailyBar', {}).get('c', 0))
-            change_pct = 0.0
-            if prev_close and last_price:
-                change_pct = round((last_price - prev_close) / prev_close * 100, 2)
-            if last_price == 0 and bid and ask:
-                last_price = round((bid + ask) / 2, 2)
-            results[sym] = {
-                'ticker': sym,
-                'last': round(last_price, 2),
-                'bid': round(bid, 2),
-                'ask': round(ask, 2),
-                'prev_close': round(prev_close, 2),
-                'change_pct': change_pct,
-                'stock_price': round(last_price, 2),
-                'stock_change_pct': change_pct,
-                'source': 'alpaca_sip',
-            }
+        for sym in tickers[:100]:
+            try:
+                q = quotes.get(sym)
+                t = trades.get(sym)
+                if not q and not t:
+                    continue
+                last_price = float(t.p) if t else 0.0
+                bid = float(q.bp) if q else 0.0
+                ask = float(q.ap) if q else 0.0
+                if last_price == 0 and bid and ask:
+                    last_price = round((bid + ask) / 2, 2)
+                spread = round(ask - bid, 4) if bid and ask else 0.0
+                results[sym] = {
+                    'ticker': sym,
+                    'last': round(last_price, 2),
+                    'bid': round(bid, 2),
+                    'ask': round(ask, 2),
+                    'spread': spread,
+                    'stock_price': round(last_price, 2),
+                    'stock_change_pct': 0.0,
+                    'source': 'alpaca_sip',
+                }
+            except Exception:
+                pass
         return results
     except Exception as e:
         logger.error(f'Alpaca batch quote error: {e}')
@@ -1548,28 +1484,83 @@ def get_ticker_sentiment(ticker, period='24h'):
     }
 
 @app.route('/api/quote/<ticker>')
-def api_quote(ticker):
-    """Real-time bid/ask/last price via Alpaca SIP feed. Falls back to Yahoo Finance."""
-    ticker = ticker.upper()
-    result = alpaca_quote(ticker)
-    if result and result['last'] > 0:
+def get_quote(ticker):
+    try:
+        api = get_alpaca_client()
+        quote = api.get_latest_quote(ticker.upper())
+        trade = api.get_latest_trade(ticker.upper())
+        return jsonify({
+            'ticker': ticker.upper(),
+            'bid': float(quote.bp),
+            'ask': float(quote.ap),
+            'bid_size': int(quote.bs),
+            'ask_size': int(quote.as_),
+            'last_price': float(trade.p),
+            'last_size': int(trade.s),
+            'timestamp': str(quote.t),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/quotes')
+def get_quotes_batch():
+    try:
+        tickers = request.args.get('tickers', 'AAPL,TSLA,NVDA,MSFT,GOOGL').upper().split(',')
+        api = get_alpaca_client()
+        quotes = api.get_latest_quotes(tickers)
+        trades = api.get_latest_trades(tickers)
+        result = []
+        for ticker in tickers:
+            try:
+                q = quotes.get(ticker)
+                t = trades.get(ticker)
+                if q and t:
+                    result.append({
+                        'ticker': ticker,
+                        'bid': float(q.bp),
+                        'ask': float(q.ap),
+                        'last_price': float(t.p),
+                        'last_size': int(t.s),
+                        'spread': round(float(q.ap) - float(q.bp), 4),
+                        'timestamp': str(q.t),
+                    })
+            except Exception:
+                pass
         return jsonify(result)
-    # Fallback to Yahoo Finance if Alpaca not configured or fails
-    yq = YahooFinance.get_quote(ticker)
-    return jsonify({
-        'ticker': ticker,
-        'last': yq.get('stock_price', 0.0),
-        'bid': 0.0,
-        'ask': 0.0,
-        'prev_close': 0.0,
-        'change_pct': yq.get('stock_change_pct', 0.0),
-        'source': 'yahoo_finance',
-    })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/bars/<ticker>')
+def get_bars(ticker):
+    try:
+        api = get_alpaca_client()
+        timeframe = request.args.get('timeframe', '1Day')
+        limit = int(request.args.get('limit', 30))
+        bars = api.get_bars(
+            ticker.upper(),
+            tradeapi.TimeFrame.Day if timeframe == '1Day' else tradeapi.TimeFrame.Hour,
+            limit=limit,
+        ).df
+        result = []
+        for ts, row in bars.iterrows():
+            result.append({
+                'time': str(ts),
+                'open': round(float(row['open']), 2),
+                'high': round(float(row['high']), 2),
+                'low': round(float(row['low']), 2),
+                'close': round(float(row['close']), 2),
+                'volume': int(row['volume']),
+            })
+        return jsonify({'ticker': ticker.upper(), 'bars': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/quotes/batch', methods=['POST'])
 def api_quotes_batch():
-    """Batch real-time quotes for multiple tickers via Alpaca SIP snapshots."""
+    """Batch quotes for heatmap screen — used internally by Flutter."""
     try:
         body = request.get_json(force=True)
         tickers = [t.upper() for t in (body.get('tickers') or []) if t]
@@ -1577,16 +1568,12 @@ def api_quotes_batch():
             return jsonify({'error': 'tickers required'}), 400
         results = alpaca_quotes_batch(tickers)
         if not results:
-            # Fallback: Yahoo Finance batch
             yq = YahooFinance.get_quotes_batch(tickers[:30])
             for sym, q in yq.items():
                 results[sym] = {
                     'ticker': sym,
                     'last': q.get('stock_price', 0.0),
-                    'bid': 0.0,
-                    'ask': 0.0,
-                    'prev_close': 0.0,
-                    'change_pct': q.get('stock_change_pct', 0.0),
+                    'bid': 0.0, 'ask': 0.0, 'spread': 0.0,
                     'stock_price': q.get('stock_price', 0.0),
                     'stock_change_pct': q.get('stock_change_pct', 0.0),
                     'source': 'yahoo_finance',
