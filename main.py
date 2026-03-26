@@ -1486,18 +1486,47 @@ def get_ticker_sentiment(ticker, period='24h'):
 @app.route('/api/quote/<ticker>')
 def get_quote(ticker):
     try:
-        api = get_alpaca_client()
-        quote = api.get_latest_quote(ticker.upper())
-        trade = api.get_latest_trade(ticker.upper())
+        headers = {
+            'APCA-API-KEY-ID': ALPACA_KEY,
+            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+        }
+        r = requests.get(
+            f'https://data.alpaca.markets/v2/stocks/{ticker.upper()}/quotes/latest',
+            headers=headers, timeout=10,
+        )
+        t = requests.get(
+            f'https://data.alpaca.markets/v2/stocks/{ticker.upper()}/trades/latest',
+            headers=headers, timeout=10,
+        )
+        if r.status_code == 200 and t.status_code == 200:
+            q = r.json().get('quote', {})
+            tr = t.json().get('trade', {})
+            return jsonify({
+                'ticker': ticker.upper(),
+                'bid': q.get('bp', 0),
+                'ask': q.get('ap', 0),
+                'last_price': tr.get('p', 0),
+                'last_size': tr.get('s', 0),
+                'spread': round(q.get('ap', 0) - q.get('bp', 0), 4),
+                'timestamp': q.get('t', ''),
+                'source': 'alpaca_sip',
+            })
+    except Exception as e:
+        logger.error(f'Alpaca quote error: {e}')
+    # Fallback to Yahoo Finance
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        info = stock.fast_info
+        price = float(info.last_price or 0)
+        prev = float(info.previous_close or 0)
+        chg = round((price - prev) / prev * 100, 2) if prev else 0
         return jsonify({
             'ticker': ticker.upper(),
-            'bid': float(quote.bp),
-            'ask': float(quote.ap),
-            'bid_size': int(quote.bs),
-            'ask_size': int(quote.as_),
-            'last_price': float(trade.p),
-            'last_size': int(trade.s),
-            'timestamp': str(quote.t),
+            'last_price': price,
+            'bid': 0, 'ask': 0,
+            'change_pct': chg,
+            'source': 'yahoo_finance',
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
