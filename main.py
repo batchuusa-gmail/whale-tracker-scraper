@@ -1761,82 +1761,245 @@ def sentiment_ticker(ticker):
 
 @app.route('/api/congress')
 def api_congress():
-    """Return recent congressional stock trades from Supabase or fallback mock."""
+    """Return recent congressional stock trades from House/Senate Stock Watcher public data."""
+    HOUSE_URL  = 'https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json'
+    SENATE_URL = 'https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json'
+    trades = []
     try:
-        db = SupabaseClient()
-        result = db.select('congress_trades', params={
-            'order': 'trade_date.desc',
-            'limit': '50'
-        })
-        if result and len(result) > 0:
-            return jsonify(result)
+        hr = requests.get(HOUSE_URL, timeout=15)
+        if hr.status_code == 200:
+            for t in hr.json():
+                ticker = t.get('ticker', '').replace('$', '').strip().upper()
+                if not ticker or ticker in ('N/A', '--', ''):
+                    continue
+                tx_type = t.get('type', '').lower()
+                if 'purchase' in tx_type:
+                    kind = 'Buy'
+                elif 'sale' in tx_type:
+                    kind = 'Sell'
+                else:
+                    continue
+                party_raw = (t.get('party') or '').strip()
+                party = 'D' if 'democrat' in party_raw.lower() else ('R' if 'republican' in party_raw.lower() else party_raw[:1].upper())
+                trades.append({
+                    'member':  t.get('representative', ''),
+                    'party':   party,
+                    'chamber': 'House',
+                    'ticker':  ticker,
+                    'type':    kind,
+                    'amount':  t.get('amount', ''),
+                    'date':    t.get('transaction_date', t.get('disclosure_date', '')),
+                    'company': t.get('asset_description', ''),
+                })
     except Exception as e:
-        logger.warning(f"Congress trades DB fetch failed: {e}")
-    # Fallback mock data
+        logger.warning(f'House stock watcher error: {e}')
+    try:
+        sr = requests.get(SENATE_URL, timeout=15)
+        if sr.status_code == 200:
+            for t in sr.json():
+                ticker = (t.get('ticker') or '').replace('$', '').strip().upper()
+                if not ticker or ticker in ('N/A', '--', ''):
+                    continue
+                tx_type = (t.get('type') or '').lower()
+                if 'purchase' in tx_type:
+                    kind = 'Buy'
+                elif 'sale' in tx_type:
+                    kind = 'Sell'
+                else:
+                    continue
+                trades.append({
+                    'member':  t.get('senator', t.get('representative', '')),
+                    'party':   (t.get('party') or '')[:1].upper(),
+                    'chamber': 'Senate',
+                    'ticker':  ticker,
+                    'type':    kind,
+                    'amount':  t.get('amount', ''),
+                    'date':    t.get('transaction_date', t.get('disclosure_date', '')),
+                    'company': t.get('asset_description', ''),
+                })
+    except Exception as e:
+        logger.warning(f'Senate stock watcher error: {e}')
+
+    if trades:
+        trades.sort(key=lambda x: x.get('date', ''), reverse=True)
+        return jsonify(trades[:60])
+
+    # Fallback mock (only if both sources fail)
     mock = [
         {'member': 'Nancy Pelosi', 'party': 'D', 'chamber': 'House', 'ticker': 'NVDA', 'type': 'Buy', 'amount': '$1M–$5M', 'date': '2026-03-10', 'company': 'NVIDIA Corp'},
         {'member': 'Dan Crenshaw', 'party': 'R', 'chamber': 'House', 'ticker': 'AAPL', 'type': 'Buy', 'amount': '$15K–$50K', 'date': '2026-03-08', 'company': 'Apple Inc'},
         {'member': 'Tommy Tuberville', 'party': 'R', 'chamber': 'Senate', 'ticker': 'TSLA', 'type': 'Sell', 'amount': '$50K–$100K', 'date': '2026-03-07', 'company': 'Tesla Inc'},
         {'member': 'Mark Warner', 'party': 'D', 'chamber': 'Senate', 'ticker': 'MSFT', 'type': 'Buy', 'amount': '$100K–$250K', 'date': '2026-03-05', 'company': 'Microsoft Corp'},
-        {'member': 'Michael McCaul', 'party': 'R', 'chamber': 'House', 'ticker': 'GOOGL', 'type': 'Buy', 'amount': '$50K–$100K', 'date': '2026-03-04', 'company': 'Alphabet Inc'},
-        {'member': 'Josh Gottheimer', 'party': 'D', 'chamber': 'House', 'ticker': 'META', 'type': 'Buy', 'amount': '$15K–$50K', 'date': '2026-03-03', 'company': 'Meta Platforms'},
         {'member': 'Roger Marshall', 'party': 'R', 'chamber': 'Senate', 'ticker': 'AMZN', 'type': 'Sell', 'amount': '$15K–$50K', 'date': '2026-03-01', 'company': 'Amazon.com Inc'},
-        {'member': 'Marjorie Greene', 'party': 'R', 'chamber': 'House', 'ticker': 'AMD', 'type': 'Buy', 'amount': '$15K–$50K', 'date': '2026-02-28', 'company': 'Advanced Micro Devices'},
         {'member': 'Brian Schatz', 'party': 'D', 'chamber': 'Senate', 'ticker': 'PLTR', 'type': 'Buy', 'amount': '$50K–$100K', 'date': '2026-02-27', 'company': 'Palantir Technologies'},
-        {'member': 'Ro Khanna', 'party': 'D', 'chamber': 'House', 'ticker': 'COIN', 'type': 'Sell', 'amount': '$15K–$50K', 'date': '2026-02-25', 'company': 'Coinbase Global'},
-        {'member': 'Pat Toomey', 'party': 'R', 'chamber': 'Senate', 'ticker': 'JPM', 'type': 'Buy', 'amount': '$100K–$250K', 'date': '2026-02-24', 'company': 'JPMorgan Chase'},
-        {'member': 'Nancy Pelosi', 'party': 'D', 'chamber': 'House', 'ticker': 'CRWD', 'type': 'Buy', 'amount': '$500K–$1M', 'date': '2026-02-20', 'company': 'CrowdStrike Holdings'},
     ]
     return jsonify(mock)
 
 
 @app.route('/api/earnings')
 def api_earnings():
-    """Return upcoming earnings with insider activity signals."""
+    """Return upcoming earnings with real dates from yfinance + insider activity from cache."""
+    import yfinance as yf
     from datetime import datetime, timedelta
-    now = datetime.utcnow()
+    import pytz
 
-    # Static earnings calendar (updated periodically)
-    earnings = [
-        {'ticker': 'NVDA', 'company': 'NVIDIA Corporation', 'earnings_date': '2026-05-28', 'insider_action': 'Buy'},
-        {'ticker': 'AAPL', 'company': 'Apple Inc', 'earnings_date': '2026-04-30', 'insider_action': 'Buy'},
-        {'ticker': 'MSFT', 'company': 'Microsoft Corporation', 'earnings_date': '2026-04-22', 'insider_action': 'Buy'},
-        {'ticker': 'META', 'company': 'Meta Platforms', 'earnings_date': '2026-04-23', 'insider_action': 'none'},
-        {'ticker': 'AMZN', 'company': 'Amazon.com Inc', 'earnings_date': '2026-04-30', 'insider_action': 'none'},
-        {'ticker': 'GOOGL', 'company': 'Alphabet Inc', 'earnings_date': '2026-04-24', 'insider_action': 'Sell'},
-        {'ticker': 'TSLA', 'company': 'Tesla Inc', 'earnings_date': '2026-04-22', 'insider_action': 'Sell'},
-        {'ticker': 'PLTR', 'company': 'Palantir Technologies', 'earnings_date': '2026-05-05', 'insider_action': 'Buy'},
-        {'ticker': 'AMD', 'company': 'Advanced Micro Devices', 'earnings_date': '2026-04-28', 'insider_action': 'none'},
-        {'ticker': 'COIN', 'company': 'Coinbase Global', 'earnings_date': '2026-05-08', 'insider_action': 'Buy'},
-        {'ticker': 'CRWD', 'company': 'CrowdStrike Holdings', 'earnings_date': '2026-06-03', 'insider_action': 'Buy'},
-        {'ticker': 'SNOW', 'company': 'Snowflake Inc', 'earnings_date': '2026-05-21', 'insider_action': 'none'},
+    TICKERS = [
+        'NVDA','AAPL','MSFT','META','AMZN','GOOGL','TSLA','PLTR','AMD',
+        'COIN','CRWD','SNOW','UBER','JPM','V','NFLX','ADBE','QCOM','MU','GS',
     ]
+    NAMES = {
+        'NVDA':'NVIDIA Corporation','AAPL':'Apple Inc','MSFT':'Microsoft Corporation',
+        'META':'Meta Platforms','AMZN':'Amazon.com Inc','GOOGL':'Alphabet Inc',
+        'TSLA':'Tesla Inc','PLTR':'Palantir Technologies','AMD':'Advanced Micro Devices',
+        'COIN':'Coinbase Global','CRWD':'CrowdStrike Holdings','SNOW':'Snowflake Inc',
+        'UBER':'Uber Technologies','JPM':'JPMorgan Chase','V':'Visa Inc',
+        'NFLX':'Netflix Inc','ADBE':'Adobe Inc','QCOM':'Qualcomm Inc',
+        'MU':'Micron Technology','GS':'Goldman Sachs',
+    }
 
-    # Enrich with days_until and sort
-    try:
-        filings = _filings_cache or []
-        buy_tickers = {f.get('ticker', '') for f in filings if f.get('transaction_type') == 'Buy'}
-        sell_tickers = {f.get('ticker', '') for f in filings if f.get('transaction_type') == 'Sell'}
-        for e in earnings:
-            t = e['ticker']
-            if t in buy_tickers:
-                e['insider_action'] = 'Buy'
-            elif t in sell_tickers and e['insider_action'] != 'Buy':
-                e['insider_action'] = 'Sell'
-    except Exception:
-        pass
+    now = datetime.utcnow()
+    filings = _filings_cache or []
+    buy_tickers  = {f.get('ticker','') for f in filings if f.get('transaction_type') == 'Buy'}
+    sell_tickers = {f.get('ticker','') for f in filings if f.get('transaction_type') == 'Sell'}
 
     result = []
-    for e in earnings:
+    for ticker in TICKERS:
+        earnings_date = None
         try:
-            dt = datetime.strptime(e['earnings_date'], '%Y-%m-%d')
-            e['days_until'] = (dt - now).days
+            t = yf.Ticker(ticker)
+            # earnings_dates is a DataFrame indexed by datetime (tz-aware)
+            ed = t.earnings_dates
+            if ed is not None and not ed.empty:
+                # Filter to future dates only
+                tz = ed.index.tz
+                now_tz = datetime.utcnow().replace(tzinfo=pytz.utc) if tz else now
+                future = ed[ed.index >= now_tz]
+                if not future.empty:
+                    earnings_date = future.index[-1].strftime('%Y-%m-%d')
+        except Exception as e:
+            logger.debug(f'yfinance earnings {ticker}: {e}')
+
+        if not earnings_date:
+            continue  # skip if we can't get a real date
+
+        if ticker in buy_tickers:
+            insider_action = 'Buy'
+        elif ticker in sell_tickers:
+            insider_action = 'Sell'
+        else:
+            insider_action = 'none'
+
+        try:
+            dt = datetime.strptime(earnings_date, '%Y-%m-%d')
+            days_until = (dt - now).days
         except Exception:
-            e['days_until'] = 999
-        result.append(e)
+            days_until = 999
+
+        result.append({
+            'ticker': ticker,
+            'company': NAMES.get(ticker, ticker),
+            'earnings_date': earnings_date,
+            'insider_action': insider_action,
+            'days_until': days_until,
+        })
 
     result.sort(key=lambda x: x['days_until'])
+
+    # Fallback to static if yfinance returned nothing
+    if not result:
+        static = [
+            {'ticker':'NVDA','company':'NVIDIA Corporation','earnings_date':'2026-05-28','insider_action':'Buy','days_until':63},
+            {'ticker':'AAPL','company':'Apple Inc','earnings_date':'2026-04-30','insider_action':'Buy','days_until':35},
+            {'ticker':'MSFT','company':'Microsoft Corporation','earnings_date':'2026-04-22','insider_action':'Buy','days_until':27},
+            {'ticker':'GOOGL','company':'Alphabet Inc','earnings_date':'2026-04-24','insider_action':'Sell','days_until':29},
+            {'ticker':'TSLA','company':'Tesla Inc','earnings_date':'2026-04-22','insider_action':'Sell','days_until':27},
+            {'ticker':'AMD','company':'Advanced Micro Devices','earnings_date':'2026-04-28','insider_action':'none','days_until':33},
+        ]
+        return jsonify(static)
+
     return jsonify(result)
+
+
+@app.route('/api/perf/batch', methods=['POST'])
+def perf_batch():
+    """Return real % return since trade date for a list of {ticker, date} pairs.
+    Uses Alpaca bars for entry price and latest snapshot for current price."""
+    from datetime import datetime, timedelta
+    try:
+        items = request.get_json(force=True) or []
+        if not items:
+            return jsonify([])
+
+        hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+
+        # 1. Batch current prices via snapshots
+        unique_tickers = list({i['ticker'].upper() for i in items if i.get('ticker')})
+        current_prices = {}
+        if ALPACA_KEY and ALPACA_SECRET and unique_tickers:
+            try:
+                sr = requests.get(
+                    'https://data.alpaca.markets/v2/stocks/snapshots',
+                    headers=hdrs,
+                    params={'symbols': ','.join(unique_tickers), 'feed': 'sip'},
+                    timeout=12,
+                )
+                if sr.status_code == 200:
+                    for sym, snap in sr.json().items():
+                        p = float(snap.get('latestTrade', {}).get('p', 0))
+                        if p > 0:
+                            current_prices[sym] = p
+            except Exception as e:
+                logger.error(f'perf/batch snapshot error: {e}')
+
+        # 2. For each item get the bar at/after trade date to find entry price
+        results = []
+        for item in items[:30]:  # cap at 30
+            ticker = (item.get('ticker') or '').upper()
+            date_str = (item.get('date') or '')[:10]  # YYYY-MM-DD
+            if not ticker or not date_str:
+                continue
+            entry_price = 0
+            try:
+                # Try 5 days forward from date to handle weekends/holidays
+                start_dt = datetime.strptime(date_str, '%Y-%m-%d')
+                end_dt = start_dt + timedelta(days=7)
+                br = requests.get(
+                    f'https://data.alpaca.markets/v2/stocks/{ticker}/bars',
+                    headers=hdrs,
+                    params={
+                        'timeframe': '1Day',
+                        'start': start_dt.strftime('%Y-%m-%dT00:00:00Z'),
+                        'end': end_dt.strftime('%Y-%m-%dT00:00:00Z'),
+                        'limit': 1,
+                        'feed': 'sip',
+                    },
+                    timeout=8,
+                )
+                if br.status_code == 200:
+                    bars = br.json().get('bars', [])
+                    if bars:
+                        entry_price = float(bars[0].get('c', 0))
+            except Exception as e:
+                logger.debug(f'perf/batch bar {ticker} {date_str}: {e}')
+
+            current = current_prices.get(ticker, 0)
+            if entry_price > 0 and current > 0:
+                change_pct = round((current - entry_price) / entry_price * 100, 2)
+            else:
+                change_pct = None  # unknown
+
+            results.append({
+                'ticker': ticker,
+                'date': date_str,
+                'entry_price': round(entry_price, 2),
+                'current_price': round(current, 2),
+                'change_pct': change_pct,
+            })
+
+        return jsonify(results)
+    except Exception as e:
+        logger.error(f'perf/batch error: {e}')
+        return jsonify([]), 500
 
 
 if __name__ == '__main__':
