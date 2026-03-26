@@ -1612,6 +1612,41 @@ def api_quotes_batch():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/heatmap')
+def heatmap():
+    import yfinance as yf
+    filter_type = request.args.get('filter', 'active')
+    TICKERS = [
+        'AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA','JPM','V','WMT',
+        'JNJ','XOM','BAC','MA','AVGO','LLY','MRK','CVX','PEP','COST',
+        'AMD','NFLX','INTC','DIS','ADBE','QCOM','MU','TXN','GS','PLTR',
+        'UBER','RIVN','COIN','SNOW','HOOD','SOFI','RBLX','LCID','PYPL',
+    ]
+    stocks = []
+    for ticker in TICKERS:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.fast_info
+            price = float(info.last_price or 0)
+            prev = float(info.previous_close or 0)
+            chg = round((price - prev) / prev * 100, 2) if prev else 0
+            mktcap = float(info.market_cap or 1e9)
+            stocks.append({'ticker': ticker, 'price': round(price, 2), 'change_pct': chg, 'market_cap': mktcap})
+        except Exception:
+            pass
+    if filter_type == 'gainers':
+        stocks = sorted([s for s in stocks if s['change_pct'] > 0], key=lambda x: x['change_pct'], reverse=True)
+    elif filter_type == 'losers':
+        stocks = sorted([s for s in stocks if s['change_pct'] < 0], key=lambda x: x['change_pct'])
+    elif filter_type == '52w_gainers':
+        stocks = sorted(stocks, key=lambda x: x['change_pct'], reverse=True)
+    elif filter_type == '52w_losers':
+        stocks = sorted(stocks, key=lambda x: x['change_pct'])
+    else:
+        stocks = sorted(stocks, key=lambda x: abs(x['change_pct']), reverse=True)
+    return jsonify(stocks[:40])
+
+
 @app.route('/api/sentiment/trending')
 def sentiment_trending():
     try:
