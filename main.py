@@ -25,8 +25,9 @@ USER_AGENT = "WhaleTracker batchuusa@gmail.com"
 SEC_HEADERS = {'User-Agent': USER_AGENT, 'Accept-Encoding': 'gzip, deflate', 'Accept': '*/*'}
 SEC_DELAY = 0.6
 
-ALPACA_KEY    = os.environ.get('ALPACA_KEY', '')
-ALPACA_SECRET = os.environ.get('ALPACA_SECRET', '')
+ALPACA_KEY       = os.environ.get('ALPACA_KEY', '')
+ALPACA_SECRET    = os.environ.get('ALPACA_SECRET', '')
+ANTHROPIC_KEY    = os.environ.get('ANTHROPIC_API_KEY', '')
 
 def get_alpaca_client():
     return tradeapi.REST(
@@ -1722,12 +1723,13 @@ def heatmap():
         try:
             from datetime import datetime, timedelta
             cutoff = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d')
-            resp = supabase.table('insider_filings') \
-                .select('ticker') \
-                .eq('transaction_type', 'Buy') \
-                .gte('transaction_date', cutoff) \
-                .execute()
-            insider_tickers = {r['ticker'] for r in (resp.data or [])}
+            _db = SupabaseClient()
+            filings_30d = _db.get_recent('filings', limit=500)
+            insider_tickers = {
+                f['ticker'] for f in filings_30d
+                if f.get('transaction_type') == 'Buy'
+                and (f.get('transaction_date', '') or '') >= cutoff
+            }
             if insider_tickers:
                 insider = [s for s in stocks if s['ticker'] in insider_tickers]
                 rest    = [s for s in stocks if s['ticker'] not in insider_tickers]
@@ -1918,6 +1920,101 @@ def api_earnings():
         return jsonify(static)
 
     return jsonify(result)
+
+
+@app.route('/api/signal/<ticker>')
+def ai_signal(ticker):
+    """Claude AI signal analysis for a ticker based on recent insider trades."""
+    if not ANTHROPIC_KEY:
+        return jsonify({'error': 'AI signals not configured'}), 503
+    try:
+        import anthropic as _anthropic
+        ticker = ticker.upper()
+
+        # Get filings from cache or DB
+        filings = [f for f in (_filings_cache or []) if f.get('ticker') == ticker]
+        if not filings:
+            _db = SupabaseClient()
+            filings = _db.get_by_ticker(ticker, limit=5)
+        if not filings:
+            return jsonify({'error': 'No filings found for this ticker'}), 404
+
+        # Get current stock price via Alpaca snapshot
+        price, chg = 0.0, 0.0
+        if ALPACA_KEY and ALPACA_SECRET:
+            try:
+                hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+                sr = requests.get(
+                    f'https://data.alpaca.markets/v2/stocks/{ticker}/snapshot',
+                    headers=hdrs, timeout=8,
+                )
+                if sr.status_code == 200:
+                    snap = sr.json().get('snapshot', sr.json())
+                    price = float((snap.get('latestTrade') or {}).get('p', 0))
+                    prev  = float((snap.get('prevDailyBar') or {}).get('c', 0))
+                    chg   = round((price - prev) / prev * 100, 2) if prev and price else 0
+            except Exception:
+                pass
+        if price == 0:
+            import yfinance as yf
+            try:
+                info = yf.Ticker(ticker).fast_info
+                price = float(info.last_price or 0)
+                prev  = float(info.previous_close or 0)
+                chg   = round((price - prev) / prev * 100, 2) if prev else 0
+            except Exception:
+                pass
+
+        # Build filing summary (up to 3)
+        lines = []
+        for f in filings[:3]:
+            name   = f.get('owner_name', f.get('ownerName', ''))
+            role   = f.get('owner_type', f.get('ownerType', ''))
+            ttype  = f.get('transaction_type', f.get('transactionType', ''))
+            val    = float(f.get('value', 0) or 0)
+            shares = float(f.get('shares', 0) or 0)
+            fp     = float(f.get('price', 0) or 0)
+            date   = f.get('transaction_date', f.get('transactionDate', ''))
+            lines.append(
+                f"- {name} ({role}) {ttype} ${val:,.0f} of {shares:,.0f} shares at ${fp:.2f} on {date}"
+            )
+        filing_summary = '\n'.join(lines)
+
+        client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=400,
+            messages=[{
+                'role': 'user',
+                'content': f"""Analyze this insider trading data for {ticker} and give a brief signal assessment.
+
+Stock: {ticker}
+Current price: ${price:.2f} ({chg:+.2f}% today)
+
+Recent insider trades:
+{filing_summary}
+
+Respond in JSON format only (no markdown, no backticks):
+{{
+  "signal": "STRONG BUY" or "BUY" or "NEUTRAL" or "SELL" or "STRONG SELL",
+  "confidence": 0-100,
+  "summary": "2-3 sentence plain English explanation",
+  "key_factors": ["factor1", "factor2", "factor3"]
+}}"""
+            }],
+        )
+        text = msg.content[0].text.strip()
+        # Strip any markdown code fences if model adds them
+        if text.startswith('```'):
+            text = text.split('```')[1]
+            if text.startswith('json'):
+                text = text[4:]
+        response = json.loads(text)
+        response['ticker'] = ticker
+        return jsonify(response)
+    except Exception as e:
+        logger.error(f'AI signal error {ticker}: {e}')
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/perf/batch', methods=['POST'])
