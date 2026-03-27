@@ -1656,64 +1656,53 @@ def heatmap():
                             'ticker': sym,
                             'price': round(last, 2),
                             'change_pct': chg,
+                            'w52_pct': chg,  # placeholder; replaced by 52w filter logic if needed
                             'market_cap': MKTCAP.get(sym, 1e10),
                         })
         except Exception as e:
             logger.error(f'Alpaca heatmap error: {e}')
 
-    # Fallback: yfinance if Alpaca returned nothing
+    # Fallback: Yahoo Finance batch quote API (free, no auth, single request)
     if not stocks:
-        import yfinance as yf
-        for ticker in TICKERS:
-            try:
-                info = yf.Ticker(ticker).fast_info
-                price = float(info.last_price or 0)
-                prev = float(info.previous_close or 0)
-                chg = round((price - prev) / prev * 100, 2) if prev else 0
-                if price > 0:
-                    stocks.append({
-                        'ticker': ticker,
-                        'price': round(price, 2),
-                        'change_pct': chg,
-                        'market_cap': MKTCAP.get(ticker, 1e10),
-                    })
-            except Exception:
-                pass
+        try:
+            yq_headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+            r = requests.get(
+                'https://query1.finance.yahoo.com/v7/finance/quote',
+                headers=yq_headers,
+                params={'symbols': ','.join(TICKERS)},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                results = r.json().get('quoteResponse', {}).get('result', [])
+                for q in results:
+                    price = float(q.get('regularMarketPrice', 0) or 0)
+                    chg = float(q.get('regularMarketChangePercent', 0) or 0)
+                    sym = q.get('symbol', '')
+                    # fiftyTwoWeekChange is a decimal ratio (e.g. 0.35 = +35%)
+                    w52_raw = q.get('fiftyTwoWeekChange')
+                    w52_pct = round(float(w52_raw) * 100, 2) if w52_raw is not None else chg
+                    if price > 0 and sym:
+                        stocks.append({
+                            'ticker': sym,
+                            'price': round(price, 2),
+                            'change_pct': round(chg, 2),
+                            'w52_pct': w52_pct,
+                            'market_cap': MKTCAP.get(sym, 1e10),
+                        })
+            else:
+                logger.warning(f'Yahoo Finance batch status: {r.status_code}')
+        except Exception as e:
+            logger.error(f'Yahoo Finance batch heatmap error: {e}')
 
     if filter_type == 'gainers':
         stocks = sorted([s for s in stocks if s['change_pct'] > 0], key=lambda x: x['change_pct'], reverse=True)
     elif filter_type == 'losers':
         stocks = sorted([s for s in stocks if s['change_pct'] < 0], key=lambda x: x['change_pct'])
     elif filter_type in ('52w_gainers', '52w_losers'):
-        # Fetch 52-week performance via Alpaca bars (1 year of daily data)
-        w52 = {}
-        if ALPACA_KEY and ALPACA_SECRET:
-            try:
-                hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
-                syms = [s['ticker'] for s in stocks]
-                from datetime import datetime, timedelta
-                end = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-                start = (datetime.utcnow() - timedelta(days=365)).strftime('%Y-%m-%dT%H:%M:%SZ')
-                r52 = requests.get(
-                    'https://data.alpaca.markets/v2/stocks/bars',
-                    headers=hdrs,
-                    params={'symbols': ','.join(syms), 'timeframe': '1Day',
-                            'start': start, 'end': end, 'limit': 2, 'sort': 'asc', 'feed': 'sip'},
-                    timeout=12,
-                )
-                if r52.status_code == 200:
-                    bars_data = r52.json().get('bars', {})
-                    for sym, bars in bars_data.items():
-                        if len(bars) >= 2:
-                            open_52w = float(bars[0].get('o', 0))
-                            latest = next((s['price'] for s in stocks if s['ticker'] == sym), 0)
-                            if open_52w > 0 and latest > 0:
-                                w52[sym] = round((latest - open_52w) / open_52w * 100, 2)
-            except Exception as e:
-                logger.error(f'52w bars error: {e}')
-        # Attach 52w_pct; fall back to daily change_pct if bars unavailable
+        # w52_pct already populated from Yahoo Finance batch (or falls back to daily change_pct)
         for s in stocks:
-            s['w52_pct'] = w52.get(s['ticker'], s['change_pct'])
+            if 'w52_pct' not in s:
+                s['w52_pct'] = s['change_pct']
         if filter_type == '52w_gainers':
             stocks = sorted(stocks, key=lambda x: x['w52_pct'], reverse=True)
         else:
@@ -1763,64 +1752,42 @@ def sentiment_ticker(ticker):
 
 @app.route('/api/congress')
 def api_congress():
-    """Return recent congressional stock trades from House/Senate Stock Watcher public data."""
-    HOUSE_URL  = 'https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json'
-    SENATE_URL = 'https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json'
+    """Return recent congressional stock trades from QuiverQuant (free, no auth)."""
     trades = []
     try:
-        hr = requests.get(HOUSE_URL, timeout=15)
-        if hr.status_code == 200:
-            for t in hr.json():
-                ticker = t.get('ticker', '').replace('$', '').strip().upper()
+        r = requests.get(
+            'https://api.quiverquant.com/beta/live/congresstrading',
+            headers={'Accept': 'application/json'},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            for t in r.json():
+                ticker = (t.get('Ticker') or '').strip().upper()
                 if not ticker or ticker in ('N/A', '--', ''):
                     continue
-                tx_type = t.get('type', '').lower()
-                if 'purchase' in tx_type:
+                ticker_type = (t.get('TickerType') or '')
+                if ticker_type not in ('ST', ''):  # only stocks
+                    continue
+                tx_raw = (t.get('Transaction') or '').lower()
+                if 'purchase' in tx_raw or 'buy' in tx_raw:
                     kind = 'Buy'
-                elif 'sale' in tx_type:
+                elif 'sale' in tx_raw or 'sell' in tx_raw:
                     kind = 'Sell'
                 else:
                     continue
-                party_raw = (t.get('party') or '').strip()
-                party = 'D' if 'democrat' in party_raw.lower() else ('R' if 'republican' in party_raw.lower() else party_raw[:1].upper())
+                chamber = 'Senate' if (t.get('House') or '') == 'Senate' else 'House'
                 trades.append({
-                    'member':  t.get('representative', ''),
-                    'party':   party,
-                    'chamber': 'House',
+                    'member':  t.get('Representative', ''),
+                    'party':   (t.get('Party') or '')[:1].upper(),
+                    'chamber': chamber,
                     'ticker':  ticker,
                     'type':    kind,
-                    'amount':  t.get('amount', ''),
-                    'date':    t.get('transaction_date', t.get('disclosure_date', '')),
-                    'company': t.get('asset_description', ''),
+                    'amount':  t.get('Range', ''),
+                    'date':    t.get('TransactionDate', t.get('ReportDate', '')),
+                    'company': t.get('Description', '')[:80],
                 })
     except Exception as e:
-        logger.warning(f'House stock watcher error: {e}')
-    try:
-        sr = requests.get(SENATE_URL, timeout=15)
-        if sr.status_code == 200:
-            for t in sr.json():
-                ticker = (t.get('ticker') or '').replace('$', '').strip().upper()
-                if not ticker or ticker in ('N/A', '--', ''):
-                    continue
-                tx_type = (t.get('type') or '').lower()
-                if 'purchase' in tx_type:
-                    kind = 'Buy'
-                elif 'sale' in tx_type:
-                    kind = 'Sell'
-                else:
-                    continue
-                trades.append({
-                    'member':  t.get('senator', t.get('representative', '')),
-                    'party':   (t.get('party') or '')[:1].upper(),
-                    'chamber': 'Senate',
-                    'ticker':  ticker,
-                    'type':    kind,
-                    'amount':  t.get('amount', ''),
-                    'date':    t.get('transaction_date', t.get('disclosure_date', '')),
-                    'company': t.get('asset_description', ''),
-                })
-    except Exception as e:
-        logger.warning(f'Senate stock watcher error: {e}')
+        logger.warning(f'QuiverQuant congress error: {e}')
 
     if trades:
         trades.sort(key=lambda x: x.get('date', ''), reverse=True)
