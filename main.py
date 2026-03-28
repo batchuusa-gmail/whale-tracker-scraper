@@ -838,7 +838,7 @@ def create_app():
         key = os.environ.get('ANTHROPIC_API_KEY', '')
         return jsonify({
             'status': 'ok',
-            'version': '2026-03-28-v4-whal77',
+            'version': '2026-03-28-v5-whal78',
             'timestamp': datetime.now().isoformat(),
             'filings_cached': len(_filings_cache),
             'last_updated': _last_updated,
@@ -2283,6 +2283,15 @@ Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside 
         # Cache result for 10 minutes
         redis_set(cache_key, result, ttl_seconds=600)
 
+        # ── Auto paper trade if enabled (WHAL-78) ─────────────────
+        try:
+            from paper_trader import place_order as _place_order
+            trade_result = _place_order(result)
+            result['paper_trade'] = trade_result
+        except Exception as e:
+            logger.warning(f'Paper trade hook error: {e}')
+            result['paper_trade'] = {'status': 'error', 'message': str(e)}
+
         return jsonify(result)
 
     except json.JSONDecodeError as e:
@@ -2290,6 +2299,42 @@ Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside 
         return jsonify({'error': 'Failed to parse AI response', 'detail': str(e)}), 500
     except Exception as e:
         logger.error(f'AI signal engine error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Paper Trading endpoints (WHAL-78) ─────────────────────────────
+
+@app.route('/api/trading/paper/portfolio')
+def paper_portfolio():
+    """GET current Alpaca paper account + open positions."""
+    try:
+        from paper_trader import get_portfolio
+        return jsonify(get_portfolio())
+    except Exception as e:
+        logger.error(f'paper/portfolio error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/paper/trades')
+def paper_trades():
+    """GET recent paper trades from Supabase."""
+    try:
+        from paper_trader import get_trades
+        limit = request.args.get('limit', 50, type=int)
+        return jsonify(get_trades(limit=limit))
+    except Exception as e:
+        logger.error(f'paper/trades error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/paper/performance')
+def paper_performance():
+    """GET paper trading performance metrics."""
+    try:
+        from paper_trader import get_performance
+        return jsonify(get_performance())
+    except Exception as e:
+        logger.error(f'paper/performance error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
