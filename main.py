@@ -835,12 +835,15 @@ def create_app():
 
     @app.route('/api/health')
     def health():
+        key = os.environ.get('ANTHROPIC_API_KEY', '')
         return jsonify({
             'status': 'ok',
+            'version': '2026-03-28-v2',
             'timestamp': datetime.now().isoformat(),
             'filings_cached': len(_filings_cache),
             'last_updated': _last_updated,
-            'anthropic_configured': bool(os.environ.get('ANTHROPIC_API_KEY', '') or ANTHROPIC_KEY),
+            'anthropic_configured': bool(key),
+            'anthropic_key_len': len(key),
         })
 
     @app.route('/api/filings')
