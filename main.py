@@ -2043,6 +2043,191 @@ Respond in JSON format only (no markdown, no backticks):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/ai/signal', methods=['POST'])
+def ai_signal_engine():
+    """WHAL-76 — AI Signal Engine.
+
+    POST body (JSON):
+    {
+      "ticker":       "AAPL",
+      "company_name": "Apple Inc",
+      "owner_name":   "Tim Cook",
+      "owner_type":   "CEO",
+      "trade_type":   "Buy",          # Buy | Sell
+      "trade_value":  5000000,        # USD
+      "shares":       25000,
+      "price":        195.50,
+      "transaction_date": "2026-03-15",
+      "current_price": 198.00         # optional — fetched if omitted
+    }
+
+    Returns:
+    {
+      "ticker": "AAPL",
+      "signal": "STRONG BUY",
+      "confidence": 85,
+      "reasoning": "...",
+      "entry_price": 198.00,
+      "stop_loss":   188.10,
+      "target_price": 218.00,
+      "hold_days":    45,
+      "key_factors": ["CEO buy", "..."],
+      "generated_at": "2026-03-28T12:00:00"
+    }
+    """
+    _key = os.environ.get('ANTHROPIC_API_KEY', '') or ANTHROPIC_KEY
+    if not _key:
+        return jsonify({'error': 'AI signals not configured — set ANTHROPIC_API_KEY'}), 503
+
+    try:
+        body = request.get_json(force=True) or {}
+        ticker       = (body.get('ticker') or '').upper()
+        company      = body.get('company_name', ticker)
+        owner_name   = body.get('owner_name', 'Unknown')
+        owner_type   = body.get('owner_type', 'Insider')
+        trade_type   = body.get('trade_type', 'Buy')
+        trade_value  = float(body.get('trade_value') or 0)
+        shares       = int(body.get('shares') or 0)
+        trade_price  = float(body.get('price') or 0)
+        trade_date   = body.get('transaction_date', '')
+        current_price = float(body.get('current_price') or 0)
+
+        if not ticker:
+            return jsonify({'error': 'ticker is required'}), 400
+
+        # Redis cache check — key on ticker + trade_date + trade_type
+        cache_key = f'ai:signal:{ticker}:{trade_date}:{trade_type}'
+        cached = redis_get(cache_key)
+        if cached:
+            logger.info(f'AI signal cache hit: {cache_key}')
+            return jsonify(cached)
+
+        # Fetch current price if not provided
+        if current_price == 0:
+            if ALPACA_KEY and ALPACA_SECRET:
+                try:
+                    hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+                    sr = requests.get(
+                        f'https://data.alpaca.markets/v2/stocks/{ticker}/snapshot',
+                        headers=hdrs, timeout=8)
+                    if sr.status_code == 200:
+                        snap = sr.json().get('snapshot', sr.json())
+                        current_price = float((snap.get('latestTrade') or {}).get('p', 0))
+                except Exception:
+                    pass
+            if current_price == 0:
+                try:
+                    import yfinance as yf
+                    current_price = float(yf.Ticker(ticker).fast_info.last_price or 0)
+                except Exception:
+                    pass
+
+        # Build Claude prompt
+        value_str = f'${trade_value:,.0f}' if trade_value >= 1000 else f'${trade_value:.2f}'
+        prompt = f"""You are a quantitative analyst specializing in insider trading signals.
+
+Analyze this insider trade and generate a precise trading signal.
+
+Company: {company} ({ticker})
+Current stock price: ${current_price:.2f}
+Insider: {owner_name} ({owner_type})
+Trade: {trade_type} {shares:,} shares @ ${trade_price:.2f} = {value_str}
+Trade date: {trade_date}
+
+Rules for your analysis:
+- CEO/CFO/Director buys of >$1M are strongly bullish
+- Cluster buying (multiple insiders) is very bullish
+- Sells are often less meaningful unless CEO/CFO selling large %
+- High confidence = multiple confirming factors
+- Entry near current price, stop loss 5-8% below for buys, target 10-20% above
+
+Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside JSON):
+{{
+  "signal": "STRONG BUY" | "BUY" | "NEUTRAL" | "SELL" | "STRONG SELL",
+  "confidence": <integer 0-100>,
+  "reasoning": "<2-3 sentence plain English explanation for retail investors>",
+  "entry_price": <float, suggested entry price near current price>,
+  "stop_loss": <float, suggested stop loss price>,
+  "target_price": <float, price target>,
+  "hold_days": <integer, suggested holding period in days>,
+  "key_factors": ["<factor1>", "<factor2>", "<factor3>"]
+}}"""
+
+        api_resp = requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': _key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': 'claude-haiku-4-5-20251001',
+                'max_tokens': 600,
+                'messages': [{'role': 'user', 'content': prompt}],
+            },
+            timeout=30,
+        )
+
+        if not api_resp.ok:
+            logger.error(f'Claude API error: {api_resp.status_code} {api_resp.text[:300]}')
+            return jsonify({'error': 'AI service error', 'detail': api_resp.text[:200]}), 500
+
+        text = api_resp.json()['content'][0]['text'].strip()
+        # Strip markdown fences if model adds them
+        if text.startswith('```'):
+            text = '\n'.join(text.split('\n')[1:])
+            if text.endswith('```'):
+                text = text[:-3].strip()
+
+        result = json.loads(text)
+
+        # Enrich with request metadata
+        result['ticker']         = ticker
+        result['company_name']   = company
+        result['owner_name']     = owner_name
+        result['owner_type']     = owner_type
+        result['trade_type']     = trade_type
+        result['trade_value']    = trade_value
+        result['current_price']  = round(current_price, 2)
+        result['generated_at']   = datetime.utcnow().isoformat()
+
+        # Store in Supabase ai_signals table (best-effort)
+        try:
+            _db = SupabaseClient()
+            _db.upsert('ai_signals', [{
+                'ticker':        ticker,
+                'company_name':  company,
+                'owner_name':    owner_name,
+                'owner_type':    owner_type,
+                'trade_type':    trade_type,
+                'trade_value':   trade_value,
+                'signal':        result.get('signal'),
+                'confidence':    result.get('confidence'),
+                'reasoning':     result.get('reasoning'),
+                'entry_price':   result.get('entry_price'),
+                'stop_loss':     result.get('stop_loss'),
+                'target_price':  result.get('target_price'),
+                'hold_days':     result.get('hold_days'),
+                'key_factors':   json.dumps(result.get('key_factors', [])),
+                'current_price': round(current_price, 2),
+                'generated_at':  result['generated_at'],
+            }])
+        except Exception as e:
+            logger.warning(f'ai_signals Supabase store error: {e}')
+
+        # Cache result for 10 minutes
+        redis_set(cache_key, result, ttl_seconds=600)
+
+        return jsonify(result)
+
+    except json.JSONDecodeError as e:
+        logger.error(f'AI signal JSON parse error: {e}')
+        return jsonify({'error': 'Failed to parse AI response', 'detail': str(e)}), 500
+    except Exception as e:
+        logger.error(f'AI signal engine error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/perf/batch', methods=['POST'])
 def perf_batch():
     """Return real % return since trade date for a list of {ticker, date} pairs.
