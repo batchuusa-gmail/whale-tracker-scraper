@@ -838,7 +838,7 @@ def create_app():
         key = os.environ.get('ANTHROPIC_API_KEY', '')
         return jsonify({
             'status': 'ok',
-            'version': '2026-03-28-v3-whal76',
+            'version': '2026-03-28-v4-whal77',
             'timestamp': datetime.now().isoformat(),
             'filings_cached': len(_filings_cache),
             'last_updated': _last_updated,
@@ -2079,6 +2079,7 @@ def ai_signal_engine():
     if not _key:
         return jsonify({'error': 'AI signals not configured — set ANTHROPIC_API_KEY'}), 503
 
+    from risk_manager import check_all, apply_price_levels
     try:
         body = request.get_json(force=True) or {}
         ticker       = (body.get('ticker') or '').upper()
@@ -2091,6 +2092,13 @@ def ai_signal_engine():
         trade_price  = float(body.get('price') or 0)
         trade_date   = body.get('transaction_date', '')
         current_price = float(body.get('current_price') or 0)
+
+        # ── New enrichment fields (WHAL-77) ──────────────────────
+        historical_win_rate = float(body.get('historical_win_rate') or 0)
+        days_to_earnings    = int(body.get('days_to_earnings') or 999)
+        reddit_sentiment    = float(body.get('reddit_sentiment') or 0)
+        short_interest      = float(body.get('short_interest') or 0)
+        portfolio_value     = float(body.get('portfolio_value') or 100_000)
 
         if not ticker:
             return jsonify({'error': 'ticker is required'}), 400
@@ -2122,8 +2130,21 @@ def ai_signal_engine():
                 except Exception:
                     pass
 
-        # Build Claude prompt
+        # Build Claude prompt — enriched with WHAL-77 fields
         value_str = f'${trade_value:,.0f}' if trade_value >= 1000 else f'${trade_value:.2f}'
+
+        # Optional context lines — only include if provided
+        extra_lines = []
+        if historical_win_rate > 0:
+            extra_lines.append(f'Insider historical win rate: {historical_win_rate*100:.0f}%')
+        if days_to_earnings < 999:
+            extra_lines.append(f'Days to next earnings: {days_to_earnings}')
+        if reddit_sentiment > 0:
+            extra_lines.append(f'Reddit/social sentiment score: {reddit_sentiment:.2f} (0=bearish, 1=bullish)')
+        if short_interest > 0:
+            extra_lines.append(f'Short interest: {short_interest*100:.1f}% of float')
+        extra_context = ('\n' + '\n'.join(extra_lines)) if extra_lines else ''
+
         prompt = f"""You are a quantitative analyst specializing in insider trading signals.
 
 Analyze this insider trade and generate a precise trading signal.
@@ -2132,14 +2153,17 @@ Company: {company} ({ticker})
 Current stock price: ${current_price:.2f}
 Insider: {owner_name} ({owner_type})
 Trade: {trade_type} {shares:,} shares @ ${trade_price:.2f} = {value_str}
-Trade date: {trade_date}
+Trade date: {trade_date}{extra_context}
 
 Rules for your analysis:
 - CEO/CFO/Director buys of >$1M are strongly bullish
 - Cluster buying (multiple insiders) is very bullish
+- High insider win rate (>65%) increases confidence significantly
+- Reddit sentiment >0.7 is bullish confirmation; <0.3 is bearish
+- High short interest (>15%) + insider buy = potential squeeze catalyst
+- Earnings within 5 days = higher volatility risk, reduce confidence
 - Sells are often less meaningful unless CEO/CFO selling large %
-- High confidence = multiple confirming factors
-- Entry near current price, stop loss 5-8% below for buys, target 10-20% above
+- Entry near current price, stop loss 10% below for buys, target 20% above
 
 Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside JSON):
 {{
@@ -2181,6 +2205,24 @@ Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside 
 
         result = json.loads(text)
 
+        # ── Risk management gate (WHAL-77) ───────────────────────
+        confidence = int(result.get('confidence') or 0)
+        risk = check_all(
+            ticker=ticker,
+            trade_value=trade_value,
+            current_price=current_price,
+            confidence=confidence,
+            days_to_earnings=days_to_earnings,
+            portfolio_value=portfolio_value,
+        )
+
+        # Override stop/target with risk-rule defaults if Claude left them null
+        price_levels = apply_price_levels(current_price, is_buy=trade_type.lower() == 'buy')
+        if result.get('stop_loss') is None:
+            result['stop_loss'] = price_levels['stop_loss']
+        if result.get('target_price') is None:
+            result['target_price'] = price_levels['target_price']
+
         # Enrich with request metadata
         result['ticker']         = ticker
         result['company_name']   = company
@@ -2191,26 +2233,49 @@ Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside 
         result['current_price']  = round(current_price, 2)
         result['generated_at']   = datetime.utcnow().isoformat()
 
+        # ── Risk result ───────────────────────────────────────────
+        result['risk_passed']    = risk['passed']
+        result['risk_violations'] = risk['violations']
+        result['position_size']  = risk['position_size']
+        result['max_shares']     = risk['max_shares']
+
+        # Downgrade signal if risk check failed
+        if not risk['passed']:
+            result['signal']     = 'NEUTRAL'
+            result['confidence'] = min(confidence, 40)
+            result['reasoning']  = (
+                f"Signal blocked by risk rules: "
+                + '; '.join(v['detail'] for v in risk['violations'])
+                + ' — ' + (result.get('reasoning') or '')
+            )
+
         # Store in Supabase ai_signals table (best-effort)
         try:
             _db = SupabaseClient()
             _db.upsert('ai_signals', [{
-                'ticker':        ticker,
-                'company_name':  company,
-                'owner_name':    owner_name,
-                'owner_type':    owner_type,
-                'trade_type':    trade_type,
-                'trade_value':   trade_value,
-                'signal':        result.get('signal'),
-                'confidence':    result.get('confidence'),
-                'reasoning':     result.get('reasoning'),
-                'entry_price':   result.get('entry_price'),
-                'stop_loss':     result.get('stop_loss'),
-                'target_price':  result.get('target_price'),
-                'hold_days':     result.get('hold_days'),
-                'key_factors':   json.dumps(result.get('key_factors', [])),
-                'current_price': round(current_price, 2),
-                'generated_at':  result['generated_at'],
+                'ticker':               ticker,
+                'company_name':         company,
+                'owner_name':           owner_name,
+                'owner_type':           owner_type,
+                'trade_type':           trade_type,
+                'trade_value':          trade_value,
+                'signal':               result.get('signal'),
+                'confidence':           result.get('confidence'),
+                'reasoning':            result.get('reasoning'),
+                'entry_price':          result.get('entry_price'),
+                'stop_loss':            result.get('stop_loss'),
+                'target_price':         result.get('target_price'),
+                'hold_days':            result.get('hold_days'),
+                'key_factors':          json.dumps(result.get('key_factors', [])),
+                'current_price':        round(current_price, 2),
+                'risk_passed':          risk['passed'],
+                'risk_violations':      json.dumps(risk['violations']),
+                'position_size':        risk['position_size'],
+                'historical_win_rate':  historical_win_rate or None,
+                'days_to_earnings':     days_to_earnings if days_to_earnings < 999 else None,
+                'reddit_sentiment':     reddit_sentiment or None,
+                'short_interest':       short_interest or None,
+                'generated_at':         result['generated_at'],
             }])
         except Exception as e:
             logger.warning(f'ai_signals Supabase store error: {e}')
