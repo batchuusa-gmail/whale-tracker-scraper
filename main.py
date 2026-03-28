@@ -840,6 +840,7 @@ def create_app():
             'timestamp': datetime.now().isoformat(),
             'filings_cached': len(_filings_cache),
             'last_updated': _last_updated,
+            'anthropic_configured': bool(os.environ.get('ANTHROPIC_API_KEY', '') or ANTHROPIC_KEY),
         })
 
     @app.route('/api/filings')
