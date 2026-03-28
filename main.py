@@ -838,7 +838,7 @@ def create_app():
         key = os.environ.get('ANTHROPIC_API_KEY', '')
         return jsonify({
             'status': 'ok',
-            'version': '2026-03-28-v2',
+            'version': '2026-03-28-v3-whal76',
             'timestamp': datetime.now().isoformat(),
             'filings_cached': len(_filings_cache),
             'last_updated': _last_updated,
