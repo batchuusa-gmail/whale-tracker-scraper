@@ -2006,7 +2006,8 @@ Respond in JSON format only (no markdown, no backticks):
             },
             timeout=30,
         )
-        api_resp.raise_for_status()
+        if not api_resp.ok:
+            return jsonify({'error': api_resp.text[:500]}), 500
         text = api_resp.json()['content'][0]['text'].strip()
         # Strip any markdown code fences if model adds them
         if text.startswith('```'):
