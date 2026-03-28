@@ -1926,7 +1926,6 @@ def ai_signal(ticker):
     if not _key:
         return jsonify({'error': 'AI signals not configured'}), 503
     try:
-        import anthropic as _anthropic
         ticker = ticker.upper()
 
         # Get filings from cache or DB
@@ -1978,13 +1977,7 @@ def ai_signal(ticker):
             )
         filing_summary = '\n'.join(lines)
 
-        client = _anthropic.Anthropic(api_key=_key)
-        msg = client.messages.create(
-            model='claude-haiku-4-5-20251001',
-            max_tokens=400,
-            messages=[{
-                'role': 'user',
-                'content': f"""Analyze this insider trading data for {ticker} and give a brief signal assessment.
+        prompt = f"""Analyze this insider trading data for {ticker} and give a brief signal assessment.
 
 Stock: {ticker}
 Current price: ${price:.2f} ({chg:+.2f}% today)
@@ -1999,9 +1992,22 @@ Respond in JSON format only (no markdown, no backticks):
   "summary": "2-3 sentence plain English explanation",
   "key_factors": ["factor1", "factor2", "factor3"]
 }}"""
-            }],
+        api_resp = requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': _key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': 'claude-haiku-4-5-20251001',
+                'max_tokens': 400,
+                'messages': [{'role': 'user', 'content': prompt}],
+            },
+            timeout=30,
         )
-        text = msg.content[0].text.strip()
+        api_resp.raise_for_status()
+        text = api_resp.json()['content'][0]['text'].strip()
         # Strip any markdown code fences if model adds them
         if text.startswith('```'):
             text = text.split('```')[1]
