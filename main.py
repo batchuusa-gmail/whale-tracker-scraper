@@ -1917,7 +1917,9 @@ def api_earnings():
 @app.route('/api/signal/<ticker>')
 def ai_signal(ticker):
     """Claude AI signal analysis for a ticker based on recent insider trades."""
-    if not ANTHROPIC_KEY:
+    # Read key fresh each request so Railway env var changes take effect without redeploy
+    _key = os.environ.get('ANTHROPIC_API_KEY', '') or ANTHROPIC_KEY
+    if not _key:
         return jsonify({'error': 'AI signals not configured'}), 503
     try:
         import anthropic as _anthropic
@@ -1972,7 +1974,7 @@ def ai_signal(ticker):
             )
         filing_summary = '\n'.join(lines)
 
-        client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = _anthropic.Anthropic(api_key=_key)
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001',
             max_tokens=400,
