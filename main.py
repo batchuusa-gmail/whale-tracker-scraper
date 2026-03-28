@@ -853,6 +853,13 @@ def create_app():
         ticker = request.args.get('ticker', '')
         source = request.args.get('source', 'cache')  # 'cache' or 'db'
 
+        # Redis cache — only for default queries (no type/ticker filter)
+        if not tx_type and not ticker and source == 'cache':
+            rkey = f'api:filings:{limit}'
+            cached = redis_get(rkey)
+            if cached:
+                return jsonify(cached)
+
         if source == 'db' or not _filings_cache or len(_filings_cache) < 20:
             # Always query Supabase when cache is small — ensures historical data shows
             db_results = db.get_recent('filings', limit=max(limit, 200))
@@ -875,7 +882,10 @@ def create_app():
         if ticker:
             results = [f for f in results if f.get('ticker', '').upper() == ticker.upper()]
 
-        return jsonify({'filings': results[:limit], 'total': len(results), 'last_updated': _last_updated})
+        response = {'filings': results[:limit], 'total': len(results), 'last_updated': _last_updated}
+        if not tx_type and not ticker and source == 'cache':
+            redis_set(f'api:filings:{limit}', response, ttl_seconds=300)
+        return jsonify(response)
 
     @app.route('/api/filings/refresh')
     def refresh():
@@ -885,6 +895,10 @@ def create_app():
 
     @app.route('/api/summary')
     def summary():
+        cached = redis_get('api:summary')
+        if cached:
+            return jsonify(cached)
+
         cutoff_7d = (datetime.now() - timedelta(days=7)).date().isoformat()
         today_str = datetime.now().date().isoformat()
 
@@ -929,7 +943,7 @@ def create_app():
             key=lambda x: float(x.get('value', 0) or 0), reverse=True
         )[:20]
 
-        return jsonify({
+        result = {
             'total_filings': len(rows_7d),
             'buys': len(buys_7d),
             'sells': len(sells_7d),
@@ -938,7 +952,9 @@ def create_app():
             'top_sells': top_sells,
             'today': today_filings,
             'last_updated': _last_updated,
-        })
+        }
+        redis_set('api:summary', result, ttl_seconds=300)
+        return jsonify(result)
 
     @app.route('/api/company/<ticker>')
     def company(ticker):
@@ -1631,6 +1647,9 @@ def api_quotes_batch():
 @app.route('/api/heatmap')
 def heatmap():
     filter_type = request.args.get('filter', 'active')
+    cached = redis_get(f'api:heatmap:{filter_type}')
+    if cached:
+        return jsonify(cached)
     TICKERS = [
         'AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA','JPM','V','WMT',
         'JNJ','XOM','BAC','MA','AVGO','LLY','MRK','CVX','PEP','COST',
@@ -1757,7 +1776,9 @@ def heatmap():
             stocks = sorted(stocks, key=lambda x: abs(x['change_pct']), reverse=True)
     else:  # active — most movement
         stocks = sorted(stocks, key=lambda x: abs(x['change_pct']), reverse=True)
-    return jsonify(stocks[:40])
+    result = stocks[:40]
+    redis_set(f'api:heatmap:{filter_type}', result, ttl_seconds=120)
+    return jsonify(result)
 
 
 @app.route('/api/sentiment/trending')
@@ -2102,6 +2123,87 @@ def perf_batch():
     except Exception as e:
         logger.error(f'perf/batch error: {e}')
         return jsonify([]), 500
+
+
+# ─── Redis Cache Layer ────────────────────────────────────────────
+# Connects to Railway Redis addon via REDIS_URL env var.
+# Falls back gracefully to no-cache if Redis is unavailable.
+
+try:
+    import redis as _redis_lib
+    _redis_url = os.environ.get('REDIS_URL', '')
+    if _redis_url:
+        _redis = _redis_lib.from_url(_redis_url, decode_responses=True, socket_connect_timeout=2)
+        _redis.ping()
+        logger.info('Redis connected')
+    else:
+        _redis = None
+        logger.info('REDIS_URL not set — caching disabled')
+except Exception as _redis_err:
+    _redis = None
+    logger.warning(f'Redis unavailable — running without cache: {_redis_err}')
+
+
+def redis_get(key):
+    """Return parsed JSON value from Redis, or None on miss/error."""
+    if _redis is None:
+        return None
+    try:
+        val = _redis.get(key)
+        return json.loads(val) if val else None
+    except Exception:
+        return None
+
+
+def redis_set(key, value, ttl_seconds=300):
+    """Store JSON value in Redis with TTL. Silently fails if Redis unavailable."""
+    if _redis is None:
+        return
+    try:
+        _redis.setex(key, ttl_seconds, json.dumps(value, default=str))
+    except Exception:
+        pass
+
+
+def redis_delete(key):
+    """Delete a key from Redis."""
+    if _redis is None:
+        return
+    try:
+        _redis.delete(key)
+    except Exception:
+        pass
+
+
+# ─── /api/version — App Version Management ───────────────────────
+# Flutter app checks this on launch. If app_version < minimum_version,
+# a non-dismissible force-update screen is shown.
+
+@app.route('/api/version')
+def api_version():
+    return jsonify({
+        'minimum_version': '1.0.0',   # bump this to force-update older builds
+        'latest_version':  '1.0.0',
+        'ios_url':     'https://apps.apple.com/app/whale-tracker/id000000000',
+        'android_url': 'https://play.google.com/store/apps/details?id=com.example.whaleTracker',
+        'release_notes': 'Bug fixes and performance improvements.',
+    })
+
+
+# ─── Cache warm-up helper (called from _startup) ──────────────────
+
+def warm_redis_cache():
+    """Pre-populate Redis with expensive endpoints on server start."""
+    if _redis is None:
+        return
+    logger.info('Warming Redis cache…')
+    try:
+        # Warm /api/filings
+        filings_data = {'filings': list(_filings_cache)[:80], 'total': len(_filings_cache), 'last_updated': _last_updated}
+        redis_set('api:filings:80', filings_data, ttl_seconds=300)
+        logger.info('Redis warm: api:filings')
+    except Exception as e:
+        logger.warning(f'Redis warm error: {e}')
 
 
 if __name__ == '__main__':
