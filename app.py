@@ -382,7 +382,60 @@ def full_refresh():
 # ── API Routes ─────────────────────────────────────────────────
 @app.route('/api/health')
 def health():
-    return jsonify({'status': 'ok', 'timestamp': datetime.now().isoformat()})
+    key = os.environ.get('ANTHROPIC_API_KEY', '')
+    return jsonify({
+        'status': 'ok',
+        'version': '2026-03-28-app',
+        'timestamp': datetime.now().isoformat(),
+        'anthropic_configured': bool(key),
+    })
+
+@app.route('/api/signal/<ticker>')
+def ai_signal(ticker):
+    key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not key:
+        return jsonify({'error': 'AI signals not configured'}), 503
+    try:
+        import anthropic as _anthropic
+        ticker = ticker.upper()
+        # Fetch recent filings for this ticker from Supabase
+        result = supabase.table('filings').select('*').eq('ticker', ticker).order('filed_at', desc=True).limit(5).execute()
+        filings = result.data or []
+        if not filings:
+            return jsonify({'error': 'No filings found for this ticker'}), 404
+
+        lines = []
+        for f in filings[:3]:
+            name = f.get('owner_name', 'Unknown')
+            ttype = f.get('transaction_type', '')
+            val = float(f.get('value', 0) or 0)
+            shares = int(f.get('shares', 0) or 0)
+            fp = float(f.get('price', 0) or 0)
+            date = f.get('transaction_date', f.get('filed_at', ''))
+            lines.append(f"- {name} {ttype} ${val:,.0f} of {shares:,.0f} shares at ${fp:.2f} on {date}")
+        filing_summary = '\n'.join(lines)
+
+        client = _anthropic.Anthropic(api_key=key)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=400,
+            messages=[{'role': 'user', 'content': f"""Analyze insider trading for {ticker}:
+{filing_summary}
+
+Reply ONLY with valid JSON (no markdown):
+{{"signal":"BULLISH|BEARISH|NEUTRAL","confidence":0-100,"summary":"2 sentence max","key_factors":["factor1","factor2","factor3"]}}"""}]
+        )
+        import json as _json
+        text = msg.content[0].text.strip()
+        if text.startswith('```'):
+            text = text.split('```')[1]
+            if text.startswith('json'):
+                text = text[4:]
+        data = _json.loads(text)
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f'AI signal error: {e}')
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/summary')
 def summary():
