@@ -2558,6 +2558,255 @@ def api_whale_picks():
         return jsonify({'error': str(e)}), 500
 
 
+# ── WHAL-48: Insider Score endpoint ──────────────────────────────
+
+@app.route('/api/insider-score/<path:name>')
+def api_insider_score(name):
+    """Real win rate + A+ to F grade for an insider based on historical trade performance."""
+    cache_key = f'insider:score:{name.lower()}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+    try:
+        import yfinance as yf
+        from datetime import timezone as _tz
+        r2 = requests.get(
+            f'{SUPABASE_URL}/rest/v1/filings',
+            headers=SUPABASE_HEADERS,
+            params={
+                'owner_name': f'ilike.{name}',
+                'transaction_type': 'eq.buy',
+                'select': 'ticker,filed_at,transaction_date,value,owner_type',
+                'limit': '100',
+                'order': 'filed_at.desc',
+            },
+            timeout=10,
+        )
+        rows = r2.json() if r2.status_code == 200 else []
+        if not isinstance(rows, list):
+            rows = []
+        role = rows[0].get('owner_type', 'Insider') if rows else 'Insider'
+        total_trades = len(rows)
+        analyzed = wins = 0
+        returns_30, returns_60, returns_90 = [], [], []
+        now_utc = datetime.now(_tz.utc)
+        for f in rows[:15]:
+            date_str = (f.get('transaction_date') or f.get('filed_at') or '')[:10]
+            ticker = (f.get('ticker') or '').upper()
+            if not date_str or not ticker:
+                continue
+            try:
+                trade_dt = datetime.strptime(date_str, '%Y-%m-%d')
+                days_ago = (now_utc - trade_dt.replace(tzinfo=_tz.utc)).days
+                if days_ago < 31:
+                    continue
+                hist = yf.Ticker(ticker).history(
+                    start=(trade_dt - timedelta(days=5)).strftime('%Y-%m-%d'),
+                    end=min((trade_dt + timedelta(days=95)).strftime('%Y-%m-%d'), now_utc.strftime('%Y-%m-%d')),
+                )
+                if hist.empty:
+                    continue
+                hdates = [d.replace(tzinfo=None) if hasattr(d, 'tzinfo') else d for d in hist.index.to_pydatetime()]
+                entry_rows2 = [(i, d) for i, d in enumerate(hdates) if d >= trade_dt]
+                if not entry_rows2:
+                    continue
+                ep = float(hist.iloc[entry_rows2[0][0]]['Close'])
+                if ep <= 0:
+                    continue
+                def _price(n):
+                    tgt = trade_dt + timedelta(days=n)
+                    rr = [(i, d) for i, d in enumerate(hdates) if d >= tgt]
+                    return float(hist.iloc[rr[0][0]]['Close']) if rr else float(hist.iloc[-1]['Close'])
+                analyzed += 1
+                r30 = round((_price(30) - ep) / ep * 100, 2)
+                returns_30.append(r30)
+                if days_ago >= 61:
+                    returns_60.append(round((_price(60) - ep) / ep * 100, 2))
+                if days_ago >= 91:
+                    returns_90.append(round((_price(90) - ep) / ep * 100, 2))
+                if r30 > 0:
+                    wins += 1
+            except Exception as ex:
+                logger.debug(f'insider score trade {ticker}: {ex}')
+        win_rate = round(wins / analyzed * 100) if analyzed > 0 else 0
+        avg_30 = round(sum(returns_30) / len(returns_30), 1) if returns_30 else None
+        avg_60 = round(sum(returns_60) / len(returns_60), 1) if returns_60 else None
+        avg_90 = round(sum(returns_90) / len(returns_90), 1) if returns_90 else None
+        if analyzed == 0:
+            grade = 'N/A'
+        elif win_rate >= 70 and avg_30 and avg_30 > 5:
+            grade = 'A+'
+        elif win_rate >= 65:
+            grade = 'A'
+        elif win_rate >= 55:
+            grade = 'B+'
+        elif win_rate >= 50:
+            grade = 'B'
+        elif win_rate >= 40:
+            grade = 'C'
+        elif win_rate >= 30:
+            grade = 'D'
+        else:
+            grade = 'F'
+        result = {'name': name, 'role': role, 'grade': grade, 'win_rate': win_rate,
+                  'avg_return_30d': avg_30, 'avg_return_60d': avg_60, 'avg_return_90d': avg_90,
+                  'total_trades': total_trades, 'analyzed': analyzed}
+        redis_set(cache_key, result, ttl_seconds=3600)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'insider-score error {name}: {e}')
+        return jsonify({'name': name, 'grade': 'N/A', 'win_rate': 0, 'total_trades': 0, 'analyzed': 0}), 500
+
+
+# ── WHAL-54: Short Squeeze Candidates ────────────────────────────
+
+@app.route('/api/squeeze')
+def api_squeeze():
+    """WHAL-54 — Tickers with high short interest + recent insider buying = squeeze candidates."""
+    cache_key = 'squeeze:candidates'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+    try:
+        import yfinance as yf
+        buys = [f for f in _filings_cache if (f.get('transaction_type') or '').lower() == 'buy']
+        ticker_map = {}
+        for f in buys[:200]:
+            t = (f.get('ticker') or '').upper()
+            if not t:
+                continue
+            if t not in ticker_map:
+                ticker_map[t] = {'ticker': t, 'buys': 0, 'buy_value': 0.0,
+                                  'latest_insider': '', 'latest_date': ''}
+            ticker_map[t]['buys'] += 1
+            ticker_map[t]['buy_value'] += float(f.get('value') or 0)
+            if not ticker_map[t]['latest_insider']:
+                ticker_map[t]['latest_insider'] = f.get('owner_name', '')
+                ticker_map[t]['latest_date'] = (f.get('filed_at') or '')[:10]
+        candidates = []
+        for ticker, info in list(ticker_map.items())[:30]:
+            try:
+                yfi = yf.Ticker(ticker).info
+                short_pct = float(yfi.get('shortPercentOfFloat') or 0) * 100
+                short_ratio = float(yfi.get('shortRatio') or 0)
+                price = float(yfi.get('currentPrice') or yfi.get('regularMarketPrice') or 0)
+                company = yfi.get('longName') or yfi.get('shortName') or ticker
+                if short_pct < 5:
+                    continue
+                squeeze_score = min(100, short_pct * 2 + info['buys'] * 5 + info['buy_value'] / 1_000_000 * 2)
+                candidates.append({'ticker': ticker, 'company': company, 'price': round(price, 2),
+                                    'short_pct': round(short_pct, 1), 'short_ratio': round(short_ratio, 1),
+                                    'insider_buys': info['buys'], 'buy_value': round(info['buy_value']),
+                                    'latest_insider': info['latest_insider'],
+                                    'latest_date': info['latest_date'],
+                                    'squeeze_score': round(min(100, squeeze_score))})
+            except Exception as ex:
+                logger.debug(f'squeeze {ticker}: {ex}')
+        candidates.sort(key=lambda x: x['squeeze_score'], reverse=True)
+        result = {'candidates': candidates[:15], 'generated_at': datetime.now().isoformat()}
+        redis_set(cache_key, result, ttl_seconds=900)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'squeeze error: {e}')
+        return jsonify({'candidates': [], 'error': str(e)}), 500
+
+
+# ── WHAL-70: Historical Backtesting ──────────────────────────────
+
+@app.route('/api/backtest')
+def api_backtest():
+    """WHAL-70 — Insider buy performance stats at 30/60/90 days post-filing."""
+    min_val = request.args.get('min_value', 500000, type=int)
+    role_filter = request.args.get('role', '').lower()
+    cache_key = f'backtest:{min_val}:{role_filter}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+    try:
+        import yfinance as yf
+        from datetime import timezone as _tz
+        r2 = requests.get(
+            f'{SUPABASE_URL}/rest/v1/filings',
+            headers=SUPABASE_HEADERS,
+            params={'transaction_type': 'eq.buy',
+                    'select': 'ticker,filed_at,transaction_date,value,owner_name,owner_type',
+                    'order': 'filed_at.desc', 'limit': '500'},
+            timeout=15,
+        )
+        filings = r2.json() if r2.status_code == 200 else []
+        if not isinstance(filings, list):
+            filings = []
+        filtered = [f for f in filings
+                    if float(f.get('value') or 0) >= min_val
+                    and (not role_filter or role_filter in (f.get('owner_type') or '').lower())]
+        analyzed = wins_30 = 0
+        returns_30, returns_60, returns_90 = [], [], []
+        best = worst = None
+        trade_results = []
+        now_utc = datetime.now(_tz.utc)
+        for f in filtered[:40]:
+            date_str = (f.get('transaction_date') or f.get('filed_at') or '')[:10]
+            ticker = (f.get('ticker') or '').upper()
+            if not date_str or not ticker:
+                continue
+            try:
+                trade_dt = datetime.strptime(date_str, '%Y-%m-%d')
+                days_ago = (now_utc - trade_dt.replace(tzinfo=_tz.utc)).days
+                if days_ago < 31:
+                    continue
+                hist = yf.Ticker(ticker).history(
+                    start=(trade_dt - timedelta(days=5)).strftime('%Y-%m-%d'),
+                    end=min((trade_dt + timedelta(days=95)).strftime('%Y-%m-%d'), now_utc.strftime('%Y-%m-%d')),
+                )
+                if hist.empty:
+                    continue
+                hdates = [d.replace(tzinfo=None) if hasattr(d, 'tzinfo') else d for d in hist.index.to_pydatetime()]
+                er = [(i, d) for i, d in enumerate(hdates) if d >= trade_dt]
+                if not er:
+                    continue
+                ep = float(hist.iloc[er[0][0]]['Close'])
+                if ep <= 0:
+                    continue
+                def _bt_price(n):
+                    tgt = trade_dt + timedelta(days=n)
+                    rr = [(i, d) for i, d in enumerate(hdates) if d >= tgt]
+                    return float(hist.iloc[rr[0][0]]['Close']) if rr else float(hist.iloc[-1]['Close'])
+                analyzed += 1
+                r30 = round((_bt_price(30) - ep) / ep * 100, 2)
+                returns_30.append(r30)
+                if days_ago >= 61:
+                    returns_60.append(round((_bt_price(60) - ep) / ep * 100, 2))
+                if days_ago >= 91:
+                    returns_90.append(round((_bt_price(90) - ep) / ep * 100, 2))
+                if r30 > 0:
+                    wins_30 += 1
+                tr = {'ticker': ticker, 'date': date_str, 'insider': f.get('owner_name', ''),
+                      'role': f.get('owner_type', ''), 'value': float(f.get('value') or 0), 'return_30d': r30}
+                trade_results.append(tr)
+                if best is None or r30 > best['return_30d']:
+                    best = tr
+                if worst is None or r30 < worst['return_30d']:
+                    worst = tr
+            except Exception as ex:
+                logger.debug(f'backtest {ticker}: {ex}')
+        win_rate = round(wins_30 / analyzed * 100, 1) if analyzed > 0 else 0
+        trade_results.sort(key=lambda x: x['return_30d'], reverse=True)
+        result = {
+            'analyzed': analyzed, 'total_found': len(filtered), 'min_value': min_val,
+            'role_filter': role_filter or 'all', 'win_rate': win_rate,
+            'avg_return_30d': round(sum(returns_30) / len(returns_30), 1) if returns_30 else 0,
+            'avg_return_60d': round(sum(returns_60) / len(returns_60), 1) if returns_60 else None,
+            'avg_return_90d': round(sum(returns_90) / len(returns_90), 1) if returns_90 else None,
+            'best_trade': best, 'worst_trade': worst,
+            'trades': trade_results[:20], 'generated_at': datetime.now().isoformat(),
+        }
+        redis_set(cache_key, result, ttl_seconds=1800)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'backtest error: {e}')
+        return jsonify({'error': str(e), 'analyzed': 0}), 500
+
+
 # ─── /api/version — App Version Management ───────────────────────
 # Flutter app checks this on launch. If app_version < minimum_version,
 # a non-dismissible force-update screen is shown.
