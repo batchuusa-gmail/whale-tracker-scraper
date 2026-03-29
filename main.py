@@ -2470,6 +2470,94 @@ def redis_delete(key):
         pass
 
 
+# ─── WHAL-81: Vector Score endpoints ────────────────────────────
+
+@app.route('/api/vector-score/<ticker>')
+def api_vector_score(ticker):
+    """WHAL-81 — Compute composite Whale Vector Score for a ticker.
+    Returns insider, options, dark pool, congressional, sentiment scores + Claude narrative.
+    Cached in Redis for 10 minutes.
+    """
+    ticker = ticker.upper()
+    cache_key = f'vector:score:{ticker}'
+    cached = redis_get(cache_key)
+    if cached:
+        logger.info(f'Vector score cache hit: {ticker}')
+        return jsonify(cached)
+
+    try:
+        from vector_score import compute_vector_score
+        company = ticker  # enrich with yfinance name if desired
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info
+            company = info.get('longName') or info.get('shortName') or ticker
+        except Exception:
+            pass
+
+        result = compute_vector_score(ticker, company)
+        redis_set(cache_key, result, ttl_seconds=600)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'Vector score error {ticker}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/whale-picks')
+def api_whale_picks():
+    """WHAL-89 — Return top 5 tickers by Vector Score from recent insider filings.
+    Computes scores for the top 15 most active recent tickers, returns top 5.
+    Cached in Redis for 15 minutes.
+    """
+    cache_key = 'whale:picks'
+    cached = redis_get(cache_key)
+    if cached:
+        logger.info('Whale picks cache hit')
+        return jsonify(cached)
+
+    try:
+        from vector_score import compute_vector_score
+
+        # Get top tickers from recent filings
+        recent = db.get_recent('filings', limit=200)
+        ticker_counts = {}
+        ticker_company = {}
+        for f in recent:
+            t = (f.get('ticker') or '').upper()
+            c = f.get('company_name') or t
+            if t and len(t) <= 5:
+                ticker_counts[t] = ticker_counts.get(t, 0) + 1
+                ticker_company[t] = c
+
+        # Take top 15 most active
+        top_tickers = sorted(ticker_counts, key=lambda x: ticker_counts[x], reverse=True)[:15]
+
+        picks = []
+        for t in top_tickers:
+            try:
+                score = compute_vector_score(t, ticker_company.get(t, t))
+                picks.append({
+                    'ticker':      score['ticker'],
+                    'company':     score['company'],
+                    'total_score': score['total_score'],
+                    'grade':       score['grade'],
+                    'narrative':   score['narrative'],
+                    'dimensions':  score['dimensions'],
+                })
+                # Cache individual scores too
+                redis_set(f'vector:score:{t}', score, ttl_seconds=600)
+            except Exception as e:
+                logger.warning(f'Whale picks: score error {t}: {e}')
+
+        picks.sort(key=lambda x: x['total_score'], reverse=True)
+        result = {'picks': picks[:5], 'generated_at': datetime.now(timezone.utc).isoformat()}
+        redis_set(cache_key, result, ttl_seconds=900)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'Whale picks error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 # ─── /api/version — App Version Management ───────────────────────
 # Flutter app checks this on launch. If app_version < minimum_version,
 # a non-dismissible force-update screen is shown.
