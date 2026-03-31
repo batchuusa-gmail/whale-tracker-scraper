@@ -1345,6 +1345,43 @@ def create_app():
             logger.error(f"Whale heatmap error: {e}")
             return jsonify(_mock)
 
+    # ── WHAL-98: EOD Report ───────────────────────────────────────────
+
+    @app.route('/api/eod/report', methods=['GET'])
+    def eod_report_today():
+        """GET /api/eod/report?date=YYYY-MM-DD  (defaults to today ET)"""
+        import pytz as _pytz
+        from eod_reporter import get_report, generate_report
+        _et = _pytz.timezone('America/New_York')
+        date_str = request.args.get('date') or datetime.now(_et).strftime('%Y-%m-%d')
+        # Try cache first
+        cached = get_report(date_str, redis_get)
+        if cached:
+            return jsonify(cached)
+        # Generate on-demand (e.g. manual request after market close)
+        report = generate_report(date_str, redis_set, redis_get)
+        return jsonify(report)
+
+    @app.route('/api/eod/history', methods=['GET'])
+    def eod_report_history():
+        """GET /api/eod/history?days=7  — last N day reports"""
+        import pytz as _pytz
+        from datetime import timedelta
+        from eod_reporter import get_report, generate_report
+        _et = _pytz.timezone('America/New_York')
+        days = min(int(request.args.get('days', 7)), 30)
+        today = datetime.now(_et).date()
+        results = []
+        for i in range(days):
+            d = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+            report = get_report(d, redis_get)
+            if report is None:
+                report = generate_report(d, redis_set, redis_get)
+            # Only include days that had trades or are today
+            if report.get('total_trades', 0) > 0 or i == 0:
+                results.append(report)
+        return jsonify({'reports': results})
+
     return app
 
 
@@ -1398,6 +1435,27 @@ def _startup():
 
 _startup_thread = threading.Thread(target=_startup, daemon=True)
 _startup_thread.start()
+
+# ── WHAL-94: Start intraday scanner background thread ─────────────
+try:
+    from intraday_scanner import start as _start_scanner
+    _start_scanner(redis_set, redis_get)
+except Exception as _scanner_start_err:
+    logger.warning(f'Intraday scanner failed to start: {_scanner_start_err}')
+
+# ── WHAL-96: Start intraday executor monitor thread ───────────────
+try:
+    from intraday_executor import start as _start_executor
+    _start_executor()
+except Exception as _executor_start_err:
+    logger.warning(f'Intraday executor failed to start: {_executor_start_err}')
+
+# ── WHAL-98: Start EOD reporter background thread ─────────────────
+try:
+    from eod_reporter import start as _start_eod_reporter
+    _start_eod_reporter(redis_set, redis_get)
+except Exception as _eod_start_err:
+    logger.warning(f'EOD reporter failed to start: {_eod_start_err}')
 
 
 # ─── Sentiment — StockTwits ───────────────────────────────────────
@@ -2283,10 +2341,32 @@ Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside 
         # Cache result for 10 minutes
         redis_set(cache_key, result, ttl_seconds=600)
 
-        # ── Auto paper trade if enabled (WHAL-78) ─────────────────
+        # ── WHAL-92: Combined Signal Score ────────────────────────
+        try:
+            from technical_indicators import get_technical_score
+            from signal_combiner import combine_signals
+            tech_result = get_technical_score(ticker)
+            combined    = combine_signals(result, tech_result)
+            result['technical_score']      = combined['technical_score']
+            result['technical_signal']     = combined['technical_signal']
+            result['technical_score_0_1']  = combined['technical_score_0_1']
+            result['final_score']          = combined['final_score']
+            result['action']               = combined['action']
+            result['combined_reasoning']   = combined['combined_reasoning']
+            result['dynamic_stop_loss']    = combined['dynamic_stop_loss']
+            result['technical_detail']     = tech_result
+        except Exception as e:
+            logger.warning(f'Combined signal score error: {e}')
+
+        # ── Auto paper trade if enabled (WHAL-78/92) ──────────────
         try:
             from paper_trader import place_order as _place_order
-            trade_result = _place_order(result)
+            # WHAL-92: only execute if combined action is EXECUTE_TRADE
+            action = result.get('action', 'SKIP')
+            if action == 'EXECUTE_TRADE' or not result.get('action'):
+                trade_result = _place_order(result)
+            else:
+                trade_result = {'status': 'skipped', 'message': f'Combined score action: {action}'}
             result['paper_trade'] = trade_result
         except Exception as e:
             logger.warning(f'Paper trade hook error: {e}')
@@ -2805,6 +2885,196 @@ def api_backtest():
     except Exception as e:
         logger.error(f'backtest error: {e}')
         return jsonify({'error': str(e), 'analyzed': 0}), 500
+
+
+# ─── /api/intraday/bars — WHAL-97 Intraday OHLCV bars ───────────
+
+@app.route('/api/intraday/bars/<ticker>')
+def intraday_bars(ticker):
+    """GET intraday 1-min/5-min/15-min/1-hr OHLCV bars from Alpaca."""
+    try:
+        tf_param = request.args.get('timeframe', '1Min')
+        limit    = int(request.args.get('limit', 60))
+        tf_map   = {'1Min': '1Min', '5Min': '5Min', '15Min': '15Min', '1Hour': '1Hour'}
+        timeframe = tf_map.get(tf_param, '1Min')
+
+        hdrs = {
+            'APCA-API-KEY-ID':     ALPACA_KEY,
+            'APCA-API-SECRET-KEY': ALPACA_SECRET,
+        }
+        r = requests.get(
+            f'https://data.alpaca.markets/v2/stocks/{ticker.upper()}/bars',
+            headers=hdrs,
+            params={'timeframe': timeframe, 'limit': limit, 'feed': 'sip'},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return jsonify({'error': f'Alpaca error: {r.status_code}', 'bars': []}), 200
+
+        raw_bars = r.json().get('bars', [])
+        bars = [{
+            'time':   b.get('t', ''),
+            'open':   round(float(b.get('o', 0)), 2),
+            'high':   round(float(b.get('h', 0)), 2),
+            'low':    round(float(b.get('l', 0)), 2),
+            'close':  round(float(b.get('c', 0)), 2),
+            'volume': int(b.get('v', 0)),
+        } for b in raw_bars]
+        return jsonify({'ticker': ticker.upper(), 'timeframe': timeframe, 'bars': bars})
+    except Exception as e:
+        logger.error(f'intraday/bars/{ticker} error: {e}')
+        return jsonify({'error': str(e), 'bars': []}), 500
+
+
+# ─── /api/intraday — WHAL-96 Intraday Trade Executor ────────────
+
+@app.route('/api/intraday/positions')
+def intraday_positions():
+    """GET current open intraday positions."""
+    try:
+        from intraday_executor import get_open_positions
+        return jsonify({'positions': get_open_positions()})
+    except Exception as e:
+        logger.error(f'intraday/positions error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/intraday/trades/today')
+def intraday_trades_today():
+    """GET all intraday trades placed today."""
+    try:
+        from intraday_executor import get_trades_today
+        trades = get_trades_today()
+        return jsonify({'trades': trades, 'count': len(trades)})
+    except Exception as e:
+        logger.error(f'intraday/trades/today error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/intraday/close/<ticker>', methods=['POST'])
+def intraday_close_ticker(ticker):
+    """POST — manually close a specific intraday position."""
+    try:
+        from intraday_executor import _alpaca, _close_position, _supa_get, force_close_all
+        ticker = ticker.upper().strip()
+        _, positions = _alpaca('get', '/v2/positions')
+        pos = next((p for p in (positions or []) if p.get('symbol') == ticker), None)
+        if not pos:
+            return jsonify({'status': 'not_found', 'message': f'No open position for {ticker}'}), 404
+        from datetime import datetime
+        import pytz
+        today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
+        trades = _supa_get('intraday_trades', f'date=eq.{today}&ticker=eq.{ticker}&status=neq.closed')
+        trade  = trades[0] if trades else {}
+        price  = float(pos.get('current_price') or 0)
+        _close_position(ticker, pos, trade, 'manual_close', price)
+        return jsonify({'status': 'closed', 'ticker': ticker, 'exit_price': price})
+    except Exception as e:
+        logger.error(f'intraday/close/{ticker} error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/intraday/close/all', methods=['POST'])
+def intraday_close_all():
+    """POST — emergency close ALL open intraday positions."""
+    try:
+        from intraday_executor import force_close_all
+        result = force_close_all()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'intraday/close/all error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── /api/scanner — WHAL-94 Intraday Stock Scanner ───────────────
+
+@app.route('/api/scanner/top')
+def scanner_top():
+    """GET top 10 scanner picks for current minute."""
+    try:
+        from intraday_scanner import get_top
+        return jsonify({'picks': get_top(redis_get), 'count': len(get_top(redis_get))})
+    except Exception as e:
+        logger.error(f'scanner/top error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/scanner/all')
+def scanner_all():
+    """GET all scored stocks from latest scan (up to 200)."""
+    try:
+        from intraday_scanner import get_all
+        stocks = get_all(redis_get)
+        return jsonify({'stocks': stocks, 'count': len(stocks)})
+    except Exception as e:
+        logger.error(f'scanner/all error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/scanner/status')
+def scanner_status():
+    """GET scanner running state, last scan time, scan count."""
+    try:
+        from intraday_scanner import get_status
+        return jsonify(get_status(redis_get))
+    except Exception as e:
+        logger.error(f'scanner/status error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── /api/scanner/score — WHAL-95 Intraday AI Scoring Engine ────
+
+@app.route('/api/scanner/score', methods=['POST'])
+def scanner_score():
+    """POST {ticker, scanner_score} → AI BUY/SELL/SKIP with entry/stop/target."""
+    try:
+        from intraday_ai_scorer import score_stock, get_daily_token_usage
+        body          = request.get_json(force=True) or {}
+        ticker        = (body.get('ticker') or '').upper().strip()
+        scanner_score_val = int(body.get('scanner_score') or 0)
+        insider_sum   = body.get('insider_summary', '')
+        sp500_trend   = body.get('sp500_trend', 'neutral')
+
+        if not ticker:
+            return jsonify({'error': 'ticker is required'}), 400
+
+        result = score_stock(
+            ticker=ticker,
+            scanner_score=scanner_score_val,
+            insider_summary=insider_sum,
+            sp500_trend=sp500_trend,
+            redis_get=redis_get,
+            redis_set=redis_set,
+        )
+        result['token_usage'] = get_daily_token_usage()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'scanner/score error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/scanner/usage')
+def scanner_usage():
+    """GET daily token/spend usage for the intraday AI scorer."""
+    try:
+        from intraday_ai_scorer import get_daily_token_usage
+        return jsonify(get_daily_token_usage())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── /api/technical/:ticker — WHAL-91 Technical Indicator Engine ──
+# Runs RSI, MACD, MA, volume, ATR, Bollinger Bands and returns combined score.
+
+@app.route('/api/technical/<ticker>')
+def api_technical(ticker):
+    try:
+        from technical_indicators import get_technical_score
+        result = get_technical_score(ticker.upper().strip())
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'api_technical({ticker}): {e}')
+        return jsonify({'error': str(e)}), 500
 
 
 # ─── /api/version — App Version Management ───────────────────────
