@@ -1345,6 +1345,37 @@ def create_app():
             logger.error(f"Whale heatmap error: {e}")
             return jsonify(_mock)
 
+    # ── WHAL-102: Market Regime ───────────────────────────────────────
+
+    @app.route('/api/regime/current', methods=['GET'])
+    def regime_current():
+        """GET current market regime + confidence + all 7 indicator values."""
+        from regime_detector import get_regime, compute_regime
+        cached = get_regime(redis_get)
+        if cached:
+            return jsonify(cached)
+        # Generate on-demand if not cached yet
+        result = compute_regime(redis_set, redis_get)
+        return jsonify(result)
+
+    @app.route('/api/regime/weights', methods=['GET'])
+    def regime_weights():
+        """GET signal weights for current regime."""
+        from regime_detector import get_strategy_weights
+        return jsonify(get_strategy_weights(redis_get))
+
+    @app.route('/api/regime/refresh', methods=['POST'])
+    def regime_refresh():
+        """POST to force recompute regime immediately (runs async)."""
+        import threading
+        from regime_detector import compute_regime
+        threading.Thread(
+            target=compute_regime,
+            args=(redis_set, redis_get),
+            daemon=True,
+        ).start()
+        return jsonify({'status': 'computing', 'message': 'Regime recompute started — check /api/regime/current in ~30s'})
+
     # ── WHAL-98: EOD Report ───────────────────────────────────────────
 
     @app.route('/api/eod/report', methods=['GET'])
@@ -1456,6 +1487,13 @@ try:
     _start_eod_reporter(redis_set, redis_get)
 except Exception as _eod_start_err:
     logger.warning(f'EOD reporter failed to start: {_eod_start_err}')
+
+# ── WHAL-102: Start regime detector background thread ─────────────
+try:
+    from regime_detector import start as _start_regime_detector
+    _start_regime_detector(redis_set, redis_get)
+except Exception as _regime_start_err:
+    logger.warning(f'Regime detector failed to start: {_regime_start_err}')
 
 
 # ─── Sentiment — StockTwits ───────────────────────────────────────
