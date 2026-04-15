@@ -13,3 +13,4 @@ lxml==5.1.0
 alpaca-trade-api==3.2.0
 redis==5.0.1
 anthropic==0.25.0
+google-auth==2.29.0

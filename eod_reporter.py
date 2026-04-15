@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 _ET = pytz.timezone('America/New_York')
 
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY', '')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg')
 _SUPA_HEADERS = {
     'apikey': SUPABASE_KEY,
     'Authorization': f'Bearer {SUPABASE_KEY}',
@@ -42,9 +42,10 @@ def _fetch_trades_for_date(trade_date: str) -> list:
         url = (
             f'{SUPABASE_URL}/rest/v1/intraday_trades'
             f'?date=eq.{trade_date}'
-            f'&status=eq.CLOSED'
-            f'&select=ticker,pnl,pnl_pct,entry_price,exit_price,hold_minutes,exit_reason,entry_time,exit_time'
-            f'&order=exit_time.desc'
+            f'&status=eq.closed'
+            f'&select=ticker,side,pnl,pnl_pct,entry_price,exit_price,hold_minutes,exit_reason,'
+            f'entry_time,exit_time,confidence,ai_reasoning,qty'
+            f'&order=entry_time.asc'
             f'&limit=200'
         )
         r = requests.get(url, headers=_SUPA_HEADERS, timeout=15)
@@ -90,13 +91,19 @@ def _build_report(trades: list, trade_date: str) -> dict:
 
     def _trade_summary(t: dict) -> dict:
         return {
-            'ticker':      t.get('ticker', ''),
-            'pnl':         round(t.get('pnl') or 0, 2),
-            'pnl_pct':     round(t.get('pnl_pct') or 0, 4),
-            'entry_price': t.get('entry_price'),
-            'exit_price':  t.get('exit_price'),
+            'ticker':       t.get('ticker', ''),
+            'side':         t.get('side', 'buy'),
+            'qty':          t.get('qty'),
+            'pnl':          round(t.get('pnl') or 0, 2),
+            'pnl_pct':      round(t.get('pnl_pct') or 0, 4),
+            'entry_price':  t.get('entry_price'),
+            'exit_price':   t.get('exit_price'),
             'hold_minutes': t.get('hold_minutes'),
-            'exit_reason': t.get('exit_reason', ''),
+            'exit_reason':  t.get('exit_reason', ''),
+            'entry_time':   t.get('entry_time', ''),
+            'exit_time':    t.get('exit_time', ''),
+            'confidence':   t.get('confidence'),
+            'ai_reasoning': t.get('ai_reasoning', ''),
         }
 
     # Exit reason breakdown

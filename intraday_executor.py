@@ -8,9 +8,9 @@ Kill switch: INTRADAY_TRADING_ENABLED=true/false (Railway env var)
 Trade Rules:
   - Max 5 simultaneous open positions
   - Max 10% of paper portfolio per trade
-  - Stop loss:  -0.8% from entry
-  - Target 1:  +1.5% → sell 50% (partial)
-  - Target 2:  +3.0% → sell remainder
+  - Stop loss:  -1.5% from entry
+  - Target 1:  +2.5% → sell 50% (partial, or AI-computed)
+  - Target 2:  +4.0% → sell remainder (or AI-computed)
   - Time stop: close if held > 120 minutes
   - Hard close: ALL positions closed at 3:45 PM ET
 """
@@ -29,10 +29,11 @@ logger = logging.getLogger(__name__)
 
 PAPER_BASE      = 'https://paper-api.alpaca.markets'
 ALPACA_DATA     = 'https://data.alpaca.markets'
-STOP_LOSS_PCT   = 0.008   # -0.8%
-TARGET_1_PCT    = 0.015   # +1.5% → sell 50%
-TARGET_2_PCT    = 0.030   # +3.0% → sell remainder
+STOP_LOSS_PCT   = 0.015   # -1.5%
+TARGET_1_PCT    = 0.025   # +2.5% → sell 50%  (fallback if AI omits)
+TARGET_2_PCT    = 0.040   # +4.0% → sell remainder (fallback if AI omits)
 MAX_HOLD_MINS   = 120
+MIN_HOLD_MINS   = 3       # don't check stop/target for first 3 minutes
 MAX_POSITIONS   = 5
 MAX_ALLOC_PCT   = 0.10    # 10% of portfolio per trade
 MONITOR_SECS    = 30
@@ -171,15 +172,16 @@ def place_intraday_order(signal: dict) -> dict:
     confidence = float(signal.get('confidence') or 0)
     entry      = float(signal.get('entry') or 0)
     stop_loss  = float(signal.get('stop_loss') or 0)
-    target     = float(signal.get('target') or 0)
+    target_1   = float(signal.get('target_1') or signal.get('target') or 0)
+    target_2   = float(signal.get('target_2') or 0)
     hold_mins  = int(signal.get('hold_minutes') or 60)
     reasoning  = str(signal.get('reasoning') or '')
 
     if sig_str not in ('BUY', 'SELL'):
         return {'status': 'skipped', 'message': f'Signal {sig_str} is not actionable'}
 
-    if confidence < 0.80:
-        return {'status': 'skipped', 'message': f'Confidence {confidence:.0%} below 80% threshold'}
+    if confidence < 0.70:
+        return {'status': 'skipped', 'message': f'Confidence {confidence:.0%} below 70% threshold'}
 
     # Check position limits
     _, positions = _alpaca('get', '/v2/positions')
@@ -228,8 +230,8 @@ def place_intraday_order(signal: dict) -> dict:
         'entry_price':   round(entry, 2),
         'exit_price':    None,
         'stop_loss':     round(stop_loss, 2),
-        'target_1':      round(entry * (1 + TARGET_1_PCT), 2),
-        'target_2':      round(target, 2),
+        'target_1':      round(target_1 if target_1 > 0 else entry * (1 + TARGET_1_PCT), 2),
+        'target_2':      round(target_2 if target_2 > 0 else entry * (1 + TARGET_2_PCT), 2),
         'hold_minutes':  hold_mins,
         'confidence':    round(confidence, 3),
         'ai_reasoning':  reasoning[:500],
@@ -252,7 +254,8 @@ def place_intraday_order(signal: dict) -> dict:
         'qty':          qty,
         'entry':        round(entry, 2),
         'stop_loss':    round(stop_loss, 2),
-        'target':       round(target, 2),
+        'target_1':     round(target_1 if target_1 > 0 else entry * (1 + TARGET_1_PCT), 2),
+        'target_2':     round(target_2 if target_2 > 0 else entry * (1 + TARGET_2_PCT), 2),
         'http_status':  status_code,
     }
 
@@ -296,6 +299,10 @@ def _check_positions():
                 pass
 
         pnl_pct = (cur_price - entry_price) / entry_price if entry_price > 0 else 0
+
+        # Skip stop/target checks for the first MIN_HOLD_MINS minutes
+        if mins_held < MIN_HOLD_MINS:
+            continue
 
         with _state_lock:
             already_partial = _partial_sold.get(ticker, False)
@@ -362,18 +369,28 @@ def _close_position(ticker: str, pos: dict, trade: dict, reason: str, exit_price
         pnl    = (exit_price - entry) * qty if side == 'long' else (entry - exit_price) * qty
         pnl_pct = (exit_price - entry) / entry if entry > 0 else 0
         now    = datetime.now(timezone.utc).isoformat()
-        logger.info(f'Intraday close: {ticker} | reason={reason} | pnl=${pnl:.2f} ({pnl_pct:.1%})')
+        # Compute hold_minutes
+        hold_mins = 0
+        entry_time_str = trade.get('entry_time')
+        if entry_time_str:
+            try:
+                et = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+                hold_mins = int((datetime.now(timezone.utc) - et).total_seconds() / 60)
+            except Exception:
+                pass
+        logger.info(f'Intraday close: {ticker} | reason={reason} | hold={hold_mins}m | pnl=${pnl:.2f} ({pnl_pct:.1%})')
         with _state_lock:
             _partial_sold.pop(ticker, None)
         _supa_upsert('intraday_trades', [{
-            'order_id':    trade.get('order_id', ''),
-            'ticker':      ticker,
-            'status':      'closed',
-            'exit_price':  round(exit_price, 2),
-            'exit_reason': reason,
-            'pnl':         round(pnl, 2),
-            'pnl_pct':     round(pnl_pct, 4),
-            'exit_time':   now,
+            'order_id':     trade.get('order_id', ''),
+            'ticker':       ticker,
+            'status':       'closed',
+            'exit_price':   round(exit_price, 2),
+            'exit_reason':  reason,
+            'pnl':          round(pnl, 2),
+            'pnl_pct':      round(pnl_pct, 4),
+            'exit_time':    now,
+            'hold_minutes': hold_mins,
         }])
     else:
         logger.error(f'Intraday close failed: {ticker} {status_code}')
@@ -386,6 +403,10 @@ def force_close_all() -> dict:
     closed = []
     errors = []
 
+    today = datetime.now(_ET).strftime('%Y-%m-%d')
+    trades = _supa_get('intraday_trades', f'date=eq.{today}&status=neq.closed')
+    trade_map = {r.get('ticker', ''): r for r in trades}
+
     if isinstance(positions, list):
         for pos in positions:
             ticker = pos.get('symbol', '')
@@ -396,6 +417,33 @@ def force_close_all() -> dict:
                 closed.append(ticker)
                 with _state_lock:
                     _partial_sold.pop(ticker, None)
+                # Update Supabase with closed status + hold_minutes
+                trade = trade_map.get(ticker, {})
+                entry  = float(pos.get('avg_entry_price') or 0)
+                cur    = float(pos.get('current_price') or 0)
+                qty    = float(pos.get('qty') or 0)
+                side   = pos.get('side', 'long')
+                pnl    = (cur - entry) * qty if side == 'long' else (entry - cur) * qty
+                pnl_pct = (cur - entry) / entry if entry > 0 else 0
+                hold_mins = 0
+                entry_time_str = trade.get('entry_time')
+                if entry_time_str:
+                    try:
+                        et = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+                        hold_mins = int((datetime.now(timezone.utc) - et).total_seconds() / 60)
+                    except Exception:
+                        pass
+                _supa_upsert('intraday_trades', [{
+                    'order_id':     trade.get('order_id', ''),
+                    'ticker':       ticker,
+                    'status':       'closed',
+                    'exit_price':   round(cur, 2),
+                    'exit_reason':  'force_close',
+                    'pnl':          round(pnl, 2),
+                    'pnl_pct':      round(pnl_pct, 4),
+                    'exit_time':    datetime.now(timezone.utc).isoformat(),
+                    'hold_minutes': hold_mins,
+                }])
             else:
                 errors.append(ticker)
 

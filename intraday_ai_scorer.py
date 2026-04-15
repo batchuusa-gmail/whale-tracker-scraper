@@ -24,13 +24,14 @@ logger = logging.getLogger(__name__)
 
 ANTHROPIC_KEY     = os.environ.get('ANTHROPIC_API_KEY', '')
 MIN_SCANNER_SCORE = 60        # only score stocks above this
-MIN_CONFIDENCE    = 0.80      # pass to executor only if >= 80%
+MIN_CONFIDENCE    = 0.70      # raised from 0.65 → only high-conviction trades
 MAX_CALLS_PER_MIN = 10        # rate limit
 MAX_TOKENS_DAY    = 500_000   # ~$5/day at Haiku pricing
 
-# Intraday price targets (tight, fast)
-TARGET_PCT    =  0.020   # +2%
-STOP_LOSS_PCT =  0.008   # -0.8%
+# Intraday price targets
+TARGET_1_PCT  =  0.025   # +2.5% first target (partial exit)
+TARGET_2_PCT  =  0.040   # +4.0% full target
+STOP_LOSS_PCT =  0.015   # -1.5% (widened from -0.8% to survive normal noise)
 MAX_HOLD_MINS =  120     # never hold >2 hours
 
 # ── Rate limiter ─────────────────────────────────────────────────
@@ -211,31 +212,41 @@ def _call_claude(ticker: str, indicators: dict, scanner_score: int,
     macd       = indicators.get('macd_signal', 'N/A')
     trend      = indicators.get('trend', 'unknown')
 
-    prompt = f"""You are an intraday trading analyst making fast, precise trade decisions.
+    day_gain = indicators.get('day_gain_pct', 0)
 
-Stock: {ticker} | Price: ${price:.2f} | Change: {change_pct:+.2f}%
-Volume: {vol_ratio:.1f}x average | Scanner Score: {scanner_score}/100
-RSI: {rsi} | MACD: {macd}
-30-min trend: {trend}
+    prompt = f"""You are an intraday trading analyst. Make precise, disciplined trade decisions.
+
+Stock: {ticker}
+Price: ${price:.2f} | Day gain so far: {day_gain:+.2f}% | 30-min change: {change_pct:+.2f}%
+Volume: {vol_ratio:.1f}x average | Scanner score: {scanner_score}/100
+RSI: {rsi} | MACD: {macd} | Trend: {trend}
 Insider activity (last 30d): {insider_summary or 'none'}
-S&P 500 trend: {sp500_trend or 'neutral'}
+S&P 500: {sp500_trend or 'neutral'}
 
-Intraday trade rules:
-- Target: +1.5% to +3% from entry (fast scalp/swing)
-- Stop loss: -0.8% from entry (tight risk)
-- Max hold: 15-120 minutes, NEVER hold overnight
-- Only BUY if momentum + volume confirm the move
-- SKIP if conditions are uncertain or market is choppy
+Entry rules (ALL must be true to BUY):
+1. Day gain < 3% — do NOT chase stocks already up big
+2. RSI between 40–70 — momentum without being overbought
+3. Volume > 1.5x average — confirms real interest
+4. Trend is up AND MACD is bullish
+5. Scanner score >= 75
+
+Risk rules:
+- Stop loss: -1.5% from entry (gives room for normal noise)
+- Target 1: +2.5% (partial exit, lock in profit)
+- Target 2: +4.0% (runner — only if strong momentum)
+- Hold: 30–120 minutes. NEVER hold overnight.
+- If ANY rule is violated → SKIP
 
 Respond ONLY with valid JSON (no markdown):
 {{
-  "signal": "BUY" | "SELL" | "SKIP",
+  "signal": "BUY" | "SKIP",
   "confidence": <float 0.0-1.0>,
   "entry": <float>,
   "stop_loss": <float>,
-  "target": <float>,
-  "hold_minutes": <int 15-120>,
-  "reasoning": "<1-2 sentence explanation>"
+  "target_1": <float>,
+  "target_2": <float>,
+  "hold_minutes": <int 30-120>,
+  "reasoning": "<1-2 sentence explanation of why BUY or SKIP>"
 }}"""
 
     try:
@@ -269,6 +280,11 @@ Respond ONLY with valid JSON (no markdown):
 
         result = json.loads(text)
         result['tokens_used'] = tokens
+        # Normalise: if Claude returns old single 'target' field, map to target_1/target_2
+        if 'target' in result and 'target_1' not in result:
+            t = result.pop('target')
+            result['target_1'] = t
+            result['target_2'] = round(float(t) * (1 + TARGET_2_PCT - TARGET_1_PCT), 2)
         return result
 
     except Exception as e:
@@ -280,33 +296,37 @@ Respond ONLY with valid JSON (no markdown):
 
 def _technical_fallback(indicators: dict, scanner_score: int) -> dict:
     """Return a BUY/SKIP based purely on technicals when Claude is unavailable."""
-    price  = indicators.get('current_price', 0)
-    rsi    = indicators.get('rsi')
-    macd   = indicators.get('macd_signal', '')
-    trend  = indicators.get('trend', 'down')
-    change = indicators.get('change_pct', 0)
+    price     = indicators.get('current_price', 0)
+    rsi       = indicators.get('rsi')
+    macd      = indicators.get('macd_signal', '')
+    trend     = indicators.get('trend', 'down')
+    change    = indicators.get('change_pct', 0)
+    day_gain  = indicators.get('day_gain_pct', 0)
 
     bullish = (
-        scanner_score >= 80 and
+        scanner_score >= 75 and       # raised threshold
         trend == 'up' and
         change > 0.5 and
+        day_gain < 3.0 and            # don't chase
         (rsi is None or 40 <= rsi <= 70) and
         'bullish' in macd
     )
     signal     = 'BUY' if bullish else 'SKIP'
-    confidence = min(scanner_score / 100, 0.75)  # cap at 75% without AI
+    confidence = min(scanner_score / 100, 0.72)  # cap at 72% without AI
 
-    stop  = round(price * (1 - STOP_LOSS_PCT), 2)
-    tgt   = round(price * (1 + TARGET_PCT), 2)
+    stop = round(price * (1 - STOP_LOSS_PCT), 2)
+    t1   = round(price * (1 + TARGET_1_PCT), 2)
+    t2   = round(price * (1 + TARGET_2_PCT), 2)
 
     return {
         'signal':       signal,
         'confidence':   round(confidence, 2),
         'entry':        round(price, 2),
         'stop_loss':    stop,
-        'target':       tgt,
+        'target_1':     t1,
+        'target_2':     t2,
         'hold_minutes': 60,
-        'reasoning':    f'Technical-only fallback (AI disabled). Score {scanner_score}/100, trend {trend}.',
+        'reasoning':    f'Technical-only fallback (AI disabled). Score {scanner_score}/100, trend {trend}, day gain {day_gain:.1f}%.',
         'source':       'technical_fallback',
     }
 
@@ -378,7 +398,7 @@ def score_stock(
         if not result.get('stop_loss') or result['stop_loss'] <= 0:
             result['stop_loss'] = round(price * (1 - STOP_LOSS_PCT), 2)
         if not result.get('target') or result['target'] <= 0:
-            result['target'] = round(price * (1 + TARGET_PCT), 2)
+            result['target'] = round(price * (1 + TARGET_1_PCT), 2)
         if not result.get('entry') or result['entry'] <= 0:
             result['entry'] = round(price, 2)
         if not result.get('hold_minutes'):
