@@ -7249,27 +7249,37 @@ def prediction_pulse():
     except Exception as e:
         logger.warning(f'prediction-pulse kalshi error: {e}')
 
-    # Polymarket — crypto/finance
+    # Polymarket — financial/economic only
+    FINANCE_KEYWORDS = {
+        'fed', 'rate', 'inflation', 'cpi', 'gdp', 'recession', 's&p', 'sp500',
+        'stock', 'market', 'bitcoin', 'btc', 'eth', 'crypto', 'dollar', 'treasury',
+        'yield', 'earnings', 'economy', 'economic', 'interest', 'employment',
+        'unemployment', 'jobs', 'tariff', 'trade', 'debt', 'deficit', 'fiscal',
+        'monetary', 'nasdaq', 'dow', 'equity', 'bond', 'ipo', 'merger', 'acquisition',
+        'revenue', 'profit', 'fomc', 'powell', 'yellen', 'sec', 'irs', 'fda approval',
+        'oil', 'gold', 'silver', 'commodit',
+    }
     try:
         p = requests.get(
             'https://gamma-api.polymarket.com/markets',
-            params={'active': 'true', 'limit': 20},
-            timeout=6,
+            params={'active': 'true', 'limit': 100, 'order': 'volume24hr', 'ascending': 'false'},
+            timeout=8,
         )
         p_data = p.json()
-        # handle both list and dict response shapes
         if isinstance(p_data, dict):
             p_data = p_data.get('markets', p_data.get('data', []))
         for m in (p_data or []):
+            title = (m.get('question') or m.get('title', '')).lower()
+            # Skip non-financial markets
+            if not any(kw in title for kw in FINANCE_KEYWORDS):
+                continue
             prices = m.get('outcomePrices') or m.get('outcome_prices')
-            # outcomePrices is sometimes a JSON string e.g. '["0.525","0.475"]'
             if isinstance(prices, str):
                 try:
                     import json as _json
                     prices = _json.loads(prices)
                 except Exception:
                     prices = None
-            # try tokens field if outcomePrices missing
             if not prices:
                 tokens = m.get('tokens') or []
                 if tokens:
@@ -7295,7 +7305,7 @@ def prediction_pulse():
         logger.warning(f'prediction-pulse polymarket error: {e}')
 
     results.sort(key=lambda x: x.get('volume', 0), reverse=True)
-    top = results[:15]
+    top = results[:25]
     redis_set(cache_key, top, ttl_seconds=300)
     return jsonify(top)
 
