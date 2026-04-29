@@ -95,6 +95,49 @@ def _latest_price(ticker: str) -> float | None:
     return None
 
 
+# ── FCM push helper ──────────────────────────────────────────────
+
+_FCM_PROJECT = os.environ.get('FIREBASE_PROJECT_ID', 'whale-tracker-8c734')
+_FCM_KEY     = os.environ.get('FIREBASE_SERVER_KEY', '')   # Legacy HTTP v1 key or FCM v1 service account JSON
+
+def _send_fcm_to_all(title: str, body: str, data: dict | None = None):
+    """Send FCM push notification to all stored device tokens (Legacy HTTP API)."""
+    if not _FCM_KEY:
+        return  # FCM key not configured — skip silently
+    try:
+        # Fetch all FCM tokens from Supabase user_devices
+        r = requests.get(
+            f'{os.environ.get("SUPABASE_URL", "https://bedurjtazsfbnkisoeee.supabase.co")}'
+            '/rest/v1/user_devices?select=fcm_token',
+            headers={
+                'apikey': os.environ.get('SUPABASE_KEY', ''),
+                'Authorization': f'Bearer {os.environ.get("SUPABASE_KEY", "")}',
+            },
+            timeout=10,
+        )
+        tokens = [row.get('fcm_token') for row in (r.json() if r.status_code == 200 else [])
+                  if row.get('fcm_token')]
+        if not tokens:
+            return
+        payload = {
+            'registration_ids': tokens[:500],
+            'notification': {'title': title, 'body': body, 'sound': 'default'},
+            'data': data or {},
+            'priority': 'high',
+        }
+        requests.post(
+            'https://fcm.googleapis.com/fcm/send',
+            headers={
+                'Authorization': f'key={_FCM_KEY}',
+                'Content-Type': 'application/json',
+            },
+            json=payload, timeout=10,
+        )
+        logger.info(f'FCM sent to {len(tokens)} devices: {title}')
+    except Exception as e:
+        logger.warning(f'FCM send error: {e}')
+
+
 # ── Supabase helpers ─────────────────────────────────────────────
 
 _SUPA_URL = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
@@ -183,23 +226,42 @@ def place_intraday_order(signal: dict) -> dict:
     if confidence < 0.70:
         return {'status': 'skipped', 'message': f'Confidence {confidence:.0%} below 70% threshold'}
 
-    # Check position limits
+    # Check position limits (manual orders from Trading Terminal bypass the auto limit)
+    is_manual = bool(signal.get('manual'))
     _, positions = _alpaca('get', '/v2/positions')
     open_count   = len(positions) if isinstance(positions, list) else 0
-    if open_count >= MAX_POSITIONS:
-        return {'status': 'skipped', 'message': f'Max {MAX_POSITIONS} open positions reached'}
 
-    # Check if already in this ticker
-    if isinstance(positions, list):
+    # Read max_positions from Redis live config (set dynamically by the app)
+    effective_max = MAX_POSITIONS
+    try:
+        import redis as _redis_mod
+        _r = _redis_mod.from_url(os.environ.get('REDIS_URL', ''), decode_responses=False)
+        import json as _json
+        raw = _r.get('algo:live_config')
+        if raw:
+            cfg = _json.loads(raw)
+            effective_max = int(cfg.get('max_positions', MAX_POSITIONS))
+    except Exception:
+        pass
+
+    if not is_manual and open_count >= effective_max:
+        return {'status': 'skipped', 'message': f'Max {effective_max} open positions reached'}
+
+    # Check if already in this ticker (manual orders from Terminal are allowed to add/reduce)
+    if isinstance(positions, list) and not is_manual:
         existing = [p for p in positions if p.get('symbol') == ticker]
         if existing:
             return {'status': 'skipped', 'message': f'Already holding {ticker}'}
 
-    # Calculate quantity: 10% of portfolio
-    _, account = _alpaca('get', '/v2/account')
-    equity     = float(account.get('equity') or 100_000)
-    alloc      = equity * MAX_ALLOC_PCT
-    qty        = max(1, int(alloc / entry)) if entry > 0 else 1
+    # Calculate quantity: use override if provided, else 10% of portfolio
+    qty_override = signal.get('qty_override')
+    if qty_override and int(qty_override) > 0:
+        qty = int(qty_override)
+    else:
+        _, account = _alpaca('get', '/v2/account')
+        equity     = float(account.get('equity') or 100_000)
+        alloc      = equity * MAX_ALLOC_PCT
+        qty        = max(1, int(alloc / entry)) if entry > 0 else 1
 
     # Place market order
     side = 'buy' if sig_str == 'BUY' else 'sell'
@@ -219,6 +281,12 @@ def place_intraday_order(signal: dict) -> dict:
         logger.info(f'Intraday order placed: {side.upper()} {qty} {ticker} @ ~${entry:.2f}')
         with _state_lock:
             _partial_sold[ticker] = False
+        # WHAL-136: push notification to all devices
+        _send_fcm_to_all(
+            title=f'{side.upper()} {ticker}',
+            body=f'Entry ${entry:.2f} | Conf {confidence:.0%} | Stop ${stop_loss:.2f}',
+            data={'ticker': ticker, 'signal': side.upper(), 'confidence': str(confidence)},
+        )
     else:
         logger.error(f'Intraday order failed: {status_code} {order}')
 
@@ -381,6 +449,13 @@ def _close_position(ticker: str, pos: dict, trade: dict, reason: str, exit_price
         logger.info(f'Intraday close: {ticker} | reason={reason} | hold={hold_mins}m | pnl=${pnl:.2f} ({pnl_pct:.1%})')
         with _state_lock:
             _partial_sold.pop(ticker, None)
+        # WHAL-136: push notification on sell
+        pnl_sign = '+' if pnl >= 0 else ''
+        _send_fcm_to_all(
+            title=f'SELL {ticker} — {pnl_sign}${pnl:.2f}',
+            body=f'P&L: {pnl_sign}{pnl_pct:.1%} | Reason: {reason} | Held {hold_mins}m',
+            data={'ticker': ticker, 'signal': 'SELL', 'pnl': str(round(pnl, 2))},
+        )
         _supa_upsert('intraday_trades', [{
             'order_id':     trade.get('order_id', ''),
             'ticker':       ticker,

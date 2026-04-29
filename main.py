@@ -1620,6 +1620,43 @@ def run_scheduler():
 # For gunicorn
 app = create_app()
 
+# ── Manual cron trigger (admin, for debugging) ────────────────────────────────
+_cron_thread_lock = threading.Lock()
+_cron_running = False
+
+@app.route('/api/admin/cron/trigger', methods=['POST'])
+def admin_cron_trigger():
+    """Manually trigger the daily data scrape — for debugging/validation.
+    POST body: {"secret": "whal-cron-2026"}
+    """
+    global _cron_running
+    body = request.get_json(silent=True) or {}
+    if body.get('secret') != 'whal-cron-2026':
+        return jsonify({'error': 'unauthorized'}), 401
+    if _cron_running:
+        return jsonify({'status': 'already_running', 'message': 'Cron is already running'}), 409
+    def _bg():
+        global _cron_running
+        _cron_running = True
+        try:
+            import cron as _cron_mod
+            _cron_mod.run()
+            logger.info('Manual cron trigger: completed')
+        except Exception as e:
+            logger.error(f'Manual cron trigger error: {e}')
+        finally:
+            _cron_running = False
+    threading.Thread(target=_bg, daemon=True, name='manual-cron').start()
+    return jsonify({'status': 'started', 'message': 'Cron scrape started in background — check logs'})
+
+
+# WHAL-131/132: Register algo engine Flask routes immediately after app creation
+try:
+    import algo_engine as _algo_engine
+    _algo_engine.register_routes(app)
+except Exception as _ae_err:
+    import logging as _lg; _lg.getLogger(__name__).warning(f'algo_engine routes: {_ae_err}')
+
 # ── Startup: load cache from Supabase + run scheduler in background ──
 def _startup():
     global _filings_cache, _last_updated
@@ -1649,7 +1686,12 @@ def _startup():
     schedule.every().day.at("16:00").do(_scraper.run)
     # WHAL-116: Daily data persistence — 17:05 ET (21:05 UTC) Mon–Fri
     schedule.every().day.at("21:05").do(_run_daily_cron)
+    # Reddit bulk scraper — every 4 hours
+    schedule.every(4).hours.do(_scrape_reddit_bulk)
     logger.info("Scheduler started — daily cron registered at 21:05 UTC")
+
+    # Run Reddit scraper on startup (in background thread already)
+    _scrape_reddit_bulk()
 
     while True:
         schedule.run_pending()
@@ -1670,6 +1712,25 @@ def _start_daily_cron_scheduler():
 
 _cron_thread = threading.Thread(target=_start_daily_cron_scheduler, daemon=True, name="daily-cron")
 _cron_thread.start()
+
+# ── Keep-alive self-ping every 4 minutes ─────────────────────────────
+# Railway free tier sleeps after ~5 min of inactivity. Self-pinging keeps
+# the server warm so app screens never hit cold-start timeouts.
+def _keep_alive():
+    import urllib.request
+    while True:
+        time.sleep(240)  # 4 minutes
+        try:
+            urllib.request.urlopen(
+                'https://whale-tracker-scraper-production.up.railway.app/api/health',
+                timeout=10,
+            )
+            logger.debug('Keep-alive ping OK')
+        except Exception as e:
+            logger.debug(f'Keep-alive ping failed: {e}')
+
+_keepalive_thread = threading.Thread(target=_keep_alive, daemon=True, name="keep-alive")
+_keepalive_thread.start()
 
 # ── WHAL-94/96/98/102: Background services — started after app init ──
 # redis_set/redis_get are defined later in the file; use a deferred thread
@@ -1703,6 +1764,12 @@ def _start_background_services():
         _start_premarket(redis_set, redis_get)
     except Exception as e:
         logger.warning(f'Pre-market scanner failed to start: {e}')
+    # WHAL-131/132: Algo engine loop + circuit breaker
+    try:
+        import algo_engine as _ae
+        _ae.start()
+    except Exception as e:
+        logger.warning(f'Algo engine failed to start: {e}')
 
 threading.Thread(target=_start_background_services, daemon=True, name='svc-starter').start()
 
@@ -2257,6 +2324,274 @@ def sentiment_ticker(ticker):
         return jsonify(data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ─── /api/reddit — Reddit WallStreetBets sentiment (WHAL-119) ────────────────
+
+@app.route('/api/reddit/sentiment')
+def reddit_sentiment_all():
+    """GET all reddit sentiment rows from Supabase (most recently scraped)."""
+    try:
+        url = (
+            f'{SUPABASE_URL}/rest/v1/reddit_sentiment'
+            f'?order=sentiment_score.desc&limit=50'
+        )
+        r = requests.get(url, headers=SUPABASE_HEADERS, timeout=10)
+        rows = r.json() if r.status_code == 200 else []
+        return jsonify({'data': rows, 'count': len(rows)})
+    except Exception as e:
+        logger.error(f'reddit_sentiment_all error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/reddit/sentiment/<ticker>')
+def reddit_sentiment_ticker(ticker):
+    """GET reddit sentiment for a specific ticker. Falls back to live scrape if not cached."""
+    t = ticker.upper()
+    cache_key = f'reddit:sentiment:{t}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+    try:
+        # Try Supabase first
+        url = f'{SUPABASE_URL}/rest/v1/reddit_sentiment?ticker=eq.{t}&order=scraped_at.desc&limit=1'
+        r = requests.get(url, headers=SUPABASE_HEADERS, timeout=8)
+        rows = r.json() if r.status_code == 200 else []
+        if rows:
+            redis_set(cache_key, rows[0], ttl_seconds=900)
+            return jsonify(rows[0])
+
+        # Live scrape fallback
+        headers = {'User-Agent': 'WhaleTracker/1.0 (whale tracker app)'}
+        subs = ['wallstreetbets', 'stocks', 'investing']
+        bull_kw = {'buy','bull','moon','calls','long','squeeze','pump','rocket','ath','dip','hold'}
+        bear_kw = {'sell','bear','puts','short','crash','dump','drop','fall','red','rip'}
+        counts = {'bullish': 0, 'bearish': 0, 'neutral': 0}
+        total_mentions = 0
+        top_posts = []
+        for sub in subs:
+            try:
+                resp = requests.get(
+                    f'https://www.reddit.com/r/{sub}/search.json',
+                    params={'q': t, 'sort': 'new', 'limit': 15, 'restrict_sr': '1'},
+                    headers=headers, timeout=8,
+                )
+                if resp.status_code != 200:
+                    continue
+                for child in resp.json().get('data', {}).get('children', []):
+                    post = child.get('data', {})
+                    body = ((post.get('title') or '') + ' ' + (post.get('selftext') or '')).lower()
+                    if t.lower() not in body:
+                        continue
+                    total_mentions += 1
+                    words = set(body.split())
+                    if words & bull_kw:    counts['bullish'] += 1
+                    elif words & bear_kw:  counts['bearish'] += 1
+                    else:                  counts['neutral'] += 1
+                    if len(top_posts) < 5:
+                        top_posts.append({
+                            'title': (post.get('title') or '')[:200],
+                            'score': post.get('score', 0),
+                            'url':   f"https://reddit.com{post.get('permalink', '')}",
+                            'sub':   sub,
+                        })
+                time.sleep(1)
+            except Exception:
+                pass
+        total = counts['bullish'] + counts['bearish'] + counts['neutral']
+        score = round((counts['bullish'] - counts['bearish']) / total, 3) if total else 0
+        result = {
+            'ticker': t,
+            'total_mentions': total_mentions,
+            'bullish_count': counts['bullish'],
+            'bearish_count': counts['bearish'],
+            'neutral_count': counts['neutral'],
+            'sentiment_score': score,
+            'top_posts': top_posts,
+            'scraped_at': datetime.now(timezone.utc).isoformat(),
+        }
+        redis_set(cache_key, result, ttl_seconds=900)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'reddit_sentiment_ticker({t}) error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── Reddit bulk scraper (runs on startup + every 4 h) ───────────────────────
+
+# Fallback seed list — only used if all dynamic sources fail
+_REDDIT_SEED_TICKERS = [
+    'NVDA','TSLA','AAPL','AMZN','META','MSFT','GOOGL','AMD','PLTR','COIN',
+    'GME','AMC','SPY','QQQ','MSTR','SMCI','ARM','CRWD','SNOW','MU',
+]
+
+import re as _re_reddit
+_TICKER_RE = _re_reddit.compile(r'\b([A-Z]{2,5})\b')   # bare uppercase words
+_DOLLAR_RE = _re_reddit.compile(r'\$([A-Z]{1,5})\b')   # $AAPL style
+
+def _get_reddit_tickers_dynamic() -> list:
+    """
+    Build the ticker list to scrape from three live sources:
+      1. Reddit WSB/stocks hot posts — extract tickers mentioned in titles
+      2. Whale Tracker scanner top picks (already computed)
+      3. User watchlists from Supabase
+
+    Returns deduplicated list capped at 50.
+    """
+    tickers = set()
+    headers_r = {'User-Agent': 'WhaleTracker/1.0 research bot'}
+
+    # ── Source 1: extract tickers from Reddit hot posts ──────────────
+    for sub in ['wallstreetbets', 'stocks', 'options']:
+        try:
+            resp = requests.get(
+                f'https://www.reddit.com/r/{sub}/hot.json',
+                params={'limit': 50},
+                headers=headers_r, timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            for child in resp.json().get('data', {}).get('children', []):
+                title = (child.get('data', {}).get('title') or '').upper()
+                # prefer $TICKER mentions, then bare uppercase words
+                for m in _DOLLAR_RE.findall(title):
+                    tickers.add(m)
+                for m in _TICKER_RE.findall(title):
+                    if len(m) >= 2:
+                        tickers.add(m)
+            time.sleep(0.8)
+        except Exception as exc:
+            logger.warning(f'Reddit hot fetch for {sub}: {exc}')
+
+    # ── Source 2: scanner top picks ───────────────────────────────────
+    try:
+        r = requests.get('http://localhost:5000/api/scanner/top', timeout=5)
+        if r.status_code == 200:
+            for pick in (r.json() or []):
+                t = (pick.get('ticker') or '').upper()
+                if t:
+                    tickers.add(t)
+    except Exception:
+        pass
+
+    # ── Source 3: user watchlists from Supabase ───────────────────────
+    try:
+        url = f'{SUPABASE_URL}/rest/v1/watchlist?select=ticker&limit=200'
+        r = requests.get(url, headers=SUPABASE_HEADERS, timeout=8)
+        if r.status_code == 200:
+            for row in (r.json() or []):
+                t = (row.get('ticker') or '').upper()
+                if t:
+                    tickers.add(t)
+    except Exception:
+        pass
+
+    # ── Filter noise: remove common English words / ETF noise ────────
+    noise = {
+        'THE','AND','FOR','ARE','WAS','NOT','BUT','ITS','WITH','THIS',
+        'THAT','FROM','WILL','HAVE','BEEN','WHAT','THEY','THEIR','ALL',
+        'CAN','HAS','ONE','NEW','OUT','NOW','JUST','SEC','CEO','CFO',
+        'EPS','IPO','ETF','ATH','WSB','DD','TA','TD','PM','AM','EST',
+        'PST','UTC','GDP','CPI','FED','AI','IT','OR','IN','IS','AT',
+        'TO','AS','BE','IF','ON','DO','UP','BY','AN','WE','ME',
+    }
+    tickers -= noise
+
+    result = sorted(tickers)[:50]  # cap at 50 per run
+
+    # Fall back to seed list if dynamic detection yielded nothing
+    if len(result) < 5:
+        result = _REDDIT_SEED_TICKERS
+
+    logger.info(f'Reddit dynamic tickers ({len(result)}): {result[:10]}…')
+    return result
+
+
+def _scrape_reddit_bulk():
+    """Scrape Reddit WSB/stocks/investing for top tickers and upsert to Supabase."""
+    import threading
+    headers_r = {'User-Agent': 'WhaleTracker/1.0 research bot'}
+    bull_kw = {'buy','bull','moon','calls','long','squeeze','pump','rocket','ath','dip','hold','yolo','calls','gains'}
+    bear_kw = {'sell','bear','puts','short','crash','dump','drop','fall','red','rip','puts','loss','losses','bearish'}
+    subs    = ['wallstreetbets', 'stocks', 'investing', 'StockMarket']
+
+    def _scrape_one(t):
+        try:
+            counts = {'bullish': 0, 'bearish': 0, 'neutral': 0}
+            total_mentions = 0
+            top_posts = []
+            for sub in subs:
+                try:
+                    resp = requests.get(
+                        f'https://www.reddit.com/r/{sub}/search.json',
+                        params={'q': t, 'sort': 'hot', 'limit': 20, 'restrict_sr': '1'},
+                        headers=headers_r, timeout=10,
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    for child in resp.json().get('data', {}).get('children', []):
+                        post = child.get('data', {})
+                        body = ((post.get('title') or '') + ' ' + (post.get('selftext') or '')).lower()
+                        if t.lower() not in body and f'${t.lower()}' not in body:
+                            continue
+                        total_mentions += 1
+                        words = set(body.split())
+                        if words & bull_kw:    counts['bullish'] += 1
+                        elif words & bear_kw:  counts['bearish'] += 1
+                        else:                  counts['neutral'] += 1
+                        if len(top_posts) < 3:
+                            top_posts.append({
+                                'title': (post.get('title') or '')[:200],
+                                'score': post.get('score', 0),
+                                'url':   f"https://reddit.com{post.get('permalink', '')}",
+                                'sub':   sub,
+                            })
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+            if total_mentions == 0:
+                return
+            total = counts['bullish'] + counts['bearish'] + counts['neutral'] or 1
+            score = round((counts['bullish'] - counts['bearish']) / total, 3)
+            bull_pct = round(counts['bullish'] / total * 100)
+            bear_pct = round(counts['bearish'] / total * 100)
+            top_post_text = top_posts[0]['title'] if top_posts else ''
+            row = {
+                'ticker':          t,
+                'total_mentions':  total_mentions,
+                'bullish_count':   counts['bullish'],
+                'bearish_count':   counts['bearish'],
+                'neutral_count':   counts['neutral'],
+                'sentiment_score': score,
+                'scraped_at':      datetime.now(timezone.utc).isoformat(),
+            }
+            # Upsert to Supabase — only write confirmed schema columns
+            upsert_url = f'{SUPABASE_URL}/rest/v1/reddit_sentiment'
+            upsert_headers = {**SUPABASE_HEADERS, 'Prefer': 'resolution=merge-duplicates'}
+            resp_upsert = requests.post(upsert_url, json=row, headers=upsert_headers, timeout=8)
+            if resp_upsert.status_code not in (200, 201):
+                logger.warning(f'Reddit upsert {t}: {resp_upsert.status_code} {resp_upsert.text[:200]}')
+            redis_set(f'reddit:sentiment:{t}', row, ttl_seconds=14400)
+            logger.info(f'Reddit bulk: {t} score={score:+.2f} mentions={total_mentions}')
+        except Exception as e:
+            logger.warning(f'Reddit bulk scrape error for {t}: {e}')
+
+    def _run():
+        tickers = _get_reddit_tickers_dynamic()
+        logger.info(f'Reddit bulk scraper starting ({len(tickers)} tickers)…')
+        for t in tickers:
+            _scrape_one(t)
+            time.sleep(1.2)  # be a good citizen, ~1 req/s across subs
+        logger.info('Reddit bulk scraper done')
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@app.route('/api/reddit/scrape', methods=['POST'])
+def trigger_reddit_scrape():
+    """Manually trigger the Reddit bulk scraper (admin use)."""
+    _scrape_reddit_bulk()
+    return jsonify({'status': 'started', 'tickers': len(_REDDIT_SEED_TICKERS)})
 
 
 # ─── /api/ofi — WHAL-104 OFI & VPIN Engine ──────────────────────────
@@ -3184,6 +3519,18 @@ Respond ONLY with valid JSON (no markdown, no backticks, no explanation outside 
   "key_factors": ["<factor1>", "<factor2>", "<factor3>"]
 }}"""
 
+        # WHAL-147: inject live Kalshi prediction market odds into prompt
+        try:
+            prediction_context = get_prediction_context()
+            prompt += f"""
+
+Current macro prediction market odds (crowd-sourced, CFTC-regulated Kalshi data):
+{prediction_context}
+
+Where relevant, reference these probabilities to enrich your analysis with macro context (e.g. 'With markets pricing a 68% chance of a Fed rate cut...')."""
+        except Exception:
+            pass
+
         api_resp = requests.post(
             'https://api.anthropic.com/v1/messages',
             headers={
@@ -4047,9 +4394,131 @@ def trade_log():
                 day_rows = _supa_get('intraday_trades', query) or []
                 rows.extend(day_rows)
 
+        # Normalise qty to int (some rows stored qty as string)
+        for r in rows:
+            try:
+                if r.get('qty') is not None:
+                    r['qty'] = int(float(str(r['qty'])))
+            except Exception:
+                r['qty'] = 0
         return jsonify({'trades': rows, 'count': len(rows)})
     except Exception as e:
         logger.error(f'trade/log error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/intraday/order', methods=['POST'])
+def intraday_manual_order():
+    """POST — place a manual paper trade from the Trading Terminal.
+
+    Body JSON:
+      ticker      : str   — e.g. "AAPL"
+      signal      : str   — "BUY" or "SELL"
+      qty         : int   — optional, shares to trade (0 = auto-calculate)
+      hold_minutes: int   — optional, default 10080 (7 days)
+      confidence  : float — optional, default 0.75
+    """
+    try:
+        from intraday_executor import place_intraday_order, _alpaca, _latest_price as _get_latest_price
+        import os as _os
+        body       = request.get_json(force=True) or {}
+        ticker     = (body.get('ticker') or '').upper().strip()
+        signal     = (body.get('signal') or 'BUY').upper()
+        qty_req    = int(body.get('qty') or 0)
+        hold_mins  = int(body.get('hold_minutes', 10080))
+        confidence = float(body.get('confidence', 0.75))
+
+        if not ticker:
+            return jsonify({'error': 'ticker required'}), 400
+        if signal not in ('BUY', 'SELL'):
+            return jsonify({'error': 'signal must be BUY or SELL'}), 400
+
+        # Manual orders from Trading Terminal always execute in paper mode
+        # regardless of INTRADAY_TRADING_ENABLED (that gate is for the auto loop only)
+        _os.environ['INTRADAY_TRADING_ENABLED'] = 'true'
+
+        # Fetch live price for accurate qty calculation
+        price = _get_latest_price(ticker)
+
+        result = place_intraday_order({
+            'ticker':       ticker,
+            'signal':       signal,
+            'entry':        price,
+            'stop_loss':    price * (0.92 if signal == 'BUY' else 1.08),
+            'target':       price * (1.15 if signal == 'BUY' else 0.85),
+            'hold_minutes': hold_mins,
+            'confidence':   confidence,
+            'qty_override': qty_req if qty_req > 0 else None,
+            'reasoning':    f'Manual order from Trading Terminal ({qty_req} shares)',
+            'manual':       True,   # bypass auto-scanner position limit
+        })
+
+        _os.environ['INTRADAY_TRADING_ENABLED'] = 'false'
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'intraday/order error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/intraday/pnl-summary', methods=['GET'])
+def intraday_pnl_summary():
+    """GET — full P&L snapshot: unrealized + realized + account equity."""
+    try:
+        from intraday_executor import _alpaca, _supa_get
+        # Alpaca positions (unrealized P&L)
+        _, positions = _alpaca('get', '/v2/positions')
+        pos_list = positions if isinstance(positions, list) else []
+
+        total_unrealized = sum(float(p.get('unrealized_pl') or 0) for p in pos_list)
+        winners = [p for p in pos_list if float(p.get('unrealized_pl') or 0) > 0]
+        losers  = [p for p in pos_list if float(p.get('unrealized_pl') or 0) < 0]
+        best  = max(pos_list, key=lambda p: float(p.get('unrealized_pl') or 0), default={})
+        worst = min(pos_list, key=lambda p: float(p.get('unrealized_pl') or 0), default={})
+
+        # Alpaca account equity
+        _, account = _alpaca('get', '/v2/account')
+        equity      = float(account.get('equity')      or 0) if isinstance(account, dict) else 0
+        last_equity = float(account.get('last_equity') or 0) if isinstance(account, dict) else 0
+        today_pnl   = equity - last_equity
+
+        # Realized from Supabase closed trades
+        rows = _supa_get('intraday_trades', 'status=eq.closed&select=pnl') or []
+        realized = sum(float(r.get('pnl') or 0) for r in rows)
+        closed_count = len(rows)
+        win_count = sum(1 for r in rows if float(r.get('pnl') or 0) > 0)
+
+        positions_summary = [
+            {
+                'ticker':    p.get('symbol'),
+                'qty':       float(p.get('qty') or 0),
+                'entry':     float(p.get('avg_entry_price') or 0),
+                'current':   float(p.get('current_price') or 0),
+                'unrealized':float(p.get('unrealized_pl') or 0),
+                'pnl_pct':   float(p.get('unrealized_plpc') or 0) * 100,
+            }
+            for p in pos_list
+        ]
+        positions_summary.sort(key=lambda x: x['unrealized'], reverse=True)
+
+        return jsonify({
+            'equity':            round(equity, 2),
+            'today_pnl':         round(today_pnl, 2),
+            'total_unrealized':  round(total_unrealized, 2),
+            'realized':          round(realized, 2),
+            'net_pnl':           round(total_unrealized + realized, 2),
+            'open_count':        len(pos_list),
+            'winner_count':      len(winners),
+            'loser_count':       len(losers),
+            'closed_count':      closed_count,
+            'win_rate':          round(win_count / closed_count * 100, 1) if closed_count else 0,
+            'best_ticker':       best.get('symbol', '—'),
+            'best_pnl':          round(float(best.get('unrealized_pl') or 0), 2),
+            'worst_ticker':      worst.get('symbol', '—'),
+            'worst_pnl':         round(float(worst.get('unrealized_pl') or 0), 2),
+            'positions':         positions_summary,
+        })
+    except Exception as e:
+        logger.error(f'pnl-summary error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
@@ -4274,6 +4743,31 @@ def premarket_scan_now():
         return jsonify({'error': str(e)}), 500
 
 
+# ─── /api/debug/market — diagnose market-open check ─────────────────────────
+@app.route('/api/debug/market')
+def debug_market():
+    """Returns live market-open check results for debugging scanner idle issues."""
+    try:
+        import pytz
+        from datetime import datetime as _dt
+        ET = pytz.timezone('America/New_York')
+        now = _dt.now(ET)
+        from intraday_scanner import is_market_open, _is_trading_day, _US_MARKET_HOLIDAYS
+        date_str = now.strftime('%Y-%m-%d')
+        return jsonify({
+            'server_time_et':    now.strftime('%Y-%m-%d %H:%M:%S %Z'),
+            'weekday':           now.weekday(),        # 0=Mon, 6=Sun
+            'date':              date_str,
+            'is_holiday':        date_str in _US_MARKET_HOLIDAYS,
+            'is_trading_day':    _is_trading_day(date_str),
+            'is_market_open':    is_market_open(),
+            'hour_et':           now.hour,
+            'minute_et':         now.minute,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # ─── /api/scanner — WHAL-94 Intraday Stock Scanner ───────────────
 
 @app.route('/api/scanner/top')
@@ -4296,6 +4790,78 @@ def scanner_all():
         return jsonify({'stocks': stocks, 'count': len(stocks)})
     except Exception as e:
         logger.error(f'scanner/all error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+_ALGO_CONFIG_KEY = 'algo:live_config'
+
+_ALGO_CONFIG_DEFAULTS = {
+    'enabled':           True,
+    'aggression':        0.5,
+    'max_trades_per_day': 3,
+    'min_score':         50,
+    'min_confidence':    65,   # stored as 0-100; divide by 100 when using
+    'hold_minutes':      390,  # one full trading session (9:30-4:00 ET)
+    'max_positions':     5,
+}
+
+def _get_live_config() -> dict:
+    """Return merged algo config: Redis overrides Supabase overrides defaults."""
+    cfg = dict(_ALGO_CONFIG_DEFAULTS)
+    # Layer 1: Supabase persisted values (min_score, min_confidence, etc.)
+    try:
+        supa_url = os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
+        supa_key = os.getenv('SUPABASE_KEY', '')
+        r = requests.get(
+            f'{supa_url}/rest/v1/algo_config?limit=1',
+            headers={'apikey': supa_key, 'Authorization': f'Bearer {supa_key}'},
+            timeout=3,
+        )
+        if r.status_code == 200 and r.json():
+            for k, v in r.json()[0].items():
+                if k in cfg and v is not None:
+                    cfg[k] = v
+    except Exception:
+        pass
+    # Layer 2: Redis live overrides (highest priority — set via POST /api/scanner/config)
+    try:
+        cached = redis_get(_ALGO_CONFIG_KEY)
+        if cached and isinstance(cached, dict):
+            cfg.update(cached)
+    except Exception:
+        pass
+    return cfg
+
+
+@app.route('/api/scanner/config', methods=['GET', 'POST'])
+def scanner_config():
+    """GET current algo config. POST to update any field dynamically.
+
+    All changes are stored in Redis and take effect on the NEXT scan cycle.
+    Persisted until Railway restarts (survives request boundaries).
+
+    Supported fields:
+      enabled, aggression, max_trades_per_day, min_score,
+      min_confidence (0-100), hold_minutes, max_positions
+    """
+    if request.method == 'GET':
+        return jsonify(_get_live_config())
+
+    try:
+        body = request.get_json(force=True) or {}
+        current = _get_live_config()
+
+        ALLOWED = {'enabled', 'aggression', 'max_trades_per_day', 'min_score',
+                   'min_confidence', 'hold_minutes', 'max_positions'}
+        for k, v in body.items():
+            if k in ALLOWED:
+                current[k] = v
+
+        redis_set(_ALGO_CONFIG_KEY, current, ttl_seconds=86400 * 30)  # 30-day TTL
+        logger.info(f'Algo config updated: {body}')
+        return jsonify({'status': 'ok', 'config': current})
+    except Exception as e:
+        logger.error(f'scanner/config POST error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
@@ -4987,6 +5553,1751 @@ def notify_send():
     except Exception as e:
         logger.error(f'notify/send error: {e}')
         return jsonify({'error': str(e)}), 500
+
+
+# ─── /api/ticker/analyze — WHAL-150 Ticker Explorer: deep AI + day trading ───
+
+@app.route('/api/ticker/analyze/<ticker>', methods=['GET'])
+def ticker_analyze(ticker: str):
+    """
+    Deep AI analysis report for any ticker.
+    Returns: quote, multi-timeframe technicals, day trading score,
+             key levels, insider activity, news, full AI trading plan.
+    """
+    ticker = ticker.upper().strip()
+    cache_key = f'ticker:analyze2:{ticker}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    result = _build_ticker_report(ticker)
+    redis_set(cache_key, result, ttl_seconds=180)  # cache 3 min
+    return jsonify(result)
+
+
+def _build_ticker_report(ticker: str) -> dict:
+    """Aggregate multi-timeframe data and generate deep AI trading plan."""
+    import concurrent.futures as _cf
+
+    # ── Fetch all data in parallel ──
+    with _cf.ThreadPoolExecutor(max_workers=6) as ex:
+        f_quote    = ex.submit(_tr_yf_quote, ticker)
+        f_bars_1m  = ex.submit(_tr_yf_bars, ticker, '1m', 60)   # 60 1-min bars
+        f_bars_5m  = ex.submit(_tr_yf_bars, ticker, '5m', 60)   # 60 5-min bars
+        f_bars_1d  = ex.submit(_tr_yf_bars, ticker, '1d', 30)   # 30 daily bars
+        f_insider  = ex.submit(_tr_insider_activity, ticker)
+        f_news     = ex.submit(_tr_news_sentiment, ticker)
+
+    quote    = f_quote.result()
+    bars_1m  = f_bars_1m.result()
+    bars_5m  = f_bars_5m.result()
+    bars_1d  = f_bars_1d.result()
+    insider  = f_insider.result()
+    news     = f_news.result()
+
+    # ── Multi-timeframe technicals ──
+    tech_1m = _tr_compute_technicals(bars_1m, label='1min')
+    tech_5m = _tr_compute_technicals(bars_5m, label='5min')
+    tech_1d = _tr_compute_technicals(bars_1d, label='daily')
+
+    # ── Key levels: VWAP, pivot, S/R ──
+    key_levels = _tr_key_levels(quote, bars_1m, bars_5m, bars_1d)
+
+    # ── Day trading score (7 axes) ──
+    day_score = _tr_day_trading_score(quote, tech_1m, tech_5m, tech_1d, insider, key_levels)
+
+    # ── Deep AI analysis with full trading plan ──
+    ai_plan = _tr_deep_ai_plan(ticker, quote, tech_1m, tech_5m, tech_1d, key_levels, day_score, insider, news)
+
+    return {
+        'ticker':       ticker,
+        'quote':        quote,
+        'technicals':   {'1min': tech_1m, '5min': tech_5m, 'daily': tech_1d},
+        'key_levels':   key_levels,
+        'day_score':    day_score,
+        'insider':      insider,
+        'news':         news,
+        'ai_plan':      ai_plan,
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+    }
+
+
+def _tr_yf_bars(ticker: str, interval: str = '5m', limit: int = 60) -> list:
+    """Fetch OHLCV bars. Interval: '1m','5m','15m','1d'. Tries Alpaca then Yahoo."""
+    # ── Alpaca IEX (1-min only, reliable from Railway) ──
+    if interval == '1m' and ALPACA_KEY and ALPACA_SECRET:
+        try:
+            r = requests.get(
+                f'https://data.alpaca.markets/v2/stocks/{ticker}/bars',
+                headers={'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET},
+                params={'timeframe': '1Min', 'limit': limit, 'feed': 'iex', 'sort': 'asc'},
+                timeout=8,
+            )
+            if r.status_code == 200:
+                bars = r.json().get('bars', [])
+                if bars:
+                    return [{'t': b['t'], 'o': b['o'], 'h': b['h'],
+                             'l': b['l'], 'c': b['c'], 'v': b['v']} for b in bars]
+        except Exception:
+            pass
+
+    # ── Yahoo Finance ──
+    yf_range = {'1m': '1d', '5m': '5d', '15m': '5d', '1d': '3mo'}.get(interval, '5d')
+    try:
+        r = requests.get(
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}',
+            params={'interval': interval, 'range': yf_range},
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; WhaleTracker/1.0)'},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            result = r.json().get('chart', {}).get('result', [])
+            if result:
+                ts = result[0].get('timestamp', [])
+                q  = result[0].get('indicators', {}).get('quote', [{}])[0]
+                bars = []
+                for i in range(len(ts)):
+                    o = q.get('open',   [None]*len(ts))[i]
+                    h = q.get('high',   [None]*len(ts))[i]
+                    l = q.get('low',    [None]*len(ts))[i]
+                    c = q.get('close',  [None]*len(ts))[i]
+                    v = q.get('volume', [None]*len(ts))[i]
+                    if None not in (o, h, l, c, v):
+                        bars.append({'t': ts[i], 'o': o, 'h': h, 'l': l, 'c': c, 'v': v})
+                return bars[-limit:]
+    except Exception as e:
+        logger.warning(f'_tr_yf_bars {ticker} {interval}: {e}')
+    return []
+
+
+def _tr_yf_quote(ticker: str) -> dict:
+    """Fetch current quote from Yahoo Finance."""
+    try:
+        r = requests.get(
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}',
+            params={'interval': '1d', 'range': '5d'},
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; WhaleTracker/1.0)'},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return {}
+        result = r.json().get('chart', {}).get('result', [])
+        if not result:
+            return {}
+        meta = result[0].get('meta', {})
+        ts   = result[0].get('timestamp', [])
+        quote_data = result[0].get('indicators', {}).get('quote', [{}])[0]
+        closes = quote_data.get('close', [])
+        opens  = quote_data.get('open', [])
+        highs  = quote_data.get('high', [])
+        lows   = quote_data.get('low', [])
+        vols   = quote_data.get('volume', [])
+        cur = closes[-1] if closes else meta.get('regularMarketPrice', 0)
+        prev_close = meta.get('previousClose') or meta.get('chartPreviousClose') or (closes[-2] if len(closes) >= 2 else cur)
+        day_open = opens[-1] if opens else cur
+        day_high = max(h for h in [highs[-1]] if h) if highs else cur
+        day_low  = min(l for l in [lows[-1]] if l) if lows else cur
+        change_pct = ((cur - prev_close) / prev_close * 100) if prev_close else 0
+        return {
+            'price':       round(cur, 2) if cur else 0,
+            'prev_close':  round(prev_close, 2) if prev_close else 0,
+            'day_open':    round(day_open, 2) if day_open else 0,
+            'day_high':    round(day_high, 2) if day_high else 0,
+            'day_low':     round(day_low, 2) if day_low else 0,
+            'change_pct':  round(change_pct, 2),
+            'volume':      int(vols[-1]) if vols and vols[-1] else 0,
+            'avg_volume':  int(meta.get('averageDailyVolume3Month') or meta.get('regularMarketVolume') or 0),
+            'market_cap':  meta.get('marketCap', 0),
+            'currency':    meta.get('currency', 'USD'),
+            'short_name':  meta.get('shortName') or meta.get('longName') or ticker,
+            '52w_high':    meta.get('fiftyTwoWeekHigh', 0),
+            '52w_low':     meta.get('fiftyTwoWeekLow', 0),
+        }
+    except Exception as e:
+        logger.warning(f'_tr_yf_quote {ticker}: {e}')
+        return {}
+
+
+
+
+def _tr_compute_technicals(bars: list, label: str = '') -> dict:
+    """Full technical analysis: RSI-14, MACD, Bollinger Bands, VWAP, volume analysis."""
+    if len(bars) < 5:
+        return {'label': label, 'rsi': None, 'macd_signal': 'insufficient_data',
+                'vol_ratio': None, 'trend': 'unknown', 'bars_count': len(bars)}
+
+    closes  = [b['c'] for b in bars]
+    highs   = [b['h'] for b in bars]
+    lows_b  = [b['l'] for b in bars]
+    volumes = [b['v'] for b in bars]
+
+    def ema(data, span):
+        k = 2 / (span + 1); e = data[0]
+        for v in data[1:]: e = v * k + e * (1 - k)
+        return e
+
+    # RSI-14 (or 5 if not enough bars)
+    rsi_period = min(14, len(closes) - 1)
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
+    avg_g = sum(gains[-rsi_period:]) / rsi_period
+    avg_l = sum(losses[-rsi_period:]) / rsi_period
+    rsi = round(100 - (100 / (1 + avg_g / avg_l)), 1) if avg_l != 0 else 100.0
+
+    # RSI interpretation
+    if rsi >= 70:   rsi_state = 'overbought'
+    elif rsi <= 30: rsi_state = 'oversold'
+    elif rsi >= 55: rsi_state = 'bullish_momentum'
+    elif rsi <= 45: rsi_state = 'bearish_momentum'
+    else:           rsi_state = 'neutral'
+
+    # MACD (12/26/9 for daily; 6/13/4 for intraday)
+    fast, slow = (6, 13) if label in ('1min', '5min') else (12, 26)
+    macd_line = ema(closes, fast) - ema(closes, slow)
+    signal_line = ema(closes, 9) if len(closes) >= 9 else macd_line
+    histogram = macd_line - signal_line
+    macd_prev_hist = (ema(closes[:-1], fast) - ema(closes[:-1], slow)) - signal_line if len(closes) > slow else 0
+    if histogram > 0 and macd_prev_hist <= 0:    macd_signal = 'bullish_crossover'
+    elif histogram > 0 and histogram > macd_prev_hist: macd_signal = 'bullish_accelerating'
+    elif histogram > 0:                           macd_signal = 'bullish'
+    elif histogram < 0 and macd_prev_hist >= 0:  macd_signal = 'bearish_crossover'
+    elif histogram < 0 and histogram < macd_prev_hist: macd_signal = 'bearish_accelerating'
+    else:                                         macd_signal = 'bearish'
+
+    # Bollinger Bands (20-period)
+    bb_period = min(20, len(closes))
+    sma20 = sum(closes[-bb_period:]) / bb_period
+    std20 = (sum((c - sma20) ** 2 for c in closes[-bb_period:]) / bb_period) ** 0.5
+    bb_upper = round(sma20 + 2 * std20, 2)
+    bb_lower = round(sma20 - 2 * std20, 2)
+    bb_width_pct = round((bb_upper - bb_lower) / sma20 * 100, 2) if sma20 > 0 else 0
+    cur = closes[-1]
+    if cur > bb_upper:        bb_position = 'above_upper'   # breakout / overbought
+    elif cur > sma20:         bb_position = 'upper_half'
+    elif cur > bb_lower:      bb_position = 'lower_half'
+    else:                     bb_position = 'below_lower'   # breakdown / oversold
+
+    # Volume analysis
+    avg_vol   = sum(volumes[:-1]) / max(len(volumes) - 1, 1)
+    vol_ratio = round(volumes[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
+    vol_trend = 'rising' if len(volumes) >= 3 and volumes[-1] > volumes[-2] > volumes[-3] else \
+                'falling' if len(volumes) >= 3 and volumes[-1] < volumes[-2] < volumes[-3] else 'mixed'
+
+    # VWAP (volume-weighted average price — intraday reference)
+    tp_sum = sum((b['h'] + b['l'] + b['c']) / 3 * b['v'] for b in bars)
+    vol_sum = sum(b['v'] for b in bars)
+    vwap = round(tp_sum / vol_sum, 2) if vol_sum > 0 else cur
+    vwap_pct = round((cur - vwap) / vwap * 100, 2) if vwap > 0 else 0
+
+    # Momentum
+    momentum_5  = round((closes[-1] - closes[-6]) / closes[-6] * 100, 2) if len(closes) >= 6 else 0
+    momentum_20 = round((closes[-1] - closes[-21]) / closes[-21] * 100, 2) if len(closes) >= 21 else 0
+
+    # Trend (EMA alignment)
+    ema9  = ema(closes, 9)
+    ema21 = ema(closes, 21) if len(closes) >= 21 else closes[0]
+    if cur > ema9 > ema21:    trend = 'strong_uptrend'
+    elif cur > ema9:          trend = 'uptrend'
+    elif cur < ema9 < ema21:  trend = 'strong_downtrend'
+    elif cur < ema9:          trend = 'downtrend'
+    else:                     trend = 'sideways'
+
+    # Support / Resistance
+    support    = round(min(lows_b[-20:]), 2)
+    resistance = round(max(highs[-20:]), 2)
+
+    # ATR (14-period Average True Range)
+    trs = []
+    for i in range(1, min(14, len(bars))):
+        tr = max(
+            bars[i]['h'] - bars[i]['l'],
+            abs(bars[i]['h'] - bars[i-1]['c']),
+            abs(bars[i]['l'] - bars[i-1]['c']),
+        )
+        trs.append(tr)
+    atr = round(sum(trs) / len(trs), 4) if trs else 0
+
+    return {
+        'label':        label,
+        'rsi':          rsi,
+        'rsi_state':    rsi_state,
+        'macd_signal':  macd_signal,
+        'macd_line':    round(macd_line, 4),
+        'histogram':    round(histogram, 4),
+        'bb_upper':     bb_upper,
+        'bb_lower':     bb_lower,
+        'bb_width_pct': bb_width_pct,
+        'bb_position':  bb_position,
+        'vwap':         vwap,
+        'vwap_pct':     vwap_pct,
+        'vol_ratio':    vol_ratio,
+        'vol_trend':    vol_trend,
+        'momentum_5':   momentum_5,
+        'momentum_20':  momentum_20,
+        'trend':        trend,
+        'ema9':         round(ema9, 2),
+        'ema21':        round(ema21, 2),
+        'support':      support,
+        'resistance':   resistance,
+        'atr':          atr,
+        'bars_count':   len(bars),
+    }
+
+
+def _tr_key_levels(quote: dict, bars_1m: list, bars_5m: list, bars_1d: list) -> dict:
+    """Calculate pivot points, key support/resistance, and VWAP levels."""
+    price = quote.get('price', 0)
+    if not price:
+        return {}
+
+    # Classic daily pivot (needs yesterday's H/L/C)
+    prev_h = quote.get('day_high', price * 1.01)
+    prev_l = quote.get('day_low',  price * 0.99)
+    prev_c = quote.get('prev_close', price)
+
+    pivot = round((prev_h + prev_l + prev_c) / 3, 2)
+    r1    = round(2 * pivot - prev_l, 2)
+    r2    = round(pivot + (prev_h - prev_l), 2)
+    s1    = round(2 * pivot - prev_h, 2)
+    s2    = round(pivot - (prev_h - prev_l), 2)
+
+    # 52-week high/low from quote
+    w52h  = quote.get('52w_high', 0)
+    w52l  = quote.get('52w_low',  0)
+
+    # VWAP from 1-min bars
+    vwap = 0
+    if bars_1m:
+        tp_sum  = sum((b['h'] + b['l'] + b['c']) / 3 * b['v'] for b in bars_1m)
+        vol_sum = sum(b['v'] for b in bars_1m)
+        vwap = round(tp_sum / vol_sum, 2) if vol_sum > 0 else price
+
+    # Recent swing highs / lows (from 5-min)
+    recent_high = round(max((b['h'] for b in bars_5m[-20:]), default=price), 2)
+    recent_low  = round(min((b['l'] for b in bars_5m[-20:]), default=price), 2)
+
+    # Daily 20-day high/low
+    d20h = round(max((b['h'] for b in bars_1d[-20:]), default=price), 2) if bars_1d else price
+    d20l = round(min((b['l'] for b in bars_1d[-20:]), default=price), 2) if bars_1d else price
+
+    return {
+        'pivot':        pivot,
+        'r1':           r1,
+        'r2':           r2,
+        's1':           s1,
+        's2':           s2,
+        'vwap':         vwap,
+        'recent_high':  recent_high,
+        'recent_low':   recent_low,
+        '20d_high':     d20h,
+        '20d_low':      d20l,
+        '52w_high':     w52h,
+        '52w_low':      w52l,
+    }
+
+
+def _tr_day_trading_score(
+    quote: dict, tech_1m: dict, tech_5m: dict, tech_1d: dict,
+    insider: dict, key_levels: dict
+) -> dict:
+    """
+    Day trading score 0-100 across 7 axes:
+    Momentum, Volume, RSI, MACD, Breakout, Insider, Trend Alignment.
+    """
+    price    = quote.get('price', 0)
+    rsi_1m   = tech_1m.get('rsi') or 50
+    rsi_5m   = tech_5m.get('rsi') or 50
+    macd_1m  = tech_1m.get('macd_signal', '')
+    macd_5m  = tech_5m.get('macd_signal', '')
+    vol_1m   = tech_1m.get('vol_ratio', 1)
+    vol_5m   = tech_5m.get('vol_ratio', 1)
+    trend_1m = tech_1m.get('trend', '')
+    trend_5m = tech_5m.get('trend', '')
+    trend_1d = tech_1d.get('trend', '')
+    mom_5    = tech_1m.get('momentum_5', 0)
+    vwap     = key_levels.get('vwap', 0)
+    recent_h = key_levels.get('recent_high', 0)
+
+    def clamp(v): return max(0, min(100, v))
+
+    # ── 1. Momentum (0-100) ──
+    # Strong positive momentum 0.5-3% = best for day trading
+    if   0.5 <= mom_5 <= 3.0:  mom_score = 85
+    elif 3.0 <  mom_5 <= 5.0:  mom_score = 60  # already extended
+    elif mom_5 > 5.0:          mom_score = 30  # chasing
+    elif -1.0 <= mom_5 < 0:    mom_score = 40  # mild pullback (potential entry)
+    else:                       mom_score = 20
+    mom_score = clamp(mom_score)
+
+    # ── 2. Volume (0-100) ──
+    avg_vol_ratio = (vol_1m + vol_5m) / 2
+    if avg_vol_ratio >= 3.0:   vol_score = 95
+    elif avg_vol_ratio >= 2.0: vol_score = 80
+    elif avg_vol_ratio >= 1.5: vol_score = 65
+    elif avg_vol_ratio >= 1.0: vol_score = 45
+    else:                      vol_score = 20
+    vol_score = clamp(vol_score)
+
+    # ── 3. RSI (0-100) ──
+    avg_rsi = (rsi_1m + rsi_5m) / 2
+    if 50 <= avg_rsi <= 65:    rsi_score = 90   # sweet spot — bullish, not overbought
+    elif 40 <= avg_rsi < 50:   rsi_score = 60   # neutral/recovering
+    elif 65 < avg_rsi <= 75:   rsi_score = 50   # getting hot
+    elif avg_rsi > 75:         rsi_score = 25   # overbought
+    elif avg_rsi < 40:         rsi_score = 35   # bearish
+    else:                      rsi_score = 50
+    rsi_score = clamp(rsi_score)
+
+    # ── 4. MACD (0-100) ──
+    macd_points = 0
+    if 'bullish_crossover'    in macd_1m: macd_points += 50
+    elif 'bullish_accelerating' in macd_1m: macd_points += 40
+    elif 'bullish'             in macd_1m: macd_points += 30
+    if 'bullish_crossover'    in macd_5m: macd_points += 50
+    elif 'bullish_accelerating' in macd_5m: macd_points += 40
+    elif 'bullish'             in macd_5m: macd_points += 30
+    macd_score = clamp(macd_points)
+
+    # ── 5. Breakout (0-100) ──
+    breakout_score = 50
+    if price and recent_h and price >= recent_h * 0.995:  # within 0.5% of recent high
+        breakout_score = 90
+    elif price and vwap and price > vwap:                  # above VWAP = bullish bias
+        breakout_score = 70
+    elif price and vwap and price < vwap * 0.99:           # well below VWAP
+        breakout_score = 25
+    breakout_score = clamp(breakout_score)
+
+    # ── 6. Insider (0-100) ──
+    ins_sent  = insider.get('sentiment', 'neutral')
+    ins_buys  = insider.get('recent_buys', 0)
+    if   ins_sent == 'bullish' and ins_buys >= 3: insider_score = 95
+    elif ins_sent == 'bullish':                    insider_score = 75
+    elif ins_sent == 'neutral':                    insider_score = 50
+    else:                                          insider_score = 25
+    insider_score = clamp(insider_score)
+
+    # ── 7. Trend Alignment (0-100): 1min + 5min + daily pointing same direction ──
+    up_count = sum(1 for t in [trend_1m, trend_5m, trend_1d] if 'up' in t)
+    if   up_count == 3: trend_score = 95
+    elif up_count == 2: trend_score = 70
+    elif up_count == 1: trend_score = 40
+    else:               trend_score = 15
+    trend_score = clamp(trend_score)
+
+    axes = [mom_score, vol_score, rsi_score, macd_score, breakout_score, insider_score, trend_score]
+    overall = round(sum(axes) / len(axes))
+
+    # Grade
+    if overall >= 80:   grade, grade_color = 'A', 'bull'
+    elif overall >= 65: grade, grade_color = 'B', 'bull'
+    elif overall >= 50: grade, grade_color = 'C', 'gold'
+    elif overall >= 35: grade, grade_color = 'D', 'bear'
+    else:               grade, grade_color = 'F', 'bear'
+
+    return {
+        'overall':     overall,
+        'grade':       grade,
+        'grade_color': grade_color,
+        'axes': {
+            'momentum':  round(mom_score),
+            'volume':    round(vol_score),
+            'rsi':       round(rsi_score),
+            'macd':      round(macd_score),
+            'breakout':  round(breakout_score),
+            'insider':   round(insider_score),
+            'trend':     round(trend_score),
+        },
+        'labels': ['Momentum', 'Volume', 'RSI', 'MACD', 'Breakout', 'Insider', 'Trend'],
+    }
+
+
+def _tr_insider_activity(ticker: str) -> dict:
+    """Check Supabase for recent insider filings on this ticker."""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=60)).strftime('%Y-%m-%d')
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/filings',
+            headers={'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'},
+            params={
+                'ticker': f'eq.{ticker}',
+                'transaction_date': f'gte.{cutoff}',
+                'order': 'transaction_date.desc',
+                'limit': '10',
+            },
+            timeout=6,
+        )
+        if r.status_code == 200:
+            filings = r.json()
+            buys  = [f for f in filings if (f.get('transaction_type') or '').upper() == 'BUY']
+            sells = [f for f in filings if (f.get('transaction_type') or '').upper() in ('SELL', 'SALE')]
+            total_buy_val  = sum(f.get('total_value', 0) or 0 for f in buys)
+            total_sell_val = sum(f.get('total_value', 0) or 0 for f in sells)
+            return {
+                'recent_filings': len(filings),
+                'recent_buys':    len(buys),
+                'recent_sells':   len(sells),
+                'total_buy_value': total_buy_val,
+                'total_sell_value': total_sell_val,
+                'sentiment': 'bullish' if len(buys) > len(sells) else
+                             'bearish' if len(sells) > len(buys) else 'neutral',
+                'latest': filings[0] if filings else None,
+            }
+    except Exception as e:
+        logger.warning(f'_tr_insider_activity {ticker}: {e}')
+    return {'recent_filings': 0, 'recent_buys': 0, 'recent_sells': 0, 'sentiment': 'neutral'}
+
+
+def _tr_news_sentiment(ticker: str) -> dict:
+    """Fetch recent news headlines for sentiment (Yahoo Finance RSS)."""
+    try:
+        r = requests.get(
+            f'https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US',
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; WhaleTracker/1.0)'},
+            timeout=6,
+        )
+        if r.status_code == 200:
+            import xml.etree.ElementTree as _ET
+            root = _ET.fromstring(r.text)
+            items = root.findall('.//item')[:5]
+            headlines = []
+            for item in items:
+                title = item.findtext('title') or ''
+                pub   = item.findtext('pubDate') or ''
+                headlines.append({'title': title, 'date': pub})
+            return {'headlines': headlines, 'count': len(headlines)}
+    except Exception as e:
+        logger.warning(f'_tr_news_sentiment {ticker}: {e}')
+    return {'headlines': [], 'count': 0}
+
+
+def _tr_deep_ai_plan(
+    ticker: str, quote: dict,
+    tech_1m: dict, tech_5m: dict, tech_1d: dict,
+    key_levels: dict, day_score: dict,
+    insider: dict, news: dict
+) -> dict:
+    """Call Claude Sonnet for a comprehensive day trading + swing plan."""
+    price      = quote.get('price', 0)
+    change_pct = quote.get('change_pct', 0)
+    vol        = quote.get('volume', 0)
+    avg_vol    = quote.get('avg_volume', 1) or 1
+    rel_vol    = round(vol / avg_vol, 1) if avg_vol else 1
+
+    headlines = '\n'.join(f'- {h["title"]}' for h in news.get('headlines', [])[:3])
+    ins_sent  = insider.get('sentiment', 'neutral')
+    ins_buys  = insider.get('recent_buys', 0)
+    ins_sells = insider.get('recent_sells', 0)
+
+    overall_score = day_score.get('overall', 50)
+    axes          = day_score.get('axes', {})
+
+    atr_1m   = tech_1m.get('atr', 0)
+    atr_5m   = tech_5m.get('atr', 0)
+    atr_use  = atr_5m or atr_1m or (price * 0.005)
+
+    prompt = f"""You are a professional day trader and market analyst. Generate a comprehensive trading plan for {ticker}.
+
+═══════════════ PRICE DATA ═══════════════
+Price: ${price}  |  Day Change: {change_pct:+.1f}%  |  Relative Volume: {rel_vol}x
+
+═══════════════ MULTI-TIMEFRAME TECHNICALS ═══════════════
+1-MIN (scalp):
+  RSI={tech_1m.get('rsi', 'N/A')} ({tech_1m.get('rsi_state','')}) | MACD={tech_1m.get('macd_signal','')} | Trend={tech_1m.get('trend','')}
+  VWAP=${tech_1m.get('vwap',0)} (price {tech_1m.get('vwap_pct',0):+.1f}% vs VWAP) | Vol ratio={tech_1m.get('vol_ratio',1)}x
+  BB: {tech_1m.get('bb_position','')} | ATR=${atr_1m:.3f}
+
+5-MIN (intraday):
+  RSI={tech_5m.get('rsi', 'N/A')} ({tech_5m.get('rsi_state','')}) | MACD={tech_5m.get('macd_signal','')} | Trend={tech_5m.get('trend','')}
+  Momentum 5-bar={tech_5m.get('momentum_5',0):+.1f}% | EMA9=${tech_5m.get('ema9',0)} EMA21=${tech_5m.get('ema21',0)}
+  BB: upper=${tech_5m.get('bb_upper',0)} / lower=${tech_5m.get('bb_lower',0)} ({tech_5m.get('bb_position','')}), width={tech_5m.get('bb_width_pct',0):.1f}%
+
+DAILY (swing context):
+  RSI={tech_1d.get('rsi', 'N/A')} | Trend={tech_1d.get('trend','')} | Momentum 20-bar={tech_1d.get('momentum_20',0):+.1f}%
+  EMA9=${tech_1d.get('ema9',0)} | Support=${tech_1d.get('support',0)} | Resistance=${tech_1d.get('resistance',0)}
+
+═══════════════ KEY LEVELS ═══════════════
+VWAP: ${key_levels.get('vwap',0)}
+Pivot: ${key_levels.get('pivot',0)} | R1: ${key_levels.get('r1',0)} | R2: ${key_levels.get('r2',0)}
+S1: ${key_levels.get('s1',0)} | S2: ${key_levels.get('s2',0)}
+Recent Swing High: ${key_levels.get('recent_high',0)} | Recent Swing Low: ${key_levels.get('recent_low',0)}
+20-Day High: ${key_levels.get('20d_high',0)} | 52W High: ${key_levels.get('52w_high',0)}
+
+═══════════════ DAY TRADING SCORE: {overall_score}/100 ═══════════════
+Momentum={axes.get('momentum',0)} | Volume={axes.get('volume',0)} | RSI={axes.get('rsi',0)} | MACD={axes.get('macd',0)}
+Breakout={axes.get('breakout',0)} | Insider={axes.get('insider',0)} | Trend={axes.get('trend',0)}
+
+═══════════════ INSIDER ACTIVITY (60d) ═══════════════
+Sentiment: {ins_sent} | Buys: {ins_buys} | Sells: {ins_sells}
+
+═══════════════ RECENT NEWS ═══════════════
+{headlines if headlines else "No recent headlines"}
+
+Respond ONLY with this exact JSON (no markdown, no explanation outside the JSON):
+{{
+  "day_signal":     "BUY" | "SELL" | "HOLD",
+  "swing_signal":   "BUY" | "SELL" | "HOLD",
+  "confidence":     <0.0-1.0>,
+  "intraday_bias":  "strongly_bullish" | "bullish" | "neutral" | "bearish" | "strongly_bearish",
+  "entry_zone":     {{"low": <price>, "high": <price>, "note": "<1 sentence on when/how to enter>"}},
+  "stop_loss":      <price>,
+  "stop_note":      "<where stop is placed and why>",
+  "target_1":       <price>,
+  "target_2":       <price>,
+  "target_3":       <price>,
+  "risk_reward":    <ratio as float, e.g. 2.5>,
+  "position_size":  "<e.g. 1-2% risk per trade>",
+  "hold_type":      "scalp" | "intraday" | "swing" | "position",
+  "analysis":       "<3-4 sentence deep analysis covering all timeframes>",
+  "day_trade_plan": "<step-by-step intraday trading plan: entry trigger, scale-in, exit rules>",
+  "swing_plan":     "<swing trade setup if applicable, or why it's not a swing trade now>",
+  "key_risk":       "<most important risk to watch>",
+  "catalyst":       "<what specific event/pattern would trigger the move>",
+  "avoid_if":       "<conditions that would invalidate this setup>"
+}}"""
+
+    if ANTHROPIC_KEY:
+        try:
+            r = requests.post(
+                'https://api.anthropic.com/v1/messages',
+                headers={
+                    'x-api-key': ANTHROPIC_KEY,
+                    'anthropic-version': '2023-06-01',
+                    'content-type': 'application/json',
+                },
+                json={
+                    'model': 'claude-haiku-4-5-20251001',
+                    'max_tokens': 1024,
+                    'messages': [{'role': 'user', 'content': prompt}],
+                },
+                timeout=25,
+            )
+            if r.status_code == 200:
+                content = r.json()['content'][0]['text'].strip()
+                start = content.find('{')
+                end   = content.rfind('}') + 1
+                if start >= 0 and end > start:
+                    plan = json.loads(content[start:end])
+                    plan['ai_powered'] = True
+                    return plan
+        except Exception as e:
+            logger.warning(f'_tr_deep_ai_plan {ticker}: {e}')
+
+    return _tr_fallback_plan(ticker, quote, tech_5m, day_score, insider, atr_use)
+
+
+def _tr_fallback_plan(
+    ticker: str, quote: dict, tech_5m: dict,
+    day_score: dict, insider: dict, atr: float
+) -> dict:
+    """Rules-based fallback when Claude is unavailable."""
+    price    = quote.get('price', 0) or 1
+    overall  = day_score.get('overall', 50)
+    ins_sent = insider.get('sentiment', 'neutral')
+
+    if overall >= 70 or (overall >= 55 and ins_sent == 'bullish'):
+        day_sig, swing_sig, conf, bias = 'BUY', 'BUY', 0.65, 'bullish'
+        analysis = 'Technical indicators align bullishly across timeframes with volume confirmation.'
+    elif overall <= 35:
+        day_sig, swing_sig, conf, bias = 'SELL', 'SELL', 0.60, 'bearish'
+        analysis = 'Bearish technicals with weakening momentum suggest downside risk.'
+    else:
+        day_sig, swing_sig, conf, bias = 'HOLD', 'HOLD', 0.50, 'neutral'
+        analysis = 'Mixed signals — wait for a clear directional catalyst before entering.'
+
+    stop_dist = max(atr * 1.5, price * 0.015)
+    tgt1_dist = stop_dist * 2
+    tgt2_dist = stop_dist * 3
+    tgt3_dist = stop_dist * 4
+
+    return {
+        'day_signal':    day_sig,
+        'swing_signal':  swing_sig,
+        'confidence':    conf,
+        'intraday_bias': bias,
+        'entry_zone':    {'low': round(price, 2), 'high': round(price * 1.002, 2),
+                          'note': 'Enter at market or on pullback to VWAP.'},
+        'stop_loss':     round(price - stop_dist, 2),
+        'stop_note':     'Below recent swing low / ATR-based stop.',
+        'target_1':      round(price + tgt1_dist, 2),
+        'target_2':      round(price + tgt2_dist, 2),
+        'target_3':      round(price + tgt3_dist, 2),
+        'risk_reward':   round(tgt2_dist / stop_dist, 1) if stop_dist > 0 else 2.0,
+        'position_size': '1-2% account risk per trade',
+        'hold_type':     'intraday',
+        'analysis':      analysis,
+        'day_trade_plan': 'Wait for volume confirmation on the break. Enter in thirds: 33% at trigger, 33% on first pullback, 33% on second test. Exit at Target 1 for 50%, trail stop on remainder.',
+        'swing_plan':    'Not enough conviction for multi-day hold. Day trade only.',
+        'key_risk':      'Broad market reversal or negative news catalyst.',
+        'catalyst':      'Volume breakout above resistance with MACD crossover.',
+        'avoid_if':      'Price closes below VWAP or RSI drops below 40.',
+        'ai_powered':    False,
+    }
+
+
+# ─── WHAL-120: Supabase-backed routes (additive) ─────────────────
+
+def _sb_read(table: str, ticker: str | None, order_col: str, limit: int = 100) -> list:
+    """Read rows from a Supabase table with optional ticker filter. Returns [] on error."""
+    try:
+        params = {'order': f'{order_col}.desc', 'limit': str(limit)}
+        if ticker:
+            params['ticker'] = f'eq.{ticker.upper()}'
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/{table}',
+            headers=SUPABASE_HEADERS,
+            params=params,
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json() if isinstance(r.json(), list) else []
+        logger.warning(f'_sb_read {table}: HTTP {r.status_code}')
+        return []
+    except Exception as e:
+        logger.warning(f'_sb_read {table} error: {e}')
+        return []
+
+
+@app.route('/api/insider-trades')
+def api_insider_trades():
+    """WHAL-120: Read insider_trades from Supabase. ?ticker=AAPL to filter."""
+    ticker = request.args.get('ticker', '').strip() or None
+    limit  = request.args.get('limit', 100, type=int)
+    cache_key = f'api:insider_trades:{ticker or "all"}:{limit}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    rows = _sb_read('insider_trades', ticker, 'scraped_at', limit)
+    # Fallback: scrape SEC EDGAR live if Supabase empty
+    if not rows:
+        try:
+            raw = list(_filings_cache)
+            if ticker:
+                raw = [f for f in raw if f.get('ticker', '').upper() == ticker.upper()]
+            rows = [{
+                'ticker':           f.get('ticker', ''),
+                'owner_name':       f.get('owner_name', f.get('insider_name', '')),
+                'owner_type':       f.get('owner_type', ''),
+                'transaction_type': f.get('transaction_type', ''),
+                'shares':           f.get('shares', 0),
+                'price':            f.get('price', 0),
+                'value':            f.get('value', 0),
+                'filing_date':      f.get('filing_date', f.get('filed_at', '')),
+            } for f in raw[:limit]]
+        except Exception as e:
+            logger.warning(f'insider-trades fallback error: {e}')
+
+    redis_set(cache_key, rows, ttl_seconds=1800)
+    return jsonify(rows)
+
+
+@app.route('/api/intraday/equity-curve')
+def intraday_equity_curve():
+    """WHAL-169: Cumulative P&L equity curve from all closed intraday trades.
+
+    Returns per-trade series + aggregated stats:
+      total_pnl, win_rate, max_drawdown, sharpe, trade_count
+    """
+    try:
+        import math as _math
+        cache_key = 'api:equity_curve'
+        cached = redis_get(cache_key)
+        if cached:
+            return jsonify(cached)
+
+        # Pull all closed trades sorted by entry_time
+        url = (f'{SUPABASE_URL}/rest/v1/intraday_trades'
+               f'?status=eq.closed'
+               f'&select=id,entry_time,ticker,side,pnl,pnl_pct,entry_price,qty'
+               f'&order=entry_time.asc'
+               f'&limit=1000')
+        resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=15)
+        rows = resp.json() if resp.status_code == 200 else []
+
+        if not rows:
+            return jsonify({'points': [], 'stats': {}, 'total': 0})
+
+        # ── Build cumulative equity curve ──────────────────────────
+        cumulative = 0.0
+        peak       = 0.0
+        max_dd     = 0.0
+        returns    = []
+        points     = []
+
+        for i, r in enumerate(rows):
+            pnl = float(r.get('pnl') or 0)
+            cumulative += pnl
+            returns.append(pnl)
+
+            # Max drawdown: largest drop from peak
+            if cumulative > peak:
+                peak = cumulative
+            dd = peak - cumulative
+            if dd > max_dd:
+                max_dd = dd
+
+            points.append({
+                'n':          i + 1,                          # trade number
+                'ticker':     r.get('ticker', ''),
+                'side':       r.get('side', ''),
+                'pnl':        round(pnl, 2),
+                'cumulative': round(cumulative, 2),
+                'entry_time': (r.get('entry_time') or '')[:10],
+            })
+
+        # ── Stats ──────────────────────────────────────────────────
+        wins     = sum(1 for r in returns if r > 0)
+        losses   = sum(1 for r in returns if r < 0)
+        total    = len(returns)
+        win_rate = round(wins / total * 100, 1) if total else 0
+
+        # Simplified Sharpe: mean_return / std_return
+        if len(returns) >= 2:
+            mean_r = sum(returns) / len(returns)
+            variance = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+            std_r = _math.sqrt(variance) if variance > 0 else 0
+            sharpe = round(mean_r / std_r, 2) if std_r > 0 else 0
+        else:
+            sharpe = 0
+
+        # Average win / average loss
+        avg_win  = (sum(r for r in returns if r > 0) / wins) if wins else 0
+        avg_loss = (sum(r for r in returns if r < 0) / losses) if losses else 0
+        profit_factor = abs(avg_win * wins / (avg_loss * losses)) if losses and avg_loss else 0
+
+        stats = {
+            'total_pnl':      round(cumulative, 2),
+            'win_rate':       win_rate,
+            'wins':           wins,
+            'losses':         losses,
+            'trade_count':    total,
+            'max_drawdown':   round(max_dd, 2),
+            'sharpe':         sharpe,
+            'avg_win':        round(avg_win, 2),
+            'avg_loss':       round(avg_loss, 2),
+            'profit_factor':  round(profit_factor, 2),
+            'best_trade':     round(max(returns), 2) if returns else 0,
+            'worst_trade':    round(min(returns), 2) if returns else 0,
+        }
+
+        result = {'points': points, 'stats': stats, 'total': total}
+        redis_set(cache_key, result, ttl_seconds=300)
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f'equity-curve error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/insider/heatmap')
+def api_insider_heatmap():
+    """WHAL-175: Aggregate insider trades by ticker × date returning dollar value matrix.
+
+    Query params:
+      days      : int   — lookback window (default 30)
+      min_value : float — minimum transaction dollar value to include (default 50000)
+      top_n     : int   — number of tickers to return (default 20)
+
+    Returns:
+      {
+        tickers:   ["AAPL", ...],          // top N tickers sorted by total activity
+        dates:     ["2026-04-01", ...],    // sorted date list (oldest → newest)
+        matrix: {
+          "AAPL": {
+            "2026-04-01": {"buy": 500000, "sell": 200000, "net": 300000}
+          }
+        },
+        max_value: 5000000                 // largest absolute net value for scaling
+      }
+    """
+    days      = request.args.get('days',      30,     type=int)
+    min_value = request.args.get('min_value', 50000,  type=float)
+    top_n     = request.args.get('top_n',     20,     type=int)
+
+    cache_key = f'api:insider_heatmap:{days}:{int(min_value)}:{top_n}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        from datetime import date, timedelta as td
+        cutoff = (date.today() - td(days=days)).isoformat()
+
+        # ── Pull from Supabase filings table ──────────────────────────
+        url = (f'{SUPABASE_URL}/rest/v1/filings'
+               f'?transaction_date=gte.{cutoff}'
+               f'&select=ticker,transaction_type,value,transaction_date,shares,price'
+               f'&order=transaction_date.desc'
+               f'&limit=5000')
+        resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=15)
+        rows = resp.json() if resp.status_code == 200 else []
+
+        # Fallback to in-memory cache if Supabase empty
+        if not rows:
+            rows = [
+                {
+                    'ticker':           f.get('ticker', ''),
+                    'transaction_type': f.get('transaction_type', ''),
+                    'value':            f.get('value', 0),
+                    'transaction_date': (f.get('transaction_date') or
+                                         f.get('filed_at', '')[:10]),
+                    'shares':           f.get('shares', 0),
+                    'price':            f.get('price', 0),
+                }
+                for f in list(_filings_cache)
+            ]
+
+        # ── Aggregate by ticker × date ─────────────────────────────────
+        from collections import defaultdict
+        cell: dict = defaultdict(lambda: {'buy': 0.0, 'sell': 0.0})
+        ticker_totals: dict = defaultdict(float)
+
+        BUY_TYPES  = {'buy', 'p', 'purchase', 'a'}
+        SELL_TYPES = {'sell', 's', 'sale', 'd', 'f'}
+
+        for row in rows:
+            ticker  = (row.get('ticker') or '').upper().strip()
+            tx_type = (row.get('transaction_type') or '').lower().strip()
+            value   = float(row.get('value') or 0)
+            tx_date = (row.get('transaction_date') or '')[:10]
+
+            if not ticker or not tx_date or value < min_value:
+                continue
+            if tx_type in BUY_TYPES:
+                cell[(ticker, tx_date)]['buy'] += value
+                ticker_totals[ticker] += value
+            elif tx_type in SELL_TYPES:
+                cell[(ticker, tx_date)]['sell'] += value
+                ticker_totals[ticker] += value
+
+        # ── Top N tickers by total activity ───────────────────────────
+        top_tickers = [t for t, _ in sorted(
+            ticker_totals.items(), key=lambda x: x[1], reverse=True
+        )[:top_n]]
+
+        # ── Build date spine (last `days` calendar days) ──────────────
+        today  = date.today()
+        dates  = [(today - td(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+
+        # ── Build matrix ──────────────────────────────────────────────
+        matrix = {}
+        max_value = 0.0
+        for ticker in top_tickers:
+            matrix[ticker] = {}
+            for d_str in dates:
+                c = cell.get((ticker, d_str), {'buy': 0.0, 'sell': 0.0})
+                net = c['buy'] - c['sell']
+                matrix[ticker][d_str] = {
+                    'buy':  round(c['buy'],  2),
+                    'sell': round(c['sell'], 2),
+                    'net':  round(net,       2),
+                }
+                if abs(net) > max_value:
+                    max_value = abs(net)
+
+        result = {
+            'tickers':   top_tickers,
+            'dates':     dates,
+            'matrix':    matrix,
+            'max_value': round(max_value, 2),
+            'days':      days,
+            'total_rows': len(rows),
+        }
+        redis_set(cache_key, result, ttl_seconds=3600)
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f'insider/heatmap error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/dark-pool')
+def api_dark_pool():
+    """WHAL-120: Read dark_pool_prints from Supabase. ?ticker=NVDA to filter."""
+    ticker = request.args.get('ticker', '').strip() or None
+    limit  = request.args.get('limit', 100, type=int)
+    cache_key = f'api:dark_pool:{ticker or "all"}:{limit}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    rows = _sb_read('dark_pool_prints', ticker, 'scraped_at', limit)
+
+    # Fallback mock if table not yet populated
+    if not rows:
+        rows = [
+            {'ticker': 'NVDA', 'price': 875.50, 'size': 85000, 'value': 74417500, 'execution_time': '2026-04-21T14:32:00+00:00'},
+            {'ticker': 'AAPL', 'price': 193.20, 'size': 120000, 'value': 23184000, 'execution_time': '2026-04-21T13:55:00+00:00'},
+            {'ticker': 'MSFT', 'price': 415.80, 'size': 45000, 'value': 18711000, 'execution_time': '2026-04-21T13:12:00+00:00'},
+            {'ticker': 'TSLA', 'price': 247.30, 'size': 55000, 'value': 13601500, 'execution_time': '2026-04-21T12:44:00+00:00'},
+            {'ticker': 'META', 'price': 527.90, 'size': 22000, 'value': 11613800, 'execution_time': '2026-04-21T11:30:00+00:00'},
+            {'ticker': 'AMZN', 'price': 186.50, 'size': 58000, 'value': 10817000, 'execution_time': '2026-04-21T11:15:00+00:00'},
+            {'ticker': 'SPY',  'price': 498.20, 'size': 18000, 'value': 8967600, 'execution_time': '2026-04-21T10:50:00+00:00'},
+            {'ticker': 'AMD',  'price': 155.40, 'size': 48000, 'value': 7459200, 'execution_time': '2026-04-21T10:22:00+00:00'},
+        ]
+        if ticker:
+            rows = [r for r in rows if r['ticker'] == ticker.upper()]
+
+    redis_set(cache_key, rows, ttl_seconds=1800)
+    return jsonify(rows)
+
+
+@app.route('/api/options-flow')
+def api_options_flow_new():
+    """WHAL-120: Read options_flow (new table) from Supabase. ?ticker=TSLA to filter."""
+    ticker = request.args.get('ticker', '').strip() or None
+    limit  = request.args.get('limit', 100, type=int)
+    cache_key = f'api:options_flow_new:{ticker or "all"}:{limit}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    rows = _sb_read('options_flow', ticker, 'scraped_at', limit)
+
+    # Normalize field names for Flutter compatibility
+    normalized = [{
+        'ticker':        r.get('ticker'),
+        'type':          r.get('call_put'),
+        'strike':        r.get('strike'),
+        'expiry':        r.get('expiry'),
+        'volume':        r.get('volume'),
+        'openInterest':  r.get('open_interest'),
+        'premium':       r.get('premium'),
+        'sentiment':     r.get('sentiment'),
+        'unusual':       (r.get('volume') or 0) > 1000 and (r.get('premium') or 0) > 500_000,
+    } for r in rows] if rows else []
+
+    redis_set(cache_key, normalized, ttl_seconds=1800)
+    return jsonify(normalized)
+
+
+@app.route('/api/congressional')
+def api_congressional():
+    """WHAL-120: Read congressional_trades from Supabase. ?ticker=AAPL to filter."""
+    ticker = request.args.get('ticker', '').strip() or None
+    limit  = request.args.get('limit', 100, type=int)
+    cache_key = f'api:congressional:{ticker or "all"}:{limit}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    rows = _sb_read('congressional_trades', ticker, 'scraped_at', limit)
+
+    # Fallback: re-use congress_trades table if new table empty
+    if not rows:
+        try:
+            cutoff = (datetime.utcnow() - timedelta(days=90)).strftime('%Y-%m-%d')
+            params = {'date': f'gte.{cutoff}', 'order': 'date.desc', 'limit': str(limit)}
+            if ticker:
+                params['ticker'] = f'eq.{ticker.upper()}'
+            r = requests.get(
+                f'{SUPABASE_URL}/rest/v1/congress_trades',
+                headers=SUPABASE_HEADERS, params=params, timeout=10,
+            )
+            if r.status_code == 200 and isinstance(r.json(), list):
+                raw = r.json()
+                rows = [{
+                    'politician':       row.get('member'),
+                    'ticker':           row.get('ticker'),
+                    'transaction_type': row.get('type'),
+                    'amount_range':     row.get('amount'),
+                    'trade_date':       row.get('date'),
+                    'disclosure_date':  row.get('date'),
+                } for row in raw]
+        except Exception as e:
+            logger.warning(f'congressional fallback error: {e}')
+
+    redis_set(cache_key, rows, ttl_seconds=3600)
+    return jsonify(rows)
+
+
+@app.route('/api/ticker-fundamentals')
+def api_ticker_fundamentals():
+    """WHAL-120: Read ticker_fundamentals from Supabase. ?ticker=NVDA to filter."""
+    ticker = request.args.get('ticker', '').strip() or None
+    cache_key = f'api:fundamentals:{ticker or "all"}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    rows = _sb_read('ticker_fundamentals', ticker, 'updated_at', 50)
+    redis_set(cache_key, rows, ttl_seconds=3600)
+    return jsonify(rows)
+
+
+# ─── WHAL-79: Live Trading Engine routes ─────────────────────────
+
+@app.route('/api/trading/live/connect', methods=['POST'])
+def live_trading_connect():
+    """POST {user_id, api_key, api_secret, max_allocation?, live_mode?} — save encrypted Alpaca keys."""
+    try:
+        from live_trader import connect_live_account
+        body = request.get_json(force=True) or {}
+        user_id  = (body.get('user_id') or '').strip()
+        api_key  = (body.get('api_key') or '').strip()
+        api_sec  = (body.get('api_secret') or '').strip()
+        max_alloc = float(body.get('max_allocation') or 5000)
+        live_mode = bool(body.get('live_mode', False))
+        if not user_id or not api_key or not api_sec:
+            return jsonify({'error': 'user_id, api_key, api_secret required'}), 400
+        result = connect_live_account(user_id, api_key, api_sec, max_alloc, live_mode)
+        return jsonify(result), (200 if result.get('ok') else 400)
+    except Exception as e:
+        logger.error(f'live/connect error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/live/disconnect', methods=['DELETE'])
+def live_trading_disconnect():
+    """DELETE — remove user's live trading credentials."""
+    try:
+        from live_trader import disconnect_live_account
+        user_id = request.args.get('user_id', '').strip()
+        if not user_id:
+            return jsonify({'error': 'user_id required'}), 400
+        result = disconnect_live_account(user_id)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/live/portfolio')
+def live_trading_portfolio():
+    """GET ?user_id=<id> — current portfolio from user's Alpaca account."""
+    try:
+        from live_trader import get_live_portfolio
+        user_id = request.args.get('user_id', '').strip()
+        if not user_id:
+            return jsonify({'error': 'user_id required'}), 400
+        result = get_live_portfolio(user_id)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/live/trades')
+def live_trading_trades():
+    """GET ?user_id=<id>&limit=50 — trade history from Supabase."""
+    try:
+        from live_trader import get_live_trades
+        user_id = request.args.get('user_id', '').strip()
+        limit   = request.args.get('limit', 50, type=int)
+        if not user_id:
+            return jsonify({'error': 'user_id required'}), 400
+        return jsonify(get_live_trades(user_id, limit))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/live/pause', methods=['POST'])
+def live_trading_pause():
+    """POST {user_id} — pause bot for this user."""
+    try:
+        from live_trader import pause_live_trading
+        body = request.get_json(force=True) or {}
+        user_id = (body.get('user_id') or request.args.get('user_id', '')).strip()
+        if not user_id:
+            return jsonify({'error': 'user_id required'}), 400
+        return jsonify(pause_live_trading(user_id))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trading/live/resume', methods=['POST'])
+def live_trading_resume():
+    """POST {user_id} — resume bot for this user."""
+    try:
+        from live_trader import resume_live_trading
+        body = request.get_json(force=True) or {}
+        user_id = (body.get('user_id') or request.args.get('user_id', '')).strip()
+        if not user_id:
+            return jsonify({'error': 'user_id required'}), 400
+        return jsonify(resume_live_trading(user_id))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── WHAL-123-127: Day Trade Scoring Engine ──────────────────────
+
+def _dts_alpaca_bars(ticker: str, timeframe: str = '1Min', limit: int = 50) -> list:
+    """Fetch Alpaca IEX bars for day trade calculations. Returns list of {c, h, l, o, v}."""
+    try:
+        hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+        r = requests.get(
+            f'https://data.alpaca.markets/v2/stocks/{ticker}/bars',
+            headers=hdrs,
+            params={'timeframe': timeframe, 'limit': limit, 'feed': 'iex', 'sort': 'asc'},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            return r.json().get('bars', [])
+    except Exception as e:
+        logger.debug(f'_dts_alpaca_bars {ticker}: {e}')
+    return []
+
+
+def _dts_alpaca_snapshot(ticker: str) -> dict:
+    """Get latest snapshot from Alpaca."""
+    try:
+        hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+        r = requests.get(
+            f'https://data.alpaca.markets/v2/stocks/{ticker}/snapshot',
+            headers=hdrs, params={'feed': 'iex'}, timeout=8,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logger.debug(f'_dts_snapshot {ticker}: {e}')
+    return {}
+
+
+# WHAL-124: RSI + MACD
+def calc_rsi_score(ticker: str) -> dict:
+    """RSI-14 from 50 1-min bars. Returns {score, rsi, signal}."""
+    bars = _dts_alpaca_bars(ticker, '1Min', 50)
+    if len(bars) < 15:
+        return {'score': 50, 'rsi': 50.0, 'signal': 'neutral'}
+    closes = [float(b['c']) for b in bars]
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    period = 14
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        rsi = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi = round(100 - 100 / (1 + rs), 1)
+    if rsi < 30:   score, sig = 85, 'oversold'
+    elif rsi < 45: score, sig = 70, 'leaning_oversold'
+    elif rsi < 55: score, sig = 50, 'neutral'
+    elif rsi < 65: score, sig = 65, 'leaning_overbought'
+    elif rsi < 70: score, sig = 40, 'overbought'
+    else:          score, sig = 20, 'overbought_extreme'
+    return {'score': score, 'rsi': rsi, 'signal': sig}
+
+
+def calc_macd_score(ticker: str) -> dict:
+    """MACD 12/26/9 from 5-min bars. Returns {score, macd, signal_line, histogram, signal}."""
+    bars = _dts_alpaca_bars(ticker, '5Min', 60)
+    if len(bars) < 30:
+        return {'score': 50, 'macd': 0.0, 'signal_line': 0.0, 'histogram': 0.0, 'signal': 'neutral'}
+    closes = [float(b['c']) for b in bars]
+
+    def ema(data, period):
+        k = 2 / (period + 1)
+        e = data[0]
+        for v in data[1:]:
+            e = v * k + e * (1 - k)
+        return e
+
+    def ema_series(data, period):
+        k = 2 / (period + 1)
+        result = [data[0]]
+        for v in data[1:]:
+            result.append(v * k + result[-1] * (1 - k))
+        return result
+
+    ema12 = ema_series(closes, 12)
+    ema26 = ema_series(closes, 26)
+    macd_line = [e12 - e26 for e12, e26 in zip(ema12, ema26)]
+    signal_line = ema_series(macd_line, 9)
+    histogram = [m - s for m, s in zip(macd_line, signal_line)]
+
+    h = histogram[-1]
+    h_prev = histogram[-2] if len(histogram) > 1 else 0
+    m = macd_line[-1]
+    s = signal_line[-1]
+
+    # Crossover detection
+    crossed_up = macd_line[-2] < signal_line[-2] and m > s
+    crossed_down = macd_line[-2] > signal_line[-2] and m < s
+
+    if crossed_up:         score, sig = 85, 'bullish_crossover'
+    elif h > 0 and h > h_prev: score, sig = 75, 'bullish_widening'
+    elif h > 0:            score, sig = 60, 'bullish'
+    elif crossed_down:     score, sig = 20, 'bearish_crossover'
+    elif h < 0 and h < h_prev: score, sig = 25, 'bearish_widening'
+    elif h < 0:            score, sig = 40, 'bearish'
+    else:                  score, sig = 50, 'neutral'
+
+    return {'score': score, 'macd': round(m, 4), 'signal_line': round(s, 4),
+            'histogram': round(h, 4), 'signal': sig}
+
+
+# WHAL-125: VWAP + Relative Volume
+def calc_vwap_score(ticker: str) -> dict:
+    """VWAP from intraday bars since 9:30 ET. Returns {score, vwap, price, signal}."""
+    from datetime import datetime as _dt
+    import pytz
+    et = pytz.timezone('US/Eastern')
+    market_open = _dt.now(et).replace(hour=9, minute=30, second=0, microsecond=0)
+    bars = _dts_alpaca_bars(ticker, '1Min', 390)  # full day
+
+    # Filter to today's bars after open
+    today_bars = []
+    for b in bars:
+        try:
+            ts = b.get('t', '')
+            bar_dt = _dt.fromisoformat(ts.replace('Z', '+00:00')).astimezone(et)
+            if bar_dt >= market_open:
+                today_bars.append(b)
+        except Exception:
+            pass
+
+    if len(today_bars) < 3:
+        return {'score': 50, 'vwap': 0.0, 'price': 0.0, 'signal': 'no_data'}
+
+    cum_pv = 0.0
+    cum_v  = 0.0
+    for b in today_bars:
+        typ_price = (float(b['h']) + float(b['l']) + float(b['c'])) / 3
+        vol = float(b['v'])
+        cum_pv += typ_price * vol
+        cum_v  += vol
+
+    vwap = round(cum_pv / cum_v, 2) if cum_v > 0 else 0
+    price = float(today_bars[-1]['c'])
+    pct_diff = (price - vwap) / vwap if vwap > 0 else 0
+
+    if pct_diff > 0.005:   score, sig = 80, 'above_vwap_strong'
+    elif pct_diff > 0:     score, sig = 65, 'above_vwap'
+    elif pct_diff > -0.005: score, sig = 35, 'below_vwap'
+    else:                  score, sig = 20, 'below_vwap_strong'
+
+    return {'score': score, 'vwap': vwap, 'price': price, 'pct_diff': round(pct_diff*100, 2), 'signal': sig}
+
+
+def calc_relvol_score(ticker: str) -> dict:
+    """Relative volume: today's vol vs 20-day avg at same time. Returns {score, rel_vol, signal}."""
+    snapshot = _dts_alpaca_snapshot(ticker)
+    today_vol = int((snapshot.get('dailyBar') or {}).get('v', 0))
+    prev_vols = []
+    try:
+        hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+        r = requests.get(
+            f'https://data.alpaca.markets/v2/stocks/{ticker}/bars',
+            headers=hdrs,
+            params={'timeframe': '1Day', 'limit': 20, 'feed': 'iex', 'sort': 'desc'},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            prev_vols = [float(b['v']) for b in r.json().get('bars', [])[1:21]]
+    except Exception:
+        pass
+
+    if not prev_vols or today_vol == 0:
+        return {'score': 50, 'rel_vol': 1.0, 'signal': 'no_data'}
+
+    avg_vol = sum(prev_vols) / len(prev_vols)
+    rel = round(today_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+    if rel > 2.0:   score, sig = 90, 'extreme_volume'
+    elif rel > 1.5: score, sig = 75, 'high_volume'
+    elif rel > 1.0: score, sig = 60, 'above_average'
+    elif rel > 0.8: score, sig = 45, 'normal'
+    else:           score, sig = 25, 'low_volume'
+
+    return {'score': score, 'rel_vol': rel, 'today_vol': today_vol, 'avg_vol': int(avg_vol), 'signal': sig}
+
+
+# WHAL-126: Gap + Fade
+def calc_gap_score(ticker: str) -> dict:
+    """Premarket gap vs prev close. Returns {score, gap_pct, gap_direction, open, prev_close}."""
+    snapshot = _dts_alpaca_snapshot(ticker)
+    prev_close = float((snapshot.get('prevDailyBar') or {}).get('c', 0))
+    open_price = float((snapshot.get('dailyBar') or {}).get('o', 0))
+
+    if prev_close == 0 or open_price == 0:
+        return {'score': 50, 'gap_pct': 0.0, 'gap_direction': 'FLAT', 'open': 0, 'prev_close': 0}
+
+    gap_pct = round((open_price - prev_close) / prev_close * 100, 2)
+
+    if gap_pct > 5:       score, direction = 85, 'UP'
+    elif gap_pct > 3:     score, direction = 75, 'UP'
+    elif gap_pct > 1:     score, direction = 60, 'UP'
+    elif gap_pct > -1:    score, direction = 50, 'FLAT'
+    elif gap_pct > -3:    score, direction = 40, 'DOWN'
+    else:                 score, direction = 25, 'DOWN'
+
+    return {'score': score, 'gap_pct': gap_pct, 'gap_direction': direction,
+            'open': round(open_price, 2), 'prev_close': round(prev_close, 2)}
+
+
+def calc_fade_score(ticker: str, rsi: float = 50.0, gap_direction: str = 'FLAT') -> dict:
+    """Fade setup score based on gap + RSI + early volume pattern. Returns {score, setup}."""
+    bars_15m = _dts_alpaca_bars(ticker, '1Min', 15)
+    vol_trend = 'unknown'
+    if len(bars_15m) >= 5:
+        early_vol = sum(float(b['v']) for b in bars_15m[:5])
+        late_vol  = sum(float(b['v']) for b in bars_15m[-5:])
+        vol_trend = 'declining' if late_vol < early_vol * 0.7 else 'increasing' if late_vol > early_vol * 1.3 else 'flat'
+
+    # Strong fade up: gap up + RSI overbought + volume declining
+    if gap_direction == 'UP' and rsi > 65 and vol_trend == 'declining':
+        score, setup = 80, 'gap_fade_short'
+    # Strong fade down: gap down + RSI oversold + volume increasing
+    elif gap_direction == 'DOWN' and rsi < 35 and vol_trend == 'increasing':
+        score, setup = 75, 'gap_fade_long'
+    elif gap_direction in ('UP', 'DOWN') and vol_trend == 'declining':
+        score, setup = 60, 'fade_candidate'
+    else:
+        score, setup = 50, 'no_fade_setup'
+
+    return {'score': score, 'setup': setup, 'vol_trend': vol_trend}
+
+
+# WHAL-127: News catalyst scoring
+def calc_news_score(ticker: str) -> dict:
+    """News catalyst via Alpaca News + Claude Haiku. Returns {score, catalyst_type, headline_summary}."""
+    cache_key = f'dts:news:{ticker}'
+    cached = redis_get(cache_key)
+    if cached:
+        return cached
+
+    headlines = []
+    try:
+        hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+        r = requests.get(
+            'https://data.alpaca.markets/v1beta1/news',
+            headers=hdrs,
+            params={'symbols': ticker, 'limit': 10},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            for item in r.json().get('news', []):
+                h = item.get('headline') or item.get('title', '')
+                if h:
+                    headlines.append(h)
+    except Exception as e:
+        logger.debug(f'news fetch {ticker}: {e}')
+
+    if not headlines:
+        result = {'score': 50, 'catalyst_type': 'none', 'headline_summary': 'No recent news'}
+        redis_set(cache_key, result, ttl_seconds=300)
+        return result
+
+    # Claude Haiku for sentiment scoring
+    _key = os.environ.get('ANTHROPIC_API_KEY', '') or ANTHROPIC_KEY
+    if _key:
+        try:
+            prompt = f"""Score these {ticker} news headlines for day-trading catalyst strength.
+Headlines:
+{chr(10).join(f'- {h}' for h in headlines[:10])}
+
+Respond with JSON only:
+{{"score": <0-100>, "catalyst_type": "earnings|fda|ma|macro|positive|negative|none", "headline_summary": "<1 sentence>"}}"""
+            resp = requests.post(
+                'https://api.anthropic.com/v1/messages',
+                headers={'x-api-key': _key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
+                json={'model': 'claude-haiku-4-5-20251001', 'max_tokens': 150,
+                      'messages': [{'role': 'user', 'content': prompt}]},
+                timeout=15,
+            )
+            if resp.ok:
+                text = resp.json()['content'][0]['text'].strip()
+                if text.startswith('```'):
+                    text = text.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+                result = json.loads(text)
+                redis_set(cache_key, result, ttl_seconds=300)
+                return result
+        except Exception as e:
+            logger.debug(f'news claude {ticker}: {e}')
+
+    # Fallback: keyword scoring
+    text_all = ' '.join(headlines).lower()
+    if any(w in text_all for w in ['earnings beat', 'fda approval', 'acquisition', 'merger']):
+        result = {'score': 85, 'catalyst_type': 'major', 'headline_summary': headlines[0]}
+    elif any(w in text_all for w in ['upgrade', 'buy', 'outperform', 'raise target']):
+        result = {'score': 70, 'catalyst_type': 'positive', 'headline_summary': headlines[0]}
+    elif any(w in text_all for w in ['downgrade', 'sell', 'miss', 'lowered']):
+        result = {'score': 30, 'catalyst_type': 'negative', 'headline_summary': headlines[0]}
+    else:
+        result = {'score': 50, 'catalyst_type': 'neutral', 'headline_summary': headlines[0]}
+
+    redis_set(cache_key, result, ttl_seconds=300)
+    return result
+
+
+# WHAL-123: Composite /day-trade-score endpoint
+@app.route('/day-trade-score/<ticker>', methods=['GET'])
+def day_trade_score(ticker: str):
+    """
+    GET /day-trade-score/AAPL — composite 0-100 day trading score.
+    Weights: RSI 20%, MACD 15%, VWAP 20%, RelVol 10%, Gap 15%, Fade 10%, News 10%
+    Returns: {ticker, score, label, components, narrative, timestamp}
+    """
+    ticker = ticker.upper().strip()
+    cache_key = f'dts:composite:{ticker}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=6) as ex:
+        f_rsi    = ex.submit(calc_rsi_score, ticker)
+        f_macd   = ex.submit(calc_macd_score, ticker)
+        f_vwap   = ex.submit(calc_vwap_score, ticker)
+        f_relvol = ex.submit(calc_relvol_score, ticker)
+        f_gap    = ex.submit(calc_gap_score, ticker)
+        f_news   = ex.submit(calc_news_score, ticker)
+
+    rsi_r    = f_rsi.result()
+    macd_r   = f_macd.result()
+    vwap_r   = f_vwap.result()
+    relvol_r = f_relvol.result()
+    gap_r    = f_gap.result()
+    news_r   = f_news.result()
+
+    # Fade depends on RSI + gap direction
+    fade_r = calc_fade_score(ticker, rsi=rsi_r.get('rsi', 50), gap_direction=gap_r.get('gap_direction', 'FLAT'))
+
+    weights = {'rsi': 0.20, 'macd': 0.15, 'vwap': 0.20, 'relvol': 0.10,
+               'gap': 0.15, 'fade': 0.10, 'news': 0.10}
+    scores  = {'rsi': rsi_r['score'], 'macd': macd_r['score'], 'vwap': vwap_r['score'],
+                'relvol': relvol_r['score'], 'gap': gap_r['score'], 'fade': fade_r['score'],
+                'news': news_r['score']}
+    composite = round(sum(scores[k] * weights[k] for k in weights), 1)
+
+    if composite >= 75:   label = 'MOMENTUM'
+    elif composite >= 62: label = 'SCALP'
+    elif composite >= 45: label = 'FADE'
+    else:                 label = 'AVOID'
+
+    components = [
+        {'name': 'RSI',       'score': rsi_r['score'],    'detail': rsi_r.get('signal', ''),    'weight': '20%'},
+        {'name': 'MACD',      'score': macd_r['score'],   'detail': macd_r.get('signal', ''),   'weight': '15%'},
+        {'name': 'VWAP',      'score': vwap_r['score'],   'detail': vwap_r.get('signal', ''),   'weight': '20%'},
+        {'name': 'Rel.Vol',   'score': relvol_r['score'], 'detail': f"{relvol_r.get('rel_vol',1):.1f}x avg", 'weight': '10%'},
+        {'name': 'Gap',       'score': gap_r['score'],    'detail': f"{gap_r.get('gap_pct',0):+.1f}% {gap_r.get('gap_direction','')}", 'weight': '15%'},
+        {'name': 'Fade',      'score': fade_r['score'],   'detail': fade_r.get('setup', ''),    'weight': '10%'},
+        {'name': 'News',      'score': news_r['score'],   'detail': news_r.get('catalyst_type',''), 'weight': '10%'},
+    ]
+
+    narrative = (
+        f"{ticker} scores {composite:.0f}/100 — {label}. "
+        f"RSI {rsi_r.get('rsi',50):.0f} ({rsi_r.get('signal','')}), "
+        f"MACD {macd_r.get('signal','')}, "
+        f"price {'above' if vwap_r.get('score',50) > 50 else 'below'} VWAP, "
+        f"volume {relvol_r.get('rel_vol',1):.1f}x avg. "
+        f"News: {news_r.get('headline_summary','')}"
+    )
+
+    result = {
+        'ticker':     ticker,
+        'score':      composite,
+        'label':      label,
+        'components': components,
+        'narrative':  narrative,
+        'timestamp':  datetime.utcnow().isoformat() + 'Z',
+        'rsi_value':  rsi_r.get('rsi'),
+        'vwap_value': vwap_r.get('vwap'),
+        'gap_pct':    gap_r.get('gap_pct'),
+        'rel_vol':    relvol_r.get('rel_vol'),
+    }
+
+    redis_set(cache_key, result, ttl_seconds=60)
+    return jsonify(result)
+
+
+# ─── WHAL-143/144/145: Prediction Markets ────────────────────────
+
+def get_prediction_context() -> str:
+    """Fetch top Kalshi macro markets for Claude prompt injection — WHAL-147."""
+    try:
+        res = requests.get(
+            'https://api.elections.kalshi.com/trade-api/v2/markets',
+            params={'status': 'open', 'category': 'Economics', 'limit': 5},
+            timeout=3,
+        )
+        markets = res.json().get('markets', [])
+        lines = []
+        for m in markets:
+            prob = round(m.get('yes_bid', 0))
+            lines.append(f"- {m.get('title', '')}: {prob}% YES probability (Kalshi CFTC-regulated)")
+        return '\n'.join(lines) if lines else 'Prediction market data unavailable.'
+    except Exception:
+        return 'Prediction market data unavailable.'
+
+
+@app.route('/kalshi-sentiment', methods=['GET'])
+def kalshi_sentiment():
+    """Kalshi macro prediction market data — WHAL-143."""
+    category = request.args.get('category', 'Economics')
+    cache_key = f'kalshi:{category}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+    try:
+        res = requests.get(
+            'https://api.elections.kalshi.com/trade-api/v2/markets',
+            params={'status': 'open', 'category': category, 'limit': 10},
+            timeout=5,
+        )
+        res.raise_for_status()
+        markets = res.json().get('markets', [])
+        result = [{
+            'title':        m.get('title', ''),
+            'yes_price':    round(m.get('yes_bid', 0) / 100, 2),
+            'no_price':     round(m.get('no_bid', 0) / 100, 2),
+            'volume':       float(m.get('volume', 0)),
+            'close_time':   m.get('close_time'),
+            'ticker':       m.get('ticker'),
+            'source':       'kalshi',
+            'source_label': 'Kalshi (CFTC)',
+        } for m in markets]
+        redis_set(cache_key, result, ttl_seconds=300)
+        return jsonify(result)
+    except Exception as e:
+        logger.warning(f'kalshi-sentiment error: {e}')
+        return jsonify({'error': str(e), 'markets': []}), 500
+
+
+@app.route('/polymarket-sentiment', methods=['GET'])
+def polymarket_sentiment():
+    """Polymarket crypto/finance prediction market data — WHAL-144."""
+    tag = request.args.get('tag', 'finance')
+    cache_key = f'polymarket:{tag}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+    try:
+        res = requests.get(
+            'https://gamma-api.polymarket.com/markets',
+            params={'active': 'true', 'tag_slug': tag, 'limit': 10},
+            timeout=5,
+        )
+        res.raise_for_status()
+        markets = res.json()
+        results = []
+        for m in markets:
+            prices = m.get('outcomePrices')
+            if isinstance(prices, str):
+                try:
+                    import json as _json
+                    prices = _json.loads(prices)
+                except Exception:
+                    prices = None
+            if not prices:
+                continue
+            results.append({
+                'title':        m.get('question') or m.get('title', ''),
+                'yes_price':    round(float(str(prices[0])), 2),
+                'no_price':     round(float(str(prices[1])), 2) if len(prices) > 1 else None,
+                'volume_24h':   float(m.get('volume24hr') or 0),
+                'volume':       float(m.get('volume24hr') or 0),
+                'end_date':     m.get('endDate'),
+                'close_time':   m.get('endDate'),
+                'slug':         m.get('slug'),
+                'ticker':       m.get('slug'),
+                'source':       'polymarket',
+                'source_label': 'Polymarket',
+            })
+        redis_set(cache_key, results, ttl_seconds=300)
+        return jsonify(results)
+    except Exception as e:
+        logger.warning(f'polymarket-sentiment error: {e}')
+        return jsonify({'error': str(e), 'markets': []}), 500
+
+
+@app.route('/prediction-pulse', methods=['GET'])
+def prediction_pulse():
+    """Unified Kalshi + Polymarket aggregator ranked by volume — WHAL-145."""
+    cache_key = 'prediction:pulse'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    results = []
+
+    # Kalshi — macro/economics (Fed, CPI, GDP, S&P 500, Jobs)
+    KALSHI_MACRO_SERIES = ['KXFED', 'KXCPI', 'KXGDP', 'KXSP500', 'KXJOBS', 'KXINFL', 'KXRECESSION']
+    try:
+        for series in KALSHI_MACRO_SERIES:
+            try:
+                k = requests.get(
+                    'https://api.elections.kalshi.com/trade-api/v2/markets',
+                    params={'status': 'open', 'series_ticker': series, 'limit': 5},
+                    timeout=4,
+                )
+                if k.status_code != 200:
+                    continue
+                for m in k.json().get('markets', []):
+                    vol = float(m.get('volume_24h_fp') or m.get('volume_fp') or 0)
+                    yes_p = float(m.get('yes_bid_dollars') or m.get('yes_ask_dollars') or 0)
+                    no_p  = float(m.get('no_bid_dollars')  or m.get('no_ask_dollars')  or 0)
+                    if yes_p == 0 and no_p == 0:
+                        continue
+                    results.append({
+                        'title':        m.get('title', ''),
+                        'yes_price':    round(yes_p, 2),
+                        'no_price':     round(no_p, 2),
+                        'volume':       vol,
+                        'close_time':   m.get('close_time'),
+                        'ticker':       m.get('ticker'),
+                        'source':       'kalshi',
+                        'source_label': 'Kalshi (CFTC)',
+                    })
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f'prediction-pulse kalshi error: {e}')
+
+    # Polymarket — crypto/finance
+    try:
+        p = requests.get(
+            'https://gamma-api.polymarket.com/markets',
+            params={'active': 'true', 'limit': 20},
+            timeout=6,
+        )
+        p_data = p.json()
+        # handle both list and dict response shapes
+        if isinstance(p_data, dict):
+            p_data = p_data.get('markets', p_data.get('data', []))
+        for m in (p_data or []):
+            prices = m.get('outcomePrices') or m.get('outcome_prices')
+            # outcomePrices is sometimes a JSON string e.g. '["0.525","0.475"]'
+            if isinstance(prices, str):
+                try:
+                    import json as _json
+                    prices = _json.loads(prices)
+                except Exception:
+                    prices = None
+            # try tokens field if outcomePrices missing
+            if not prices:
+                tokens = m.get('tokens') or []
+                if tokens:
+                    prices = [t.get('price', 0) for t in tokens]
+            if not prices:
+                continue
+            try:
+                yes_p = round(float(str(prices[0])), 2)
+                no_p  = round(float(str(prices[1])), 2) if len(prices) > 1 else round(1 - yes_p, 2)
+            except Exception:
+                continue
+            results.append({
+                'title':        m.get('question') or m.get('title', ''),
+                'yes_price':    yes_p,
+                'no_price':     no_p,
+                'volume':       float(m.get('volume24hr') or m.get('volume') or 0),
+                'close_time':   m.get('endDate') or m.get('end_date_iso'),
+                'ticker':       m.get('slug') or m.get('conditionId', ''),
+                'source':       'polymarket',
+                'source_label': 'Polymarket',
+            })
+    except Exception as e:
+        logger.warning(f'prediction-pulse polymarket error: {e}')
+
+    results.sort(key=lambda x: x.get('volume', 0), reverse=True)
+    top = results[:15]
+    redis_set(cache_key, top, ttl_seconds=300)
+    return jsonify(top)
 
 
 # ─── Cache warm-up helper (called from _startup) ──────────────────

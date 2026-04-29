@@ -5,6 +5,7 @@ Scores each stock 0-100 and stores top 10 picks in Redis.
 
 Kill switch: INTRADAY_SCANNER_ENABLED=true/false (Railway env var)
 """
+from __future__ import annotations
 
 import os
 import json
@@ -39,43 +40,24 @@ _state = {
 _state_lock = threading.Lock()
 
 
-# ── Stock universe ───────────────────────────────────────────────
+# ── Stock universe — top 50 liquid stocks (Yahoo Finance compatible) ─
+# Reduced from 503 to 50 to avoid rate limits on free-tier data sources.
+# These are the highest-volume, most-traded US stocks — best for intraday signals.
 
 SP500 = [
-    'AAPL','MSFT','AMZN','NVDA','GOOGL','META','TSLA','BRK.B','UNH','LLY',
-    'JPM','V','XOM','AVGO','PG','MA','HD','JNJ','COST','MRK','ABBV','CVX',
-    'CRM','AMD','ACN','MCD','PEP','ADBE','WMT','BAC','LIN','DIS','CSCO','NFLX',
-    'WFC','TXN','ABT','MS','GE','DHR','INTC','PM','CMCSA','ORCL','CAT','INTU',
-    'TMO','QCOM','IBM','NEE','VZ','HON','NOW','SPGI','UPS','AMGN','LOW','RTX',
-    'BA','GS','BLK','AMAT','SYK','MDT','PFE','T','MMM','SCHW','DE','GILD',
-    'AXP','ADP','ELV','CI','SLB','MDLZ','MO','TJX','SBUX','ADI','CB','BMY',
-    'C','FI','ZTS','ISRG','LRCX','HCA','REGN','PANW','DUK','PLD','ETN','AON',
-    'GD','SO','BDX','TGT','CME','ICE','NSC','EMR','APH','MCO','FCX','EW',
-    'ITW','ROP','AFL','MET','CTAS','MAR','KMB','PSA','WM','TRV','HLT','F',
-    'GM','PCG','EXC','PAYX','IQV','IDXX','VRSK','MCHP','FTNT','DXCM','BIIB',
-    'FAST','WBD','OKE','KR','MRNA','CTVA','PPG','GIS','YUM','CARR','SPG',
-    'PCAR','HSY','A','ROK','ACGL','OTIS','NEM','CMI','FICO','KHC','ALL',
-    'KEYS','RSG','DD','EFX','TROW','HAL','VICI','D','PPL','AEP','ED','ES',
-    'XEL','WEC','ATO','NI','CMS','PNW','OGE','SR','SRE','AGR','ETRN',
-    'ORLY','DLTR','ROST','BBY','ULTA','DG','AZO','EBAY','ETSY','SQ','PYPL',
-    'UBER','LYFT','DASH','SNAP','PINS','RBLX','U','SPOT','HOOD','COIN',
-    'ZM','DOCU','CRWD','OKTA','NET','DDOG','MDB','SNOW','PLTR','PATH',
-    'SOFI','LCID','RIVN','NIO','XPEV','LI','FSR','LAZR','WKHS','RIDE',
+    'AAPL','MSFT','NVDA','AMZN','META','GOOGL','TSLA','AVGO','BRK.B','JPM',
+    'V','UNH','XOM','LLY','MA','COST','PG','HD','JNJ','WMT',
+    'BAC','ABBV','MRK','NFLX','CRM','AMD','ORCL','CVX','ACN','TMO',
+    'ADBE','IBM','QCOM','TXN','NOW','INTU','CSCO','MCD','PEP','MS',
+    'GS','AMGN','ISRG','AMAT','PANW','LRCX','CRWD','NET','PLTR','COIN',
+    # Market regime indicators (not scored for trades — used for S&P trend)
+    'SPY', 'QQQ',
 ]
 
-NASDAQ100_EXTRA = [
-    'MRVL','KLAC','CDNS','SNPS','ANSS','NXPI','ON','MPWR','SWKS','QRVO',
-    'ALGN','IDXX','PODD','HOLX','GEHC','XRAY','VTRS','CTLT','JAZZ','ALNY',
-    'BMRN','SGEN','EXAS','FATE','NVAX','MRVI','NNOX','NVRO','SGFY','ACAD',
-    'FATE','FOLD','PTGX','TGTX','NTRA','GH','RXRX','TWST','BEAM','EDIT',
-    'NTLA','CRSP','BLUE','SAGE','AXSM','INVA','ICPT','ARWR','AGEN','IDYA',
-    'DNLI','IMVT','RVMD','PRLD','FGEN','CHRS','PTCT','VRNA','AQST','XCUR',
-    'LBPH','PMVP','IRON','FWRD','HALO','KRTX','NUVL','AUPH','ALDX','ADMA',
-    'ATRO','TPVG','GLAD','PFLT','PSEC','MAIN','ARCC','HTGC','GBDC','SLRC',
-]
+NASDAQ100_EXTRA = []  # emptied — using top-52 focused universe only
 
 def _build_universe(insider_tickers: list[str]) -> list[str]:
-    """Merge SP500 + NASDAQ100 extra + insider tickers, deduplicated."""
+    """Merge SP500 top-50 + any active insider tickers, deduplicated."""
     seen = set()
     result = []
     for t in SP500 + NASDAQ100_EXTRA + insider_tickers:
@@ -88,28 +70,23 @@ def _build_universe(insider_tickers: list[str]) -> list[str]:
 
 # ── Market hours ─────────────────────────────────────────────────
 
-_trading_day_cache: dict[str, bool] = {}   # date_str → is_trading_day
+# ── US market holidays (hardcoded — no API dependency, no failure modes) ──
+# NOTE: Update this set each year. Alpaca calendar was removed because a single
+# transient [] response at boot would cache False permanently and kill the scanner.
+_US_MARKET_HOLIDAYS = {
+    # 2025
+    '2025-01-01', '2025-01-20', '2025-02-17', '2025-04-18',
+    '2025-05-26', '2025-06-19', '2025-07-04', '2025-09-01',
+    '2025-11-27', '2025-12-25',
+    # 2026
+    '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03',
+    '2026-05-25', '2026-06-19', '2026-07-03', '2026-09-07',
+    '2026-11-26', '2026-12-25',
+}
 
 def _is_trading_day(date_str: str) -> bool:
-    """Check Alpaca calendar API to confirm a date is a trading day (not a holiday)."""
-    if date_str in _trading_day_cache:
-        return _trading_day_cache[date_str]
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        return True  # assume open if keys missing
-    try:
-        r = requests.get(
-            'https://paper-api.alpaca.markets/v2/calendar',
-            headers={'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET},
-            params={'start': date_str, 'end': date_str},
-            timeout=8,
-        )
-        if r.status_code == 200:
-            result = len(r.json()) > 0
-            _trading_day_cache[date_str] = result
-            return result
-    except Exception as e:
-        logger.warning(f'_is_trading_day check error: {e}')
-    return True  # assume open on error to avoid blocking
+    """Return True if date_str is a US market trading day (not a federal holiday)."""
+    return date_str not in _US_MARKET_HOLIDAYS
 
 
 def is_market_open() -> bool:
@@ -164,61 +141,78 @@ def _yf_bars_one(sym: str, limit: int) -> tuple[str, list]:
 def _alpaca_bars_batch(symbols: list[str], limit: int = 10) -> dict[str, list]:
     """
     Fetch last `limit` 1-minute bars for all symbols.
-    Primary: Alpaca Data API (reliable on server IPs, handles 500+ symbols).
-    Fallback: Yahoo Finance chart API.
+    Primary: Alpaca Data API with feed=iex (reliable on Railway server IPs).
+    Fallback: Yahoo Finance chart API for any symbols Alpaca misses.
     Returns {symbol: [{'t','o','h','l','c','v'}, ...]}
     """
-    # ── Primary: Alpaca 1-min bars (chunked, 100 symbols per call) ──
+    results: dict[str, list] = {}
+
+    # ── Primary: Alpaca IEX (server-IP reliable, handles batches of 100) ──
     if ALPACA_KEY and ALPACA_SECRET:
         try:
-            results = {}
             hdrs = {
-                'APCA-API-KEY-ID': ALPACA_KEY,
+                'APCA-API-KEY-ID':     ALPACA_KEY,
                 'APCA-API-SECRET-KEY': ALPACA_SECRET,
             }
-            chunk_size = 100
+            chunk_size = 50
             for i in range(0, len(symbols), chunk_size):
                 chunk = symbols[i:i + chunk_size]
                 r = requests.get(
                     'https://data.alpaca.markets/v2/stocks/bars',
                     headers=hdrs,
                     params={
-                        'symbols': ','.join(chunk),
+                        'symbols':   ','.join(chunk),
                         'timeframe': '1Min',
-                        'limit': limit,
-                        'feed': 'iex',
-                        'sort': 'asc',
+                        'limit':     limit,
+                        'feed':      'iex',
+                        'sort':      'asc',
                     },
-                    timeout=15,
+                    timeout=10,
                 )
                 if r.status_code == 200:
-                    data = r.json().get('bars', {})
-                    for sym, bar_list in data.items():
-                        results[sym] = [{
-                            't': b['t'], 'o': b['o'], 'h': b['h'],
-                            'l': b['l'], 'c': b['c'], 'v': b['v'],
-                        } for b in bar_list]
-            if results:
-                logger.info(f'Bar fetch (Alpaca): {len(results)}/{len(symbols)} symbols returned data')
-                return results
+                    for sym, bar_list in r.json().get('bars', {}).items():
+                        bars = [
+                            {'t': b['t'], 'o': b['o'], 'h': b['h'],
+                             'l': b['l'], 'c': b['c'], 'v': b['v']}
+                            for b in bar_list if all(k in b for k in ('o', 'h', 'l', 'c', 'v'))
+                        ]
+                        if bars:
+                            results[sym.upper()] = bars
+                elif r.status_code == 403:
+                    logger.warning('Alpaca IEX 403 — SIP feed blocked on free tier (expected)')
+                else:
+                    logger.warning(f'Alpaca bars HTTP {r.status_code}: {r.text[:120]}')
         except Exception as e:
-            logger.warning(f'Alpaca bars batch error: {e} — falling back to Yahoo Finance')
+            logger.warning(f'Alpaca bars error: {e}')
 
-    # ── Fallback: Yahoo Finance (blocked on some server IPs) ──
-    import concurrent.futures as _cf
-    results = {}
-    with _cf.ThreadPoolExecutor(max_workers=30) as ex:
-        for sym, bars in ex.map(lambda s: _yf_bars_one(s, limit), symbols):
-            if bars:
-                results[sym] = bars
-    logger.info(f'Bar fetch (Yahoo): {len(results)}/{len(symbols)} symbols returned data')
+    alpaca_count = len(results)
+
+    # ── Fallback: Yahoo Finance for anything Alpaca missed ──
+    missing = [s for s in symbols if s not in results]
+    if missing:
+        import concurrent.futures as _cf
+        yf_results = {}
+        with _cf.ThreadPoolExecutor(max_workers=20) as ex:
+            for sym, bars in ex.map(lambda s: _yf_bars_one(s, limit), missing):
+                if bars:
+                    yf_results[sym] = bars
+        results.update(yf_results)
+        logger.info(
+            f'Bar fetch: Alpaca={alpaca_count} Yahoo={len(yf_results)} '
+            f'total={len(results)}/{len(symbols)} coverage={len(results)*100//len(symbols) if symbols else 0}%'
+        )
+    else:
+        logger.info(
+            f'Bar fetch: Alpaca={alpaca_count}/{len(symbols)} coverage=100% (no Yahoo fallback needed)'
+        )
+
     return results
 
 
 # ── Indicator helpers (using bar lists) ─────────────────────────
 
-def _rsi_from_bars(closes: list[float], period: int = 7) -> float | None:
-    """Fast RSI from a short list of closes (uses available bars, min period+1)."""
+def _rsi_from_bars(closes: list[float], period: int = 5) -> float | None:
+    """Fast RSI from a short list of closes. Period=5 works with just 6 bars (IEX-friendly)."""
     if len(closes) < period + 1:
         return None
     gains, losses = [], []
@@ -235,8 +229,11 @@ def _rsi_from_bars(closes: list[float], period: int = 7) -> float | None:
 
 
 def _macd_crossover(closes: list[float]) -> bool:
-    """True if MACD histogram turned positive in last 3 bars (bullish crossover)."""
-    if len(closes) < 15:
+    """Bullish momentum signal. Works with as few as 4 bars (IEX-friendly).
+    Uses short EMA crossover (3 vs 6) when < 8 bars, full MACD (6 vs 13) otherwise.
+    """
+    n = len(closes)
+    if n < 4:
         return False
 
     def ema(data, span):
@@ -246,21 +243,16 @@ def _macd_crossover(closes: list[float]) -> bool:
             e = v * k + e * (1 - k)
         return e
 
-    def hist_at(idx):
-        c = closes[:idx + 1]
-        if len(c) < 15:
-            return 0
-        macd = ema(c, 6) - ema(c, 13)
-        # approximate signal with ema of last few macd values
-        return macd  # simplified: just check sign change
-
-    # Simplified: use last 3 bars to detect positive momentum building
-    n = len(closes)
-    if n < 4:
-        return False
-    recent = closes[-4:]
-    gains = [recent[i] - recent[i - 1] for i in range(1, 4)]
-    return gains[-1] > 0 and gains[-2] <= 0  # reversal up
+    if n >= 8:
+        # Full short MACD: EMA(6) - EMA(13) turning positive
+        macd_now  = ema(closes, 6) - ema(closes, 13)
+        macd_prev = ema(closes[:-1], 6) - ema(closes[:-1], 13) if n > 8 else 0
+        return macd_now > 0 and macd_prev <= 0
+    else:
+        # Simplified reversal: price turned up after 1+ down bars (works with 4-7 bars)
+        recent = closes[-4:]
+        gains = [recent[i] - recent[i - 1] for i in range(1, 4)]
+        return gains[-1] > 0 and gains[-2] <= 0  # reversal up
 
 
 def _volume_avg(volumes: list[float]) -> float:
@@ -270,9 +262,12 @@ def _volume_avg(volumes: list[float]) -> float:
 # ── Score one symbol ─────────────────────────────────────────────
 
 # ── Quality filters ──────────────────────────────────────────────
-MIN_PRICE          = 15.0      # skip penny/micro-cap stocks
-MIN_AVG_DAILY_VOL  = 500_000   # skip illiquid stocks (per-minute baseline × 390 mins)
-MAX_DAY_GAIN_PCT   = 3.0       # skip if already up >3% today (chasing)
+MIN_PRICE          = 10.0      # skip extreme penny stocks (was 15 — too strict)
+# IEX covers ~3-5% of total market volume. Per-minute IEX volume for a stock with
+# 500K real daily volume ≈ 38-65 shares/minute on IEX. Set to 2,000 implied daily
+# (≈5 shares/min) to avoid skipping real stocks that simply have thin IEX coverage.
+MIN_AVG_DAILY_VOL  = 2_000     # IEX-adjusted (was 20K → still too strict for many stocks)
+MAX_DAY_GAIN_PCT   = 8.0       # skip if already up >8% today (was 3% — killed real moves)
 
 
 def _score_symbol(
@@ -282,7 +277,7 @@ def _score_symbol(
     vol_baselines: dict[str, float],
 ) -> dict:
     """Score a single symbol 0-100 based on scan criteria."""
-    if not bars or len(bars) < 3:
+    if not bars or len(bars) < 2:
         return {'ticker': symbol, 'score': 0, 'skip': True}
 
     closes  = [b['c'] for b in bars]
@@ -438,7 +433,7 @@ def _do_load_baselines(symbols: list[str]):
                         'symbols': ','.join(chunk),
                         'timeframe': '1Day',
                         'limit': 10,
-                        'feed': 'iex',
+                        'feed': 'sip',
                         'sort': 'asc',
                     },
                     timeout=15,
@@ -485,10 +480,18 @@ def _run_scan(redis_set_fn, redis_get_fn):
     bars_data = _alpaca_bars_batch(universe, limit=20)
 
     results = []
+    skip_reasons: dict[str, int] = {}
+    no_bars_count = 0
     for symbol in universe:
         bars = bars_data.get(symbol, [])
+        if not bars:
+            no_bars_count += 1
+            continue
         scored = _score_symbol(symbol, bars, insider_tickers, _vol_baselines)
-        if not scored.get('skip'):
+        if scored.get('skip'):
+            reason = scored.get('skip_reason', 'no_bars')
+            skip_reasons[reason[:40]] = skip_reasons.get(reason[:40], 0) + 1
+        else:
             # Boost score for pre-market gappers — they already showed conviction
             if symbol in premarket_tickers:
                 scored['score'] = min(100, scored['score'] + 15)
@@ -498,6 +501,14 @@ def _run_scan(redis_set_fn, redis_get_fn):
     # Sort by score desc, then momentum desc — always surface best picks even at score=0
     results.sort(key=lambda x: (x['score'], x.get('momentum_pct', 0)), reverse=True)
     top_picks = results[:TOP_N]
+
+    logger.info(
+        f'Scan breakdown: universe={len(universe)} iex_coverage={len(bars_data)} '
+        f'no_bars={no_bars_count} skipped={sum(skip_reasons.values())} scored={len(results)} '
+        f'top_score={top_picks[0]["score"] if top_picks else 0} '
+        f'auto_trade_eligible={len([p for p in top_picks if p["score"] >= AUTO_TRADE_MIN_SCORE])} '
+        f'skip_reasons={skip_reasons}'
+    )
 
     scan_end = datetime.now(_ET)
     elapsed  = (scan_end - scan_start).total_seconds()
@@ -537,8 +548,8 @@ def _run_scan(redis_set_fn, redis_get_fn):
     _auto_trade_top_picks(top_picks, bars_data, insider_tickers, redis_set_fn, redis_get_fn)
 
 
-AUTO_TRADE_MIN_SCORE   = 75   # raised from 60 → only high-conviction picks
-AUTO_TRADE_MAX_PER_SCAN = 3   # reduced from 5 → fewer, better trades per scan
+AUTO_TRADE_MIN_SCORE   = 50   # lowered: IEX data sparsity limits realistic max to 60-80
+AUTO_TRADE_MAX_PER_SCAN = 3   # max per scan to avoid over-trading
 
 # S&P 500 trend cache (refreshed each scan)
 _sp500_trend = 'neutral'
@@ -567,6 +578,7 @@ def _auto_trade_top_picks(
     """
     trading_enabled = os.environ.get('INTRADAY_TRADING_ENABLED', 'false').lower() == 'true'
     if not trading_enabled:
+        logger.info('Auto-trade: INTRADAY_TRADING_ENABLED is not true — skipping')
         return
 
     try:
@@ -576,12 +588,74 @@ def _auto_trade_top_picks(
         logger.error(f'Auto-trade bridge import error: {e}')
         return
 
+    # Read live config — Redis (highest priority) → Supabase → hardcoded defaults
+    app_config: dict = {
+        'enabled':            True,
+        'min_score':          AUTO_TRADE_MIN_SCORE,
+        'min_confidence':     int(MIN_CONFIDENCE * 100),
+        'max_trades_per_day': AUTO_TRADE_MAX_PER_SCAN,
+        'hold_minutes':       390,   # one trading session default
+        'max_positions':      5,
+    }
+    try:
+        import requests as _req
+        supa_url = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
+        supa_key = os.environ.get('SUPABASE_KEY', '')
+        r = _req.get(
+            f'{supa_url}/rest/v1/algo_config?limit=1',
+            headers={'apikey': supa_key, 'Authorization': f'Bearer {supa_key}'},
+            timeout=3,
+        )
+        if r.status_code == 200 and r.json():
+            for k, v in r.json()[0].items():
+                if k in app_config and v is not None:
+                    app_config[k] = v
+    except Exception as e:
+        logger.warning(f'algo_config Supabase fetch failed: {e}')
+
+    # Redis overrides everything (set via POST /api/scanner/config from the app)
+    try:
+        if redis_get:
+            redis_cfg = redis_get('algo:live_config')
+            if redis_cfg and isinstance(redis_cfg, dict):
+                app_config.update(redis_cfg)
+                logger.info(f'Loaded live config from Redis: {redis_cfg}')
+    except Exception as e:
+        logger.warning(f'algo_config Redis fetch failed: {e}')
+
+    if app_config.get('enabled') is False:
+        logger.info('Auto-trade disabled via app config')
+        return
+
+    min_score_threshold  = int(app_config.get('min_score', AUTO_TRADE_MIN_SCORE))
+    min_conf_threshold   = float(app_config.get('min_confidence', int(MIN_CONFIDENCE * 100))) / 100
+    max_per_scan         = int(app_config.get('max_trades_per_day', AUTO_TRADE_MAX_PER_SCAN))
+    hold_minutes         = int(app_config.get('hold_minutes', 390))
+    max_positions        = int(app_config.get('max_positions', 5))
+
+    logger.info(
+        f'Auto-trade config: min_score={min_score_threshold} '
+        f'min_conf={min_conf_threshold:.0%} max_per_scan={max_per_scan} '
+        f'hold_min={hold_minutes} max_pos={max_positions}'
+    )
+
     sp500_trend = _get_sp500_trend(bars_data)
-    candidates  = [p for p in top_picks if p.get('score', 0) >= AUTO_TRADE_MIN_SCORE]
+    candidates  = [p for p in top_picks if p.get('score', 0) >= min_score_threshold]
+
+    logger.info(
+        f'Auto-trade: trend={sp500_trend} top_picks={len(top_picks)} '
+        f'candidates_above_{min_score_threshold}={len(candidates)} '
+        f'bars_available={len(bars_data)}'
+    )
+
+    if not candidates:
+        logger.info('Auto-trade: no candidates met score threshold — no orders this scan')
+        return
+
     attempted   = 0
 
     for pick in candidates:
-        if attempted >= AUTO_TRADE_MAX_PER_SCAN:
+        if attempted >= max_per_scan:
             break
 
         ticker       = pick['ticker']
@@ -612,14 +686,20 @@ def _auto_trade_top_picks(
             f'signal={sig} confidence={confidence:.0%}'
         )
 
-        if sig in ('BUY', 'SELL') and confidence >= MIN_CONFIDENCE:
+        if sig not in ('BUY', 'SELL'):
+            logger.info(f'Auto-trade skip {ticker}: signal={sig} (not BUY/SELL)')
+        elif confidence < min_conf_threshold:
+            logger.info(f'Auto-trade skip {ticker}: confidence={confidence:.0%} < threshold={min_conf_threshold:.0%}')
+
+        if sig in ('BUY', 'SELL') and confidence >= min_conf_threshold:
+            logger.info(f'Auto-trade FIRING order: {ticker} {sig} confidence={confidence:.0%}')
             order_payload = {
                 'ticker':       ticker,
                 'signal':       sig,
                 'entry':        signal.get('entry', pick.get('price', 0)),
                 'stop_loss':    signal.get('stop_loss', 0),
                 'target':       signal.get('target', 0),
-                'hold_minutes': signal.get('hold_minutes', 60),
+                'hold_minutes': hold_minutes,   # from live app config
                 'confidence':   confidence,
                 'reasoning':    signal.get('reasoning', ''),
             }
@@ -638,30 +718,64 @@ def _auto_trade_top_picks(
 
 def _scanner_loop(redis_set_fn, redis_get_fn):
     logger.info('Intraday scanner thread started')
+    _last_status_log = 0
     while True:
         try:
             enabled = os.environ.get('INTRADAY_SCANNER_ENABLED', 'false').lower() == 'true'
-            if enabled and is_market_open():
+            market_open = is_market_open()
+            if enabled and market_open:
                 _run_scan(redis_set_fn, redis_get_fn)
             else:
                 with _state_lock:
                     _state['running'] = False
+                reason = 'market_closed' if not market_open else 'disabled'
+                # Log status every 30 minutes to confirm thread is alive
+                now_ts = time.time()
+                if now_ts - _last_status_log > 1800:
+                    now_et = datetime.now(_ET)
+                    logger.info(
+                        f'Scanner idle — reason={reason} '
+                        f'enabled={enabled} market_open={market_open} '
+                        f'ET={now_et.strftime("%H:%M")} '
+                        f'weekday={now_et.weekday()} '
+                        f'date={now_et.strftime("%Y-%m-%d")} '
+                        f'is_holiday={now_et.strftime("%Y-%m-%d") in _US_MARKET_HOLIDAYS} '
+                        f'scan_count={_state.get("scan_count",0)}'
+                    )
+                    _last_status_log = now_ts
                 # Update Redis status to stopped
                 redis_set_fn('scanner:status', {
                     'running':    False,
-                    'reason':     'market_closed' if not is_market_open() else 'disabled',
+                    'reason':     reason,
                     'last_scan':  _state.get('last_scan'),
                     'scan_count': _state.get('scan_count', 0),
                 }, ttl_seconds=300)
         except Exception as e:
-            logger.error(f'Intraday scanner error: {e}')
+            logger.error(f'Intraday scanner error: {e}', exc_info=True)
             with _state_lock:
                 _state['error'] = str(e)
         time.sleep(SCAN_INTERVAL)
 
 
+def _scanner_watchdog(redis_set_fn, redis_get_fn):
+    """Watchdog: restarts the scanner thread if it dies unexpectedly."""
+    while True:
+        time.sleep(90)  # check every 90s
+        alive = any(t.name == 'intraday-scanner' and t.is_alive()
+                    for t in threading.enumerate())
+        if not alive:
+            logger.error('Intraday scanner thread died — restarting...')
+            t = threading.Thread(
+                target=_scanner_loop,
+                args=(redis_set_fn, redis_get_fn),
+                daemon=True,
+                name='intraday-scanner',
+            )
+            t.start()
+
+
 def start(redis_set_fn, redis_get_fn):
-    """Start the background scanner thread. Call once at app startup."""
+    """Start the background scanner thread + watchdog. Call once at app startup."""
     t = threading.Thread(
         target=_scanner_loop,
         args=(redis_set_fn, redis_get_fn),
@@ -669,7 +783,14 @@ def start(redis_set_fn, redis_get_fn):
         name='intraday-scanner',
     )
     t.start()
-    logger.info('Intraday scanner: background thread launched')
+    # Watchdog restarts scanner if it ever dies
+    threading.Thread(
+        target=_scanner_watchdog,
+        args=(redis_set_fn, redis_get_fn),
+        daemon=True,
+        name='scanner-watchdog',
+    ).start()
+    logger.info('Intraday scanner: background thread + watchdog launched')
 
 
 # ── Public accessors (used by Flask endpoints) ───────────────────
