@@ -7310,6 +7310,305 @@ def prediction_pulse():
     return jsonify(top)
 
 
+# ─── WHAL-159: Risk Dashboard ────────────────────────────────────────────────
+
+@app.route('/api/risk/dashboard')
+def api_risk_dashboard():
+    """WHAL-159 + WHAL-164: Risk metrics + signal accuracy from closed trades."""
+    cache_key = 'api:risk:dashboard'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        import math as _math
+        from collections import defaultdict
+
+        # Pull all closed trades
+        url = (f'{SUPABASE_URL}/rest/v1/intraday_trades'
+               f'?status=eq.closed'
+               f'&select=ticker,side,pnl,pnl_pct,confidence,exit_reason,entry_time,date'
+               f'&order=entry_time.asc&limit=2000')
+        resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=15)
+        trades = resp.json() if resp.status_code == 200 else []
+        if not isinstance(trades, list):
+            trades = []
+
+        if not trades:
+            return jsonify({'error': 'no_trades', 'message': 'No closed trades yet'})
+
+        pnls = [float(t.get('pnl') or 0) for t in trades]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+
+        # Overall stats
+        win_rate     = len(wins) / len(pnls) if pnls else 0
+        total_pnl    = sum(pnls)
+        avg_win      = sum(wins) / len(wins) if wins else 0
+        avg_loss     = abs(sum(losses) / len(losses)) if losses else 0
+        profit_factor = (avg_win * len(wins)) / (avg_loss * len(losses)) if losses and losses[0] != 0 else 0
+
+        # Max drawdown (peak-to-trough on cumulative P&L)
+        cumulative = 0; peak = 0; max_dd = 0
+        for p in pnls:
+            cumulative += p
+            if cumulative > peak:
+                peak = cumulative
+            dd = peak - cumulative
+            if dd > max_dd:
+                max_dd = dd
+
+        # Current drawdown
+        current_dd = max(0, peak - cumulative)
+
+        # Sharpe (annualised, assume 252 trading days)
+        if len(pnls) > 1:
+            mean_p = sum(pnls) / len(pnls)
+            std_p  = _math.sqrt(sum((p - mean_p) ** 2 for p in pnls) / len(pnls))
+            sharpe = (mean_p / std_p * _math.sqrt(252)) if std_p > 0 else 0
+        else:
+            sharpe = 0
+
+        # Streak
+        streak = 0; max_loss_streak = 0; cur_loss = 0
+        for p in pnls:
+            if p > 0:
+                streak = max(streak + 1, 1) if streak >= 0 else 1
+                cur_loss = 0
+            else:
+                streak = min(streak - 1, -1) if streak <= 0 else -1
+                cur_loss += 1
+                max_loss_streak = max(max_loss_streak, cur_loss)
+
+        # Daily P&L (last 14 days)
+        daily: dict = defaultdict(float)
+        for t in trades:
+            d = (t.get('date') or (t.get('entry_time') or '')[:10])
+            daily[d] += float(t.get('pnl') or 0)
+        sorted_days = sorted(daily.keys())[-14:]
+        daily_series = [{'date': d, 'pnl': round(daily[d], 2)} for d in sorted_days]
+
+        # --- WHAL-164: Signal accuracy breakdown ---
+        # Group by confidence bucket
+        conf_buckets: dict = defaultdict(lambda: {'wins': 0, 'losses': 0, 'pnl': 0.0})
+        for t in trades:
+            conf = float(t.get('confidence') or 0)
+            if conf >= 0.80:
+                bucket = 'High (80%+)'
+            elif conf >= 0.65:
+                bucket = 'Medium (65–80%)'
+            else:
+                bucket = 'Low (<65%)'
+            pnl = float(t.get('pnl') or 0)
+            conf_buckets[bucket]['pnl'] += pnl
+            if pnl > 0:
+                conf_buckets[bucket]['wins'] += 1
+            else:
+                conf_buckets[bucket]['losses'] += 1
+
+        conf_breakdown = []
+        for bucket, data in sorted(conf_buckets.items()):
+            total = data['wins'] + data['losses']
+            conf_breakdown.append({
+                'label':     bucket,
+                'trades':    total,
+                'win_rate':  round(data['wins'] / total, 3) if total else 0,
+                'total_pnl': round(data['pnl'], 2),
+                'avg_pnl':   round(data['pnl'] / total, 2) if total else 0,
+            })
+
+        # Group by exit_reason
+        exit_buckets: dict = defaultdict(lambda: {'wins': 0, 'losses': 0, 'pnl': 0.0})
+        for t in trades:
+            reason = (t.get('exit_reason') or 'unknown').replace('_', ' ').title()
+            pnl = float(t.get('pnl') or 0)
+            exit_buckets[reason]['pnl'] += pnl
+            if pnl > 0:
+                exit_buckets[reason]['wins'] += 1
+            else:
+                exit_buckets[reason]['losses'] += 1
+
+        exit_breakdown = []
+        for reason, data in sorted(exit_buckets.items(), key=lambda x: -(x[1]['pnl'])):
+            total = data['wins'] + data['losses']
+            exit_breakdown.append({
+                'label':     reason,
+                'trades':    total,
+                'win_rate':  round(data['wins'] / total, 3) if total else 0,
+                'total_pnl': round(data['pnl'], 2),
+                'avg_pnl':   round(data['pnl'] / total, 2) if total else 0,
+            })
+
+        # Group by side (BUY/SELL)
+        side_buckets: dict = defaultdict(lambda: {'wins': 0, 'losses': 0, 'pnl': 0.0})
+        for t in trades:
+            side = (t.get('side') or 'buy').upper()
+            pnl = float(t.get('pnl') or 0)
+            side_buckets[side]['pnl'] += pnl
+            if pnl > 0:
+                side_buckets[side]['wins'] += 1
+            else:
+                side_buckets[side]['losses'] += 1
+
+        side_breakdown = []
+        for side, data in side_buckets.items():
+            total = data['wins'] + data['losses']
+            side_breakdown.append({
+                'label':     side,
+                'trades':    total,
+                'win_rate':  round(data['wins'] / total, 3) if total else 0,
+                'total_pnl': round(data['pnl'], 2),
+                'avg_pnl':   round(data['pnl'] / total, 2) if total else 0,
+            })
+
+        # Health score (0–100)
+        wr_score   = min(win_rate * 100, 50)           # up to 50pts for win rate
+        pf_score   = min(profit_factor * 10, 25)       # up to 25pts for profit factor
+        dd_score   = max(0, 25 - (max_dd / max(abs(total_pnl), 1)) * 25)  # 25pts for low DD
+        health_score = round(wr_score + pf_score + dd_score)
+
+        result = {
+            'total_trades':    len(pnls),
+            'wins':            len(wins),
+            'losses':          len(losses),
+            'win_rate':        round(win_rate, 3),
+            'total_pnl':       round(total_pnl, 2),
+            'avg_win':         round(avg_win, 2),
+            'avg_loss':        round(avg_loss, 2),
+            'profit_factor':   round(profit_factor, 2),
+            'max_drawdown':    round(max_dd, 2),
+            'current_drawdown':round(current_dd, 2),
+            'sharpe':          round(sharpe, 2),
+            'current_streak':  streak,
+            'max_loss_streak': max_loss_streak,
+            'health_score':    min(health_score, 100),
+            'daily_series':    daily_series,
+            'conf_breakdown':  conf_breakdown,
+            'exit_breakdown':  exit_breakdown,
+            'side_breakdown':  side_breakdown,
+        }
+
+        redis_set(cache_key, result, ttl_seconds=300)
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f'risk/dashboard error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── WHAL-155: Morning AI Briefing ───────────────────────────────────────────
+
+@app.route('/api/morning-briefing')
+def api_morning_briefing():
+    """WHAL-155: Today's AI market briefing — top signals + context."""
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    cache_key = f'briefing:{today}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        briefing = _generate_morning_briefing()
+        # Cache until midnight (86400s max, or next day)
+        redis_set(cache_key, briefing, ttl_seconds=28800)  # 8h
+        return jsonify(briefing)
+    except Exception as e:
+        logger.error(f'morning-briefing error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+def _generate_morning_briefing() -> dict:
+    """Compile top scanner picks + market context into a morning briefing."""
+    from datetime import date as _date
+    import json as _json
+    today = _date.today().isoformat()
+
+    # Market regime
+    regime = 'NEUTRAL'
+    try:
+        r_raw = redis_get('scanner:regime') or redis_get('scanner:status') or {}
+        regime = (r_raw.get('regime') or 'NEUTRAL').upper()
+    except Exception:
+        pass
+
+    # Top scanner picks from Redis cache
+    top_picks = []
+    try:
+        picks_raw = redis_get('scanner:top_picks') or redis_get('intraday:top_picks') or []
+        if isinstance(picks_raw, list):
+            top_picks = picks_raw[:5]
+    except Exception:
+        pass
+
+    # Fallback: pull high-score tickers from recent scan
+    if not top_picks:
+        try:
+            url = (f'{SUPABASE_URL}/rest/v1/intraday_trades'
+                   f'?date=eq.{today}&status=neq.cancelled'
+                   f'&select=ticker,side,confidence,entry_price&order=confidence.desc&limit=5')
+            resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=10)
+            if resp.status_code == 200:
+                top_picks = resp.json() or []
+        except Exception:
+            pass
+
+    # Today's P&L
+    today_pnl = 0.0
+    try:
+        url = (f'{SUPABASE_URL}/rest/v1/intraday_trades'
+               f'?date=eq.{today}&status=eq.closed&select=pnl')
+        resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=10)
+        if resp.status_code == 200:
+            rows = resp.json() or []
+            today_pnl = sum(float(r.get('pnl') or 0) for r in rows)
+    except Exception:
+        pass
+
+    # Key market levels (S&P 500, VIX) from cache
+    spy_price = 0.0; vix = 0.0
+    try:
+        snap = redis_get('snapshot:SPY') or {}
+        spy_price = float(snap.get('price') or 0)
+    except Exception:
+        pass
+
+    # Build summary text
+    regime_emoji = '🟢' if 'BULL' in regime else '🔴' if 'BEAR' in regime else '🟡'
+    pnl_emoji    = '📈' if today_pnl >= 0 else '📉'
+    picks_text = ', '.join(p.get('ticker', '') for p in top_picks if p.get('ticker')) or 'Scanning…'
+
+    summary = (
+        f"{regime_emoji} Market regime: {regime}. "
+        f"Top scanner picks: {picks_text}. "
+        f"{pnl_emoji} Today's P&L so far: ${today_pnl:+.2f}."
+    )
+
+    briefing = {
+        'date':        today,
+        'regime':      regime,
+        'summary':     summary,
+        'top_picks':   top_picks,
+        'today_pnl':   round(today_pnl, 2),
+        'spy_price':   round(spy_price, 2),
+        'generated_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z',
+    }
+
+    # Send FCM push to registered devices
+    try:
+        from firebase_push import send_to_all_devices
+        send_to_all_devices(
+            title='🌅 Morning Briefing',
+            body=summary[:120],
+            data={'type': 'morning_briefing', 'date': today},
+            supabase=_supabase,
+        )
+    except Exception as e:
+        logger.debug(f'FCM push skipped: {e}')
+
+    return briefing
+
+
 # ─── Cache warm-up helper (called from _startup) ──────────────────
 
 def warm_redis_cache():
