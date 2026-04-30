@@ -7609,6 +7609,186 @@ def _generate_morning_briefing() -> dict:
     return briefing
 
 
+# ─── WHAL-158: Insider Cluster Alerts ────────────────────────────────────────
+
+@app.route('/api/insider/clusters')
+def api_insider_clusters():
+    """WHAL-158: Tickers where 3+ insiders bought in the same rolling 7-day window."""
+    days      = request.args.get('days', 30, type=int)
+    min_buys  = request.args.get('min_buys', 3, type=int)
+    min_value = request.args.get('min_value', 25000, type=float)
+
+    cache_key = f'api:insider_clusters:{days}:{min_buys}'
+    cached = redis_get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        from datetime import date, timedelta as td
+        from collections import defaultdict
+        cutoff = (date.today() - td(days=days)).isoformat()
+
+        url = (f'{SUPABASE_URL}/rest/v1/filings'
+               f'?transaction_date=gte.{cutoff}'
+               f'&transaction_type=in.(buy,p,purchase,a)'
+               f'&select=ticker,owner_name,value,transaction_date,shares'
+               f'&order=transaction_date.desc&limit=5000')
+        resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=15)
+        rows = resp.json() if resp.status_code == 200 and isinstance(resp.json(), list) else []
+
+        # Fallback to in-memory cache
+        if not rows:
+            BUY_TYPES = {'buy', 'p', 'purchase', 'a'}
+            rows = [
+                {
+                    'ticker':           f.get('ticker', ''),
+                    'owner_name':       f.get('owner_name', f.get('insider_name', '')),
+                    'value':            f.get('value', 0),
+                    'transaction_date': (f.get('transaction_date') or f.get('filed_at', ''))[:10],
+                    'shares':           f.get('shares', 0),
+                }
+                for f in list(_filings_cache)
+                if (f.get('transaction_type') or '').lower() in BUY_TYPES
+            ]
+
+        # Group by ticker → list of (date, insider, value)
+        ticker_events: dict = defaultdict(list)
+        for row in rows:
+            ticker = (row.get('ticker') or '').upper().strip()
+            value  = float(row.get('value') or 0)
+            if not ticker or value < min_value:
+                continue
+            ticker_events[ticker].append({
+                'insider': (row.get('owner_name') or '—').strip(),
+                'date':    (row.get('transaction_date') or '')[:10],
+                'value':   value,
+                'shares':  int(row.get('shares') or 0),
+            })
+
+        # Find clusters: 3+ different insiders buying within 7-day windows
+        clusters = []
+        for ticker, events in ticker_events.items():
+            if len(events) < min_buys:
+                continue
+            # Sort by date
+            events_sorted = sorted(events, key=lambda e: e['date'])
+            # Sliding 7-day window
+            best_window = []
+            for i, ev in enumerate(events_sorted):
+                try:
+                    window_start = date.fromisoformat(ev['date'])
+                    window_end   = window_start + td(days=7)
+                    window = [e for e in events_sorted[i:]
+                              if e['date'] >= ev['date'] and
+                              date.fromisoformat(e['date']) <= window_end]
+                    unique_insiders = len({e['insider'] for e in window})
+                    if unique_insiders >= min_buys and len(window) > len(best_window):
+                        best_window = window
+                except Exception:
+                    continue
+
+            if len(best_window) < min_buys:
+                continue
+
+            total_value  = sum(e['value'] for e in best_window)
+            unique_names = list({e['insider'] for e in best_window})
+            date_range   = f"{best_window[0]['date']} – {best_window[-1]['date']}"
+            cluster_score = min(100, len(best_window) * 15 + total_value / 1_000_000 * 5)
+
+            clusters.append({
+                'ticker':         ticker,
+                'insider_count':  len(best_window),
+                'unique_insiders':len(unique_names),
+                'insiders':       unique_names[:5],
+                'total_value':    round(total_value),
+                'date_range':     date_range,
+                'latest_date':    best_window[-1]['date'],
+                'cluster_score':  round(cluster_score),
+            })
+
+        clusters.sort(key=lambda x: x['cluster_score'], reverse=True)
+        result = {'clusters': clusters[:20], 'total': len(clusters), 'days': days}
+        redis_set(cache_key, result, ttl_seconds=1800)
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f'insider/clusters error: {e}')
+        return jsonify({'clusters': [], 'error': str(e)}), 500
+
+
+# ─── WHAL-165: SSE Price Streaming ───────────────────────────────────────────
+
+@app.route('/api/prices/stream')
+def api_prices_stream():
+    """WHAL-165: Server-Sent Events stream for live Alpaca snapshot prices.
+
+    Query params:
+      tickers : comma-separated list e.g. AAPL,MSFT,TSLA
+      interval: seconds between updates (default 3, min 2)
+    """
+    import time as _time
+    from flask import Response, stream_with_context
+    import json as _json
+
+    tickers_raw = request.args.get('tickers', '')
+    interval    = max(2, request.args.get('interval', 3, type=int))
+    tickers     = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
+    if not tickers:
+        return jsonify({'error': 'tickers param required'}), 400
+
+    ALPACA_KEY = os.environ.get('ALPACA_KEY', '')
+    ALPACA_SEC = os.environ.get('ALPACA_SECRET', '')
+    ALPACA_BASE = 'https://paper-api.alpaca.markets'
+
+    def generate():
+        max_iterations = 60  # 60 × interval = 3 min max stream
+        for _ in range(max_iterations):
+            try:
+                resp = requests.get(
+                    f'{ALPACA_BASE}/v2/stocks/snapshots',
+                    params={'symbols': ','.join(tickers), 'feed': 'iex'},
+                    headers={
+                        'APCA-API-KEY-ID':     ALPACA_KEY,
+                        'APCA-API-SECRET-KEY': ALPACA_SEC,
+                    },
+                    timeout=5,
+                )
+                if resp.status_code == 200:
+                    snaps = resp.json()
+                    prices = {}
+                    for ticker in tickers:
+                        snap = snaps.get(ticker, {})
+                        lq = snap.get('latestQuote', {})
+                        lt = snap.get('latestTrade', {})
+                        prev = snap.get('prevDailyBar', {})
+                        price = float(lt.get('p', 0) or lq.get('ap', 0) or 0)
+                        prev_c = float(prev.get('c', 0) or 0)
+                        chg_pct = ((price - prev_c) / prev_c * 100) if prev_c else 0
+                        prices[ticker] = {
+                            'price':    round(price, 2),
+                            'change':   round(price - prev_c, 2),
+                            'chg_pct':  round(chg_pct, 2),
+                            'bid':      round(float(lq.get('bp', 0) or 0), 2),
+                            'ask':      round(float(lq.get('ap', 0) or 0), 2),
+                        }
+                    yield f'data: {_json.dumps(prices)}\n\n'
+                else:
+                    yield f'data: {{"error": "{resp.status_code}"}}\n\n'
+            except Exception as ex:
+                yield f'data: {{"error": "{str(ex)[:60]}"}}\n\n'
+            _time.sleep(interval)
+        yield 'data: {"done": true}\n\n'
+
+    return Response(
+        stream_with_context(generate()),
+        content_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
 # ─── Cache warm-up helper (called from _startup) ──────────────────
 
 def warm_redis_cache():
