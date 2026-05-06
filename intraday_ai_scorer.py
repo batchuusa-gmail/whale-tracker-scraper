@@ -23,8 +23,8 @@ import requests
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_KEY     = os.environ.get('ANTHROPIC_API_KEY', '')
-MIN_SCANNER_SCORE = 60        # only score stocks above this
-MIN_CONFIDENCE    = 0.70      # raised from 0.65 → only high-conviction trades
+MIN_SCANNER_SCORE = 50        # aligned with AUTO_TRADE_MIN_SCORE in scanner
+MIN_CONFIDENCE    = 0.60      # lowered — limited bar data caps realistic confidence at ~70%
 MAX_CALLS_PER_MIN = 10        # rate limit
 MAX_TOKENS_DAY    = 500_000   # ~$5/day at Haiku pricing
 

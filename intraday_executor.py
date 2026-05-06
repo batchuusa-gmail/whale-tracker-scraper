@@ -95,16 +95,12 @@ def _latest_price(ticker: str) -> float | None:
     return None
 
 
-# ── FCM push helper ──────────────────────────────────────────────
-
-_FCM_PROJECT = os.environ.get('FIREBASE_PROJECT_ID', 'whale-tracker-8c734')
-_FCM_KEY     = os.environ.get('FIREBASE_SERVER_KEY', '')   # Legacy HTTP v1 key or FCM v1 service account JSON
+# ── FCM push helper (FCM v1 API via firebase_push.py) ────────────
 
 def _send_fcm_to_all(title: str, body: str, data: dict | None = None):
-    """Send FCM push notification to all stored device tokens (Legacy HTTP API)."""
-    if not _FCM_KEY:
-        return  # FCM key not configured — skip silently
+    """Send FCM push to all stored device tokens using FCM v1 API."""
     try:
+        from firebase_push import send_to_tokens
         # Fetch all FCM tokens from Supabase user_devices
         r = requests.get(
             f'{os.environ.get("SUPABASE_URL", "https://bedurjtazsfbnkisoeee.supabase.co")}'
@@ -118,22 +114,10 @@ def _send_fcm_to_all(title: str, body: str, data: dict | None = None):
         tokens = [row.get('fcm_token') for row in (r.json() if r.status_code == 200 else [])
                   if row.get('fcm_token')]
         if not tokens:
+            logger.info('FCM: no device tokens found')
             return
-        payload = {
-            'registration_ids': tokens[:500],
-            'notification': {'title': title, 'body': body, 'sound': 'default'},
-            'data': data or {},
-            'priority': 'high',
-        }
-        requests.post(
-            'https://fcm.googleapis.com/fcm/send',
-            headers={
-                'Authorization': f'key={_FCM_KEY}',
-                'Content-Type': 'application/json',
-            },
-            json=payload, timeout=10,
-        )
-        logger.info(f'FCM sent to {len(tokens)} devices: {title}')
+        sent = send_to_tokens(tokens, title, body, data or {})
+        logger.info(f'FCM sent to {sent}/{len(tokens)} devices: {title}')
     except Exception as e:
         logger.warning(f'FCM send error: {e}')
 
@@ -337,8 +321,8 @@ def _check_positions():
         return
 
     # Load trade records for stop/target/entry_time
-    today = datetime.now(_ET).strftime('%Y-%m-%d')
-    trades = _supa_get('intraday_trades', f'date=eq.{today}&status=neq.closed')
+    # Query by status only — date field unreliable (may be null on older rows)
+    trades = _supa_get('intraday_trades', 'status=neq.closed&order=entry_time.desc&limit=100')
     trade_map = {r.get('ticker', ''): r for r in trades}
 
     for pos in positions:
@@ -478,8 +462,7 @@ def force_close_all() -> dict:
     closed = []
     errors = []
 
-    today = datetime.now(_ET).strftime('%Y-%m-%d')
-    trades = _supa_get('intraday_trades', f'date=eq.{today}&status=neq.closed')
+    trades = _supa_get('intraday_trades', 'status=neq.closed&order=entry_time.desc&limit=100')
     trade_map = {r.get('ticker', ''): r for r in trades}
 
     if isinstance(positions, list):
@@ -593,9 +576,13 @@ def get_open_positions() -> list:
     trades = _supa_get('intraday_trades', f'date=eq.{today}&status=neq.closed')
     trade_map = {r.get('ticker', ''): r for r in trades}
 
+    _CRYPTO_SUFFIXES = ('USD', 'USDT', 'USDC', 'BTC', 'ETH')
     result = []
     for p in positions:
         ticker      = p.get('symbol', '')
+        # Skip crypto positions — they belong to crypto_executor / /api/crypto/positions
+        if any(ticker.endswith(s) for s in _CRYPTO_SUFFIXES) and len(ticker) > 4:
+            continue
         entry       = float(p.get('avg_entry_price') or 0)
         cur         = float(p.get('current_price') or 0)
         qty         = float(p.get('qty') or 0)

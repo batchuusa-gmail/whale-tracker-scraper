@@ -1657,6 +1657,13 @@ try:
 except Exception as _ae_err:
     import logging as _lg; _lg.getLogger(__name__).warning(f'algo_engine routes: {_ae_err}')
 
+# Options engine routes
+try:
+    from options_engine.scanner import register_routes as _register_options_routes
+    _register_options_routes(app)
+except Exception as _oe_err:
+    import logging as _lg; _lg.getLogger(__name__).warning(f'options_engine routes: {_oe_err}')
+
 # ── Startup: load cache from Supabase + run scheduler in background ──
 def _startup():
     global _filings_cache, _last_updated
@@ -1688,6 +1695,14 @@ def _startup():
     schedule.every().day.at("21:05").do(_run_daily_cron)
     # Reddit bulk scraper — every 4 hours
     schedule.every(4).hours.do(_scrape_reddit_bulk)
+    # APEX-78: Signal history — persist scanner scores every 30 min
+    schedule.every(30).minutes.do(_persist_signal_history)
+    # APEX-79: Morning briefing push at 13:30 UTC (9:30 AM EDT / market open)
+    schedule.every().day.at("13:30").do(_generate_morning_briefing)
+    # APEX-81: Price alerts — check every 5 min
+    schedule.every(5).minutes.do(_check_price_alerts)
+    # APEX-82: Drawdown circuit breaker — check every 5 min
+    schedule.every(5).minutes.do(_check_drawdown_circuit_breaker)
     logger.info("Scheduler started — daily cron registered at 21:05 UTC")
 
     # Run Reddit scraper on startup (in background thread already)
@@ -1770,6 +1785,24 @@ def _start_background_services():
         _ae.start()
     except Exception as e:
         logger.warning(f'Algo engine failed to start: {e}')
+    # Crypto algo engine — executor monitor + scanner (24/7)
+    try:
+        from crypto_executor import start as _start_crypto_executor
+        _start_crypto_executor()
+    except Exception as e:
+        logger.warning(f'Crypto executor failed to start: {e}')
+    try:
+        from crypto_scanner import start as _start_crypto_scanner
+        _start_crypto_scanner(redis_set, redis_get)
+    except Exception as e:
+        logger.warning(f'Crypto scanner failed to start: {e}')
+
+    # Options engine — income + growth scanner (market hours)
+    try:
+        from options_engine.scanner import start as _start_options_scanner
+        _start_options_scanner()
+    except Exception as e:
+        logger.warning(f'Options scanner failed to start: {e}')
 
 threading.Thread(target=_start_background_services, daemon=True, name='svc-starter').start()
 
@@ -4264,6 +4297,24 @@ def intraday_trades_today():
         return jsonify({'trades': trades, 'count': len(trades)})
     except Exception as e:
         logger.error(f'intraday/trades/today error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/intraday/journal')
+def intraday_journal():
+    """WHAL-160: Full trade journal — all trades with all fields for the Trade Journal screen."""
+    try:
+        from intraday_executor import _supa_get
+        limit = int(request.args.get('limit', 200))
+        rows = _supa_get(
+            'intraday_trades',
+            f'select=id,ticker,side,pnl,pnl_pct,confidence,exit_reason,'
+            f'entry_time,date,status,entry_price,exit_price,qty,ai_reasoning'
+            f'&order=entry_time.desc&limit={limit}'
+        ) or []
+        return jsonify({'trades': rows, 'count': len(rows)})
+    except Exception as e:
+        logger.error(f'intraday/journal error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
@@ -7594,17 +7645,35 @@ def _generate_morning_briefing() -> dict:
         'generated_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z',
     }
 
-    # Send FCM push to registered devices
+    # Options expiring this week
+    expiring_soon = []
     try:
-        from firebase_push import send_to_all_devices
-        send_to_all_devices(
-            title='🌅 Morning Briefing',
-            body=summary[:120],
-            data={'type': 'morning_briefing', 'date': today},
-            supabase=_supabase,
+        from datetime import timedelta
+        week_end = (__import__('datetime').date.today() + timedelta(days=7)).isoformat()
+        r_exp = requests.get(
+            f'{SUPABASE_URL}/rest/v1/options_paper_trades'
+            f'?status=eq.open&expiry=lte.{week_end}&select=ticker,option_type,strike,expiry,dte',
+            headers={'apikey': _SUPA_PT_KEY, 'Authorization': f'Bearer {_SUPA_PT_KEY}'},
+            timeout=10,
         )
-    except Exception as e:
-        logger.debug(f'FCM push skipped: {e}')
+        if r_exp.ok:
+            expiring_soon = r_exp.json() or []
+    except Exception:
+        pass
+
+    if expiring_soon:
+        exp_text = ', '.join(f"{t.get('ticker')} {t.get('option_type','').upper()} ${t.get('strike','')}" for t in expiring_soon[:3])
+        summary += f" ⚠️ Options expiring soon: {exp_text}."
+
+    briefing['expiring_soon'] = expiring_soon
+
+    # Send FCM push to all devices via raw requests (no _supabase client needed)
+    _fcm_push_all(
+        title='🌅 Morning Briefing',
+        body=summary[:140],
+        data={'type': 'morning_briefing', 'date': today},
+    )
+    logger.info(f'Morning briefing sent: {summary[:80]}')
 
     return briefing
 
@@ -7803,6 +7872,813 @@ def warm_redis_cache():
         logger.info('Redis warm: api:filings')
     except Exception as e:
         logger.warning(f'Redis warm error: {e}')
+
+
+# ── ApexTrader Mobile App Routes ─────────────────────────────────────────────
+# New routes required by the Flutter app. Added here — never modifying existing routes.
+
+@app.route('/api/intraday/stats')
+def intraday_stats():
+    """GET daily + all-time stats summary for the Dashboard screen."""
+    try:
+        from intraday_executor import _supa_get
+        import pytz as _pytz
+        _et = _pytz.timezone('America/New_York')
+        today = datetime.now(_et).strftime('%Y-%m-%d')
+
+        rows = _supa_get(
+            'intraday_trades',
+            'select=pnl,date,status&status=eq.closed&order=date.desc&limit=2000'
+        ) or []
+
+        pnls = [float(r.get('pnl') or 0) for r in rows]
+        today_pnls = [float(r.get('pnl') or 0) for r in rows if (r.get('date') or '')[:10] == today]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+
+        return jsonify({
+            'total_trades': len(pnls),
+            'wins': len(wins),
+            'losses': len(losses),
+            'win_rate': round(len(wins) / len(pnls) * 100, 1) if pnls else 0,
+            'total_pnl': round(sum(pnls), 2),
+            'today_pnl': round(sum(today_pnls), 2),
+            'today_trades': len(today_pnls),
+            'avg_win': round(sum(wins) / len(wins), 2) if wins else 0,
+            'avg_loss': round(sum(losses) / len(losses), 2) if losses else 0,
+            'profit_factor': round((sum(wins) / abs(sum(losses))), 2) if losses and sum(losses) != 0 else 0,
+        })
+    except Exception as e:
+        logger.error(f'intraday/stats error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+
+@app.route('/api/risk/status')
+def api_risk_status():
+    """GET risk dashboard — alias used by ApexTrader mobile app."""
+    try:
+        # Reuse the same logic as /api/risk/dashboard
+        with app.test_request_context('/api/risk/dashboard'):
+            resp = api_risk_dashboard()
+        return resp
+    except Exception as e:
+        logger.error(f'risk/status error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/intraday/close-all', methods=['POST'])
+def intraday_close_all_alias():
+    """POST — kill switch alias (mobile app uses dash, backend uses slash)."""
+    try:
+        from intraday_executor import force_close_all
+        result = force_close_all()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'intraday/close-all error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Crypto routes — powered by crypto_scanner.py + crypto_executor.py ─────────
+
+@app.route('/api/crypto/positions')
+def crypto_positions():
+    """GET open crypto positions from Supabase crypto_trades table."""
+    try:
+        from crypto_executor import _supa_get
+        rows = _supa_get('crypto_trades', 'status=eq.open&order=entry_time.desc&limit=50') or []
+        return jsonify({'positions': rows, 'count': len(rows), 'status': 'ok'})
+    except Exception as e:
+        logger.warning(f'crypto/positions error: {e}')
+        return jsonify({'positions': [], 'count': 0, 'status': 'error', 'error': str(e)})
+
+
+@app.route('/api/crypto/journal')
+def crypto_journal():
+    """GET crypto trade journal from Supabase."""
+    try:
+        from crypto_executor import _supa_get
+        limit = min(int(request.args.get('limit', 200)), 500)
+        rows  = _supa_get('crypto_trades', f'order=entry_time.desc&limit={limit}') or []
+        return jsonify({'trades': rows, 'count': len(rows), 'status': 'ok'})
+    except Exception as e:
+        logger.warning(f'crypto/journal error: {e}')
+        return jsonify({'trades': [], 'count': 0, 'status': 'error', 'error': str(e)})
+
+
+@app.route('/api/crypto/algo/status')
+def crypto_algo_status():
+    """GET crypto algo engine + scanner status."""
+    try:
+        from crypto_executor import get_status as _exec_status
+        from crypto_scanner  import get_status as _scan_status
+        exec_st = _exec_status()
+        scan_st = _scan_status()
+        return jsonify({
+            'running':        exec_st.get('running', False),
+            'circuit_breaker': exec_st.get('circuit_open', False),
+            'circuit_reason': exec_st.get('circuit_reason', ''),
+            'trades_today':   exec_st.get('trades_today', 0),
+            'pnl_today':      exec_st.get('pnl_today', 0.0),
+            'last_scan':      scan_st.get('last_scan'),
+            'scan_count':     scan_st.get('scan_count', 0),
+            'signals_today':  scan_st.get('signals_today', 0),
+            'top_picks':      scan_st.get('top_picks', []),
+            'market_open':    True,
+            'mode':           'paper',
+            'status':         'ok',
+        })
+    except Exception as e:
+        logger.warning(f'crypto/algo/status error: {e}')
+        return jsonify({'running': False, 'status': 'error', 'error': str(e)})
+
+
+@app.route('/api/crypto/algo/config', methods=['GET', 'POST'])
+def crypto_algo_config():
+    """GET/POST crypto scanner configuration."""
+    try:
+        from crypto_scanner import get_config, update_config
+        if request.method == 'POST':
+            body = request.get_json(force=True) or {}
+            update_config(body, redis_set)
+            return jsonify({'status': 'updated'})
+        return jsonify({**get_config(redis_get), 'status': 'ok'})
+    except Exception as e:
+        logger.warning(f'crypto/algo/config error: {e}')
+        return jsonify({
+            'min_confidence': 0.68,
+            'max_trades_per_day': 4,
+            'position_size_pct': 0.05,
+            'stop_loss_pct': 0.03,
+            'take_profit_pct': 0.06,
+            'enabled_coins': ['BTC/USD', 'ETH/USD', 'SOL/USD', 'DOGE/USD'],
+            'status': 'error',
+            'error': str(e),
+        })
+
+
+@app.route('/api/crypto/order', methods=['POST'])
+def crypto_order():
+    """POST — place a manual crypto order."""
+    try:
+        from crypto_executor import place_crypto_order, _get_latest_price
+        body   = request.get_json(force=True) or {}
+        ticker = (body.get('ticker') or body.get('symbol') or '').upper().replace('/', '')
+        side   = (body.get('side') or 'BUY').upper()
+        qty    = body.get('qty')
+
+        if not ticker:
+            return jsonify({'error': 'ticker required'}), 400
+
+        price = _get_latest_price(ticker) or 0
+        result = place_crypto_order({
+            'ticker':            ticker,
+            'symbol':            ticker[:3] + '/' + ticker[3:] if len(ticker) == 6 else ticker,
+            'signal':            side,
+            'entry':             price,
+            'confidence':        body.get('confidence', 0.75),
+            'score':             body.get('score', 70),
+            'position_size_pct': body.get('position_size_pct', 0.05),
+            'stop_loss_pct':     body.get('stop_loss_pct', 0.03),
+            'take_profit_pct':   body.get('take_profit_pct', 0.06),
+            'reasoning':         body.get('reasoning', 'Manual order from ApexTrader'),
+        })
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'crypto/order error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/crypto/close-all', methods=['POST'])
+def crypto_close_all():
+    """POST — emergency close all open crypto positions."""
+    try:
+        from crypto_executor import force_close_all
+        result = force_close_all()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f'crypto/close-all error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/crypto/circuit/reset', methods=['POST'])
+def crypto_circuit_reset():
+    """POST — reset crypto circuit breaker."""
+    try:
+        from crypto_executor import reset_circuit
+        reset_circuit()
+        return jsonify({'status': 'reset'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/setup-crypto-table')
+def admin_setup_crypto_table():
+    """GET — returns the SQL needed to create crypto_trades table in Supabase.
+    Copy the sql field and run it in Supabase SQL Editor:
+    https://supabase.com/dashboard/project/bedurjtazsfbnkisoeee/sql/new
+    """
+    sql = """
+CREATE TABLE IF NOT EXISTS crypto_trades (
+    id            BIGSERIAL    PRIMARY KEY,
+    order_id      TEXT         UNIQUE NOT NULL,
+    ticker        TEXT         NOT NULL,
+    symbol        TEXT,
+    side          TEXT         NOT NULL DEFAULT 'BUY',
+    qty           NUMERIC      NOT NULL,
+    entry_price   NUMERIC      NOT NULL,
+    exit_price    NUMERIC,
+    stop_loss     NUMERIC,
+    target_1      NUMERIC,
+    target_2      NUMERIC,
+    pnl           NUMERIC,
+    pnl_pct       NUMERIC,
+    confidence    NUMERIC,
+    score         INTEGER,
+    ai_reasoning  TEXT,
+    status        TEXT         NOT NULL DEFAULT 'open',
+    partial_sold  BOOLEAN      NOT NULL DEFAULT false,
+    exit_reason   TEXT,
+    entry_time    TIMESTAMPTZ,
+    exit_time     TIMESTAMPTZ,
+    date          DATE,
+    asset_class   TEXT         NOT NULL DEFAULT 'crypto',
+    created_at    TIMESTAMPTZ  DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS crypto_trades_date_idx   ON crypto_trades(date);
+CREATE INDEX IF NOT EXISTS crypto_trades_status_idx ON crypto_trades(status);
+CREATE INDEX IF NOT EXISTS crypto_trades_ticker_idx ON crypto_trades(ticker);
+""".strip()
+    # Test if table already exists
+    try:
+        from crypto_executor import _supa_get
+        _supa_get('crypto_trades', 'limit=1')
+        table_exists = True
+    except Exception:
+        table_exists = False
+
+    return jsonify({
+        'table_exists': table_exists,
+        'sql': sql,
+        'instructions': 'If table_exists is false, copy the sql field and run it at https://supabase.com/dashboard/project/bedurjtazsfbnkisoeee/sql/new',
+    })
+
+
+# ── Backtest run — simulates strategy against closed trades ──────────────────
+
+@app.route('/api/backtest/run', methods=['POST'])
+def backtest_run():
+    """POST — run strategy backtest against historical intraday trades.
+
+    Body JSON:
+      ticker          : str   — filter by ticker ('all' or empty = all tickers)
+      start_date      : str   — YYYY-MM-DD (default: 90 days ago)
+      end_date        : str   — YYYY-MM-DD (default: today)
+      stop_loss_pct   : float — e.g. 0.05 (5%)
+      take_profit_pct : float — e.g. 0.10 (10%)
+      min_confidence  : float — e.g. 0.70
+    """
+    try:
+        from intraday_executor import _supa_get
+        import pytz as _pytz
+
+        body = request.get_json(force=True) or {}
+        ticker_filter   = (body.get('ticker') or 'all').upper().strip()
+        stop_loss_pct   = float(body.get('stop_loss_pct') or 0.08)
+        take_profit_pct = float(body.get('take_profit_pct') or 0.15)
+        min_conf        = float(body.get('min_confidence') or 0.0)
+
+        et = _pytz.timezone('America/New_York')
+        today_str = datetime.now(et).strftime('%Y-%m-%d')
+        default_start = (datetime.now(et) - timedelta(days=90)).strftime('%Y-%m-%d')
+        start_date = body.get('start_date') or default_start
+        end_date   = body.get('end_date') or today_str
+
+        # Pull relevant closed trades from Supabase
+        query = (
+            f'select=id,ticker,side,entry_price,exit_price,pnl,confidence,exit_reason,date,entry_time'
+            f'&status=eq.closed'
+            f'&date=gte.{start_date}&date=lte.{end_date}'
+            f'&order=entry_time.asc&limit=2000'
+        )
+        if ticker_filter and ticker_filter != 'ALL':
+            query += f'&ticker=eq.{ticker_filter}'
+
+        rows = _supa_get('intraday_trades', query) or []
+
+        # Apply confidence filter and re-simulate P&L with new SL/TP
+        equity = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        curve = []
+        wins_list = []
+        losses_list = []
+
+        for i, r in enumerate(rows):
+            conf = float(r.get('confidence') or 0)
+            if conf < min_conf:
+                continue
+
+            entry = float(r.get('entry_price') or 0)
+            if entry <= 0:
+                # No price data — use original P&L
+                pnl = float(r.get('pnl') or 0)
+            else:
+                # Re-simulate: did original exit hit our new SL/TP?
+                orig_exit = float(r.get('exit_price') or entry)
+                orig_reason = r.get('exit_reason') or ''
+                move_pct = (orig_exit - entry) / entry if entry > 0 else 0
+
+                if move_pct >= take_profit_pct:
+                    # Would have hit take profit
+                    sim_exit = entry * (1 + take_profit_pct)
+                elif move_pct <= -stop_loss_pct:
+                    # Would have hit stop loss
+                    sim_exit = entry * (1 - stop_loss_pct)
+                elif 'stop' in orig_reason.lower():
+                    sim_exit = entry * (1 - stop_loss_pct)
+                elif 'target' in orig_reason.lower() or 'tp' in orig_reason.lower():
+                    sim_exit = entry * (1 + take_profit_pct)
+                else:
+                    sim_exit = orig_exit
+
+                qty = abs(float(r.get('qty') or 1))
+                side = (r.get('side') or 'BUY').upper()
+                if side == 'BUY':
+                    pnl = (sim_exit - entry) * qty
+                else:
+                    pnl = (entry - sim_exit) * qty
+
+            equity += pnl
+            if equity > peak:
+                peak = equity
+            dd = peak - equity
+            if dd > max_dd:
+                max_dd = dd
+
+            curve.append({'n': len(curve) + 1, 'cumulative': round(equity, 2), 'pnl': round(pnl, 2), 'ticker': r.get('ticker', '')})
+            if pnl > 0:
+                wins_list.append(pnl)
+            else:
+                losses_list.append(pnl)
+
+        total = len(curve)
+        win_rate = round(len(wins_list) / total * 100, 1) if total else 0
+        avg_win  = round(sum(wins_list) / len(wins_list), 2) if wins_list else 0
+        avg_loss = round(sum(losses_list) / len(losses_list), 2) if losses_list else 0
+        profit_factor = round(sum(wins_list) / abs(sum(losses_list)), 2) if losses_list and sum(losses_list) != 0 else 0
+        rr = round(take_profit_pct / stop_loss_pct, 2) if stop_loss_pct > 0 else 0
+
+        return jsonify({
+            'total_trades':   total,
+            'wins':           len(wins_list),
+            'losses':         len(losses_list),
+            'win_rate':       win_rate,
+            'total_pnl':      round(equity, 2),
+            'avg_win':        avg_win,
+            'avg_loss':       avg_loss,
+            'profit_factor':  profit_factor,
+            'max_drawdown':   round(max_dd, 2),
+            'risk_reward':    rr,
+            'equity_curve':   curve,
+            'params': {
+                'ticker': ticker_filter,
+                'start_date': start_date,
+                'end_date': end_date,
+                'stop_loss_pct': stop_loss_pct,
+                'take_profit_pct': take_profit_pct,
+                'min_confidence': min_conf,
+            },
+        })
+    except Exception as e:
+        logger.error(f'backtest/run error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── APEX-77: Options Paper Trade Journal ─────────────────────────────────────
+
+_SUPA_PT_URL = f"{os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')}/rest/v1/options_paper_trades"
+_SUPA_PT_KEY = os.getenv('SUPABASE_SERVICE_KEY', os.getenv('SUPABASE_KEY', ''))
+
+
+def _supa_headers(prefer: str = 'return=representation') -> dict:
+    return {
+        'apikey':        _SUPA_PT_KEY,
+        'Authorization': f'Bearer {_SUPA_PT_KEY}',
+        'Content-Type':  'application/json',
+        'Prefer':        prefer,
+    }
+
+
+def _fcm_push_all(title: str, body: str, data: dict = None) -> int:
+    """Send FCM push to all registered devices using raw Supabase requests (no _supabase client)."""
+    try:
+        from firebase_push import send_to_tokens
+        key = os.getenv('SUPABASE_SERVICE_KEY', os.getenv('SUPABASE_KEY', ''))
+        hdrs = {'apikey': key, 'Authorization': f'Bearer {key}'}
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/user_devices?select=fcm_token',
+            headers=hdrs, timeout=10,
+        )
+        tokens = [row['fcm_token'] for row in (r.json() if r.ok else []) if row.get('fcm_token')]
+        if not tokens:
+            return 0
+        return send_to_tokens(tokens, title, body, data or {})
+    except Exception as e:
+        logger.warning(f'_fcm_push_all error: {e}')
+        return 0
+
+
+@app.route('/api/options/paper-trade', methods=['POST'])
+def options_paper_trade_open():
+    """
+    POST {ticker, strategy, direction, option_type, strike, expiry, dte,
+          premium, delta, pop, iv_rank, stock_price, max_risk, max_loss, contracts}
+    Opens a new paper trade and saves to options_paper_trades Supabase table.
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        required = ['ticker', 'strategy', 'option_type', 'strike', 'expiry', 'premium']
+        missing = [f for f in required if not body.get(f)]
+        if missing:
+            return jsonify({'error': f'missing fields: {missing}'}), 400
+
+        row = {
+            'ticker':            body['ticker'].upper(),
+            'strategy':          body.get('strategy', 'INCOME'),
+            'direction':         body.get('direction', 'short'),
+            'option_type':       body.get('option_type', 'PUT'),
+            'strike':            float(body['strike']),
+            'expiry':            body['expiry'],
+            'dte_at_entry':      int(body.get('dte', 0)),
+            'premium_entry':     float(body['premium']),
+            'delta':             float(body.get('delta', 0)),
+            'pop':               float(body.get('pop', 0)),
+            'iv_rank':           int(body.get('iv_rank_proxy', body.get('iv_rank', 0))),
+            'stock_price_entry': float(body.get('stock_price', 0)),
+            'max_risk':          float(body.get('max_risk', 0)),
+            'max_loss':          float(body.get('max_loss', 0)),
+            'contracts':         int(body.get('contracts', 1)),
+            'status':            'open',
+            'earnings_risk':     bool(body.get('earnings_risk', False)),
+        }
+        r = requests.post(_SUPA_PT_URL, headers=_supa_headers(), json=row, timeout=10)
+        trade = r.json()[0] if r.ok and r.json() else row
+        return jsonify({'status': 'ok', 'trade': trade})
+    except Exception as e:
+        logger.error(f'options/paper-trade open error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/options/paper-trades', methods=['GET'])
+def options_paper_trades_list():
+    """GET ?status=open|closed|all  — list paper trades."""
+    try:
+        status_filter = request.args.get('status', 'all')
+        params = {'order': 'opened_at.desc', 'limit': '100'}
+        if status_filter in ('open', 'closed'):
+            params['status'] = f'eq.{status_filter}'
+        r = requests.get(_SUPA_PT_URL, headers=_supa_headers('return=representation'), params=params, timeout=10)
+        trades = r.json() if r.ok else []
+        return jsonify({'status': 'ok', 'count': len(trades), 'trades': trades})
+    except Exception as e:
+        logger.error(f'options/paper-trades list error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/options/paper-trade/<trade_id>/close', methods=['POST'])
+def options_paper_trade_close(trade_id):
+    """
+    POST {exit_premium}  — close a paper trade and calculate P&L.
+    Income (short put): P&L = (entry - exit) * 100 * contracts
+    Growth (long call/put): P&L = (exit - entry) * 100 * contracts
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        exit_premium = float(body.get('exit_premium', 0))
+
+        r = requests.get(_SUPA_PT_URL, headers=_supa_headers(),
+                         params={'id': f'eq.{trade_id}', 'limit': '1'}, timeout=10)
+        rows = r.json() if r.ok else []
+        if not rows:
+            return jsonify({'error': 'trade not found'}), 404
+        trade = rows[0]
+
+        entry     = float(trade.get('premium_entry', 0))
+        contracts = int(trade.get('contracts', 1))
+        strategy  = trade.get('strategy', 'INCOME')
+
+        pnl = (entry - exit_premium) * 100 * contracts if strategy == 'INCOME' \
+              else (exit_premium - entry) * 100 * contracts
+
+        cost_basis = (float(trade.get('max_risk', entry)) if strategy == 'INCOME' else entry) * 100 * contracts
+        pnl_pct = round(pnl / cost_basis * 100, 2) if cost_basis > 0 else 0
+
+        update = {
+            'status':       'closed',
+            'premium_exit': exit_premium,
+            'pnl':          round(pnl, 2),
+            'pnl_pct':      pnl_pct,
+            'closed_at':    datetime.now(timezone.utc).isoformat(),
+        }
+        requests.patch(f'{_SUPA_PT_URL}?id=eq.{trade_id}',
+                       headers=_supa_headers('return=minimal'), json=update, timeout=10)
+        return jsonify({'status': 'ok', 'pnl': round(pnl, 2), 'pnl_pct': pnl_pct})
+    except Exception as e:
+        logger.error(f'options/paper-trade close error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── APEX-78: Signal History Persistence ──────────────────────────────────────
+
+_SUPA_SH_URL = f"{os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')}/rest/v1/signal_history"
+
+
+def _persist_signal_history():
+    """Write top scanner scores to signal_history table. Runs every 30 min."""
+    try:
+        supa_key = os.getenv('SUPABASE_SERVICE_KEY', os.getenv('SUPABASE_KEY', ''))
+        if not supa_key:
+            return
+        headers = {
+            'apikey': supa_key,
+            'Authorization': f'Bearer {supa_key}',
+            'Content-Type': 'application/json',
+            'Prefer': 'resolution=ignore-duplicates,return=minimal',
+        }
+        rows = []
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Stock scanner top picks
+        try:
+            from intraday_scanner import get_state as stock_state
+            st = stock_state()
+            for p in (st.get('top_picks') or [])[:20]:
+                if p.get('ticker') and p.get('score') is not None:
+                    rows.append({
+                        'ticker':     p['ticker'],
+                        'score':      int(p['score']),
+                        'confidence': float(p.get('confidence', 0)),
+                        'direction':  p.get('signal', p.get('direction', 'neutral')),
+                        'asset_type': 'stock',
+                        'scanned_at': now,
+                    })
+        except Exception as e:
+            logger.debug(f'signal_history: stock state error: {e}')
+
+        # Crypto scanner top picks
+        try:
+            from crypto_scanner import get_status as crypto_status
+            cs = crypto_status()
+            for p in (cs.get('top_picks') or [])[:10]:
+                if p.get('symbol') and p.get('score') is not None:
+                    rows.append({
+                        'ticker':     p['symbol'],
+                        'score':      int(p['score']),
+                        'confidence': float(p.get('confidence', 0)),
+                        'direction':  p.get('signal', 'neutral'),
+                        'asset_type': 'crypto',
+                        'scanned_at': now,
+                    })
+        except Exception as e:
+            logger.debug(f'signal_history: crypto state error: {e}')
+
+        if rows:
+            requests.post(_SUPA_SH_URL, headers=headers, json=rows, timeout=10)
+            logger.info(f'signal_history: persisted {len(rows)} rows')
+
+    except Exception as e:
+        logger.warning(f'signal_history persist error: {e}')
+
+
+@app.route('/api/signals/history')
+def api_signals_history():
+    """
+    GET ?ticker=AAPL&asset_type=stock&limit=100
+    Returns signal score history for charting on Pulse screen.
+    """
+    try:
+        supa_key = os.getenv('SUPABASE_SERVICE_KEY', os.getenv('SUPABASE_KEY', ''))
+        headers  = {'apikey': supa_key, 'Authorization': f'Bearer {supa_key}'}
+        params   = {
+            'order': 'scanned_at.desc',
+            'limit': request.args.get('limit', '200'),
+        }
+        ticker     = request.args.get('ticker', '').upper()
+        asset_type = request.args.get('asset_type', '')
+        if ticker:
+            params['ticker'] = f'eq.{ticker}'
+        if asset_type:
+            params['asset_type'] = f'eq.{asset_type}'
+
+        r = requests.get(_SUPA_SH_URL, headers=headers, params=params, timeout=10)
+        rows = r.json() if r.ok else []
+        return jsonify({'status': 'ok', 'count': len(rows), 'history': rows})
+    except Exception as e:
+        logger.error(f'signals/history error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ── APEX-82: Drawdown Circuit Breaker ─────────────────────────────────────────
+
+_circuit_breaker_fired_date: str = ''  # tracks which date the breaker last fired
+
+
+def _check_drawdown_circuit_breaker():
+    """
+    If today's realized P&L drops below the configured drawdown limit,
+    auto-pause the intraday algo and send an FCM alert.
+    Runs every 5 min. Will not re-fire if already triggered today.
+    """
+    global _circuit_breaker_fired_date
+    try:
+        from datetime import date as _date
+        today = _date.today().isoformat()
+
+        # Only fire once per day
+        if _circuit_breaker_fired_date == today:
+            return
+
+        # Read today's closed trade P&L from Supabase
+        url = (f'{SUPABASE_URL}/rest/v1/intraday_trades'
+               f'?date=eq.{today}&status=eq.closed&select=pnl')
+        r = requests.get(url, headers=SUPABASE_HEADERS, timeout=10)
+        if not r.ok:
+            return
+        rows = r.json() or []
+        today_pnl = sum(float(row.get('pnl') or 0) for row in rows)
+
+        # Threshold: configurable via env, default -$500
+        threshold = float(os.environ.get('DRAWDOWN_LIMIT', '-500'))
+
+        if today_pnl > threshold:
+            return  # still within limits
+
+        # Pause the algo
+        os.environ['INTRADAY_TRADING_ENABLED'] = 'false'
+        _circuit_breaker_fired_date = today
+
+        # Send push alert
+        _fcm_push_all(
+            title='🛑 Circuit Breaker Triggered',
+            body=f'Daily loss ${today_pnl:+.2f} hit limit ${threshold:.0f}. Algo paused for today.',
+            data={'type': 'circuit_breaker', 'today_pnl': str(today_pnl), 'threshold': str(threshold)},
+        )
+        logger.warning(f'circuit_breaker: fired — today_pnl={today_pnl:.2f} threshold={threshold}')
+
+    except Exception as e:
+        logger.warning(f'circuit_breaker check error: {e}')
+
+
+@app.route('/api/risk/circuit-breaker', methods=['GET'])
+def api_circuit_breaker_status():
+    """Return current circuit breaker state."""
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    algo_paused = os.environ.get('INTRADAY_TRADING_ENABLED', 'true').lower() != 'true'
+    threshold = float(os.environ.get('DRAWDOWN_LIMIT', '-500'))
+    return jsonify({
+        'status': 'ok',
+        'algo_paused': algo_paused,
+        'fired_today': _circuit_breaker_fired_date == today,
+        'drawdown_limit': threshold,
+    })
+
+
+@app.route('/api/risk/circuit-breaker/reset', methods=['POST'])
+def api_circuit_breaker_reset():
+    """Manually reset the circuit breaker and re-enable algo."""
+    global _circuit_breaker_fired_date
+    _circuit_breaker_fired_date = ''
+    os.environ['INTRADAY_TRADING_ENABLED'] = 'true'
+    logger.info('circuit_breaker: manually reset by API')
+    return jsonify({'status': 'reset', 'algo_enabled': True})
+
+
+# ── APEX-81: Price Alerts ──────────────────────────────────────────────────────
+
+_SUPA_ALERTS_URL = f"{SUPABASE_URL}/rest/v1/price_alerts"
+
+
+def _alerts_headers(prefer: str = 'return=representation') -> dict:
+    key = os.getenv('SUPABASE_SERVICE_KEY', os.getenv('SUPABASE_KEY', ''))
+    return {
+        'apikey':        key,
+        'Authorization': f'Bearer {key}',
+        'Content-Type':  'application/json',
+        'Prefer':        prefer,
+    }
+
+
+@app.route('/api/alerts', methods=['GET'])
+def api_alerts_list():
+    """List all active price alerts."""
+    try:
+        r = requests.get(
+            f'{_SUPA_ALERTS_URL}?triggered=eq.false&order=created_at.desc',
+            headers=_alerts_headers(), timeout=10,
+        )
+        return jsonify({'status': 'ok', 'alerts': r.json() if r.ok else []})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/alerts', methods=['POST'])
+def api_alerts_create():
+    """Create a price alert. Body: {ticker, target_price, direction: 'above'|'below'}"""
+    try:
+        body = request.get_json(force=True)
+        ticker       = (body.get('ticker') or '').upper().strip()
+        target_price = float(body.get('target_price', 0))
+        direction    = body.get('direction', 'above')
+        if not ticker or target_price <= 0 or direction not in ('above', 'below'):
+            return jsonify({'error': 'ticker, target_price, and direction (above|below) required'}), 400
+        row = {'ticker': ticker, 'target_price': target_price, 'direction': direction, 'triggered': False}
+        r = requests.post(_SUPA_ALERTS_URL, headers=_alerts_headers(), json=row, timeout=10)
+        if r.ok:
+            return jsonify({'status': 'created', 'alert': r.json()[0] if r.json() else row})
+        return jsonify({'error': 'failed to save alert', 'detail': r.text}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/alerts/<alert_id>', methods=['DELETE'])
+def api_alerts_delete(alert_id):
+    """Delete a price alert by ID."""
+    try:
+        r = requests.delete(
+            f'{_SUPA_ALERTS_URL}?id=eq.{alert_id}',
+            headers=_alerts_headers('return=minimal'), timeout=10,
+        )
+        return jsonify({'status': 'deleted' if r.ok else 'error'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _check_price_alerts():
+    """Check all active price alerts against current prices. Runs every 5 min."""
+    try:
+        r = requests.get(
+            f'{_SUPA_ALERTS_URL}?triggered=eq.false',
+            headers=_alerts_headers(), timeout=10,
+        )
+        if not r.ok:
+            return
+        alerts = r.json() or []
+        if not alerts:
+            return
+
+        tickers = list({a['ticker'] for a in alerts})
+        prices = alpaca_quotes_batch(tickers)
+
+        # Fallback to yfinance for any missing
+        missing = [t for t in tickers if t not in prices or not prices[t].get('last')]
+        if missing:
+            try:
+                import yfinance as yf
+                data = yf.download(missing, period='1d', interval='1m', progress=False, auto_adjust=True)
+                for t in missing:
+                    try:
+                        close = float(data['Close'][t].dropna().iloc[-1])
+                        prices[t] = {'last': close}
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        triggered_ids = []
+        for alert in alerts:
+            ticker       = alert['ticker']
+            target       = float(alert['target_price'])
+            direction    = alert['direction']
+            current      = float((prices.get(ticker) or {}).get('last') or 0)
+            if current <= 0:
+                continue
+            hit = (direction == 'above' and current >= target) or \
+                  (direction == 'below' and current <= target)
+            if not hit:
+                continue
+
+            # Mark triggered
+            requests.patch(
+                f'{_SUPA_ALERTS_URL}?id=eq.{alert["id"]}',
+                headers=_alerts_headers('return=minimal'),
+                json={'triggered': True, 'triggered_at': datetime.now(timezone.utc).isoformat()},
+                timeout=10,
+            )
+            triggered_ids.append(alert['id'])
+
+            # Send FCM push
+            arrow = '↑' if direction == 'above' else '↓'
+            _fcm_push_all(
+                title=f'🔔 Price Alert: {ticker}',
+                body=f'{ticker} {arrow} ${current:.2f} crossed your ${target:.2f} alert',
+                data={'type': 'price_alert', 'ticker': ticker},
+            )
+            logger.info(f'price_alert: {ticker} triggered at {current} (target {target} {direction})')
+
+    except Exception as e:
+        logger.warning(f'_check_price_alerts error: {e}')
 
 
 if __name__ == '__main__':

@@ -1,0 +1,59 @@
+# Options Engine — default configuration
+# Override any field via env var OPTIONS_CONFIG_PATH pointing to a custom YAML
+
+# Ticker universe — scanned by both Income and Growth engines
+tickers:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - META
+  - NVDA
+  - TSLA
+  - AMD
+  - SPY
+  - QQQ
+  - JPM
+  - GS
+  - NFLX
+  - CRM
+  - PLTR
+
+# Income Engine (Engine A — Options Selling)
+income:
+  enabled:         true
+  min_iv_rank:     25       # lowered: calm markets still have tradeable IV
+  min_avg_volume:  300000   # lowered: broader ticker coverage
+  min_oi:          200      # lowered: include less liquid but valid contracts
+  min_premium:     0.15     # lowered: accept smaller credits
+  min_pop:         0.55     # lowered: 55% POP still favourable
+  dte_min:         21       # widened: catch 3-week expirations too
+  dte_max:         60       # widened: go out to 2 months
+  target_delta:    -0.25    # short put delta target
+  max_trades:      5
+
+# Growth Engine (Engine B — Options Buying)
+growth:
+  enabled:         true
+  max_iv_rank:     70       # raised: allow buying even at moderate IV
+  min_vol_spike:   1.0      # lowered: any volume is fine
+  min_avg_volume:  200000
+  min_oi:          20
+  min_premium:     0.10
+  max_spread_pct:  0.20     # more lenient on spread
+  dte_min:         14       # catch shorter-dated plays
+  dte_max:         60
+  max_trades:      5
+
+# Analytics
+analytics:
+  risk_free_rate:  0.0525   # 5.25%
+  spread_threshold: 0.10    # > 10% bid-ask = ILLIQUID
+
+# Capital allocation (USD) — hard cap per engine
+capital:
+  options_usd: 5000   # total options capital; picks filtered to max_risk <= this
+  max_risk_per_trade: 5000  # single trade max risk
+
+# Scan interval (seconds) — for background scan loop
+scan_interval_seconds: 3600  # hourly during market hours

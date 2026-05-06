@@ -108,6 +108,22 @@ def send_to_tokens(tokens: list, title: str, body: str, data: dict = None) -> in
     return sum(1 for t in tokens if send_to_token(t, title, body, data))
 
 
+def send_to_all_devices(title: str, body: str, data: dict = None,
+                         supabase=None) -> int:
+    """Send to every FCM token in the user_devices Supabase table."""
+    if supabase is None:
+        return 0
+    try:
+        rows = supabase.table('user_devices').select('fcm_token').execute()
+        tokens = [r['fcm_token'] for r in (rows.data or []) if r.get('fcm_token')]
+        if not tokens:
+            return 0
+        return send_to_tokens(tokens, title, body, data)
+    except Exception as e:
+        logger.warning(f'send_to_all_devices error: {e}')
+        return 0
+
+
 def notify_watchlist_activity(ticker: str, insider: str, value: float,
                                supabase_client=None) -> int:
     """
