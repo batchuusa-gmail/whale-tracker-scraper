@@ -114,6 +114,7 @@ def _run_scan():
             _state['growth_picks'] = growth_dicts
         _save_picks_to_supabase(income_dicts, growth_dicts)
         _notify_new_picks(income_dicts, growth_dicts)
+        _execute_picks(income_dicts, growth_dicts)
 
     with _state_lock:
         _state['last_scan']   = datetime.now(timezone.utc).isoformat()
@@ -154,6 +155,25 @@ def _notify_new_picks(income_dicts: list, growth_dicts: list):
 
     except Exception as e:
         logger.warning(f'options_scanner: notify error: {e}')
+
+
+def _execute_picks(income_dicts: list, growth_dicts: list):
+    """Execute picks via Alpaca paper options orders if OPTIONS_TRADING_ENABLED=true."""
+    import os
+    if os.environ.get('OPTIONS_TRADING_ENABLED', 'false').lower() != 'true':
+        return
+    try:
+        from options_engine.executor import execute_income_pick, execute_growth_pick
+        for pick in income_dicts:
+            result = execute_income_pick(pick)
+            if result['status'] not in ('disabled', 'skipped', 'ok'):
+                logger.warning(f'options_scanner: income exec {pick["ticker"]}: {result}')
+        for pick in growth_dicts:
+            result = execute_growth_pick(pick)
+            if result['status'] not in ('disabled', 'skipped', 'ok'):
+                logger.warning(f'options_scanner: growth exec {pick["ticker"]}: {result}')
+    except Exception as e:
+        logger.error(f'options_scanner: _execute_picks error: {e}')
 
 
 def _scan_loop():

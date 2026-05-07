@@ -8378,6 +8378,45 @@ def options_paper_trade_close(trade_id):
         return jsonify({'error': str(e)}), 500
 
 
+_SUPA_OPT_CFG_URL = f"{os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')}/rest/v1/options_config"
+
+
+@app.route('/api/options/algo/config', methods=['GET', 'POST'])
+def options_algo_config():
+    """GET/POST options auto-trading config (trading_enabled, max_contracts, capital_per_trade)."""
+    key = os.getenv('SUPABASE_KEY', '')
+    hdrs = {
+        'apikey': key, 'Authorization': f'Bearer {key}',
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates,return=representation',
+    }
+    if request.method == 'GET':
+        try:
+            r = requests.get(f'{_SUPA_OPT_CFG_URL}?id=eq.1', headers=hdrs, timeout=5)
+            if r.ok and r.json():
+                return jsonify(r.json()[0])
+        except Exception:
+            pass
+        return jsonify({
+            'id': 1, 'trading_enabled': True,
+            'max_contracts': 1, 'capital_per_trade': 5000,
+        })
+    try:
+        body = request.get_json(force=True) or {}
+        allowed = {'trading_enabled', 'max_contracts', 'capital_per_trade'}
+        update = {k: v for k, v in body.items() if k in allowed}
+        if not update:
+            return jsonify({'error': 'no valid fields'}), 400
+        r = requests.post(_SUPA_OPT_CFG_URL, headers=hdrs,
+                          json={**{'id': 1}, **update}, timeout=10)
+        if r.ok:
+            return jsonify({'status': 'ok', 'config': r.json()[0] if r.json() else update})
+        return jsonify({'error': r.text}), 500
+    except Exception as e:
+        logger.error(f'options/algo/config error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 # ─── APEX-78: Signal History Persistence ──────────────────────────────────────
 
 _SUPA_SH_URL = f"{os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')}/rest/v1/signal_history"
