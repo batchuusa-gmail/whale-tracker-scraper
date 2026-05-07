@@ -104,12 +104,16 @@ def is_market_open() -> bool:
 # ── Alpaca 1-min bars fetch ──────────────────────────────────────
 
 def _yf_bars_one(sym: str, limit: int) -> tuple[str, list]:
-    """Fetch last `limit` 1-min bars for one symbol via Yahoo Finance chart API."""
+    """Fetch last `limit` 1-min bars for one symbol via Yahoo Finance chart API with crumb auth."""
     try:
-        r = requests.get(
-            f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}',
-            params={'interval': '1m', 'range': '1d'},
-            headers=_YF_HDR, timeout=5,
+        sess, crumb = _get_yf_session_crumb()
+        params = {'interval': '1m', 'range': '1d'}
+        if crumb:
+            params['crumb'] = crumb
+        r = sess.get(
+            f'https://query2.finance.yahoo.com/v8/finance/chart/{sym}',
+            params=params,
+            timeout=8,
         )
         if r.status_code != 200:
             return sym, []
@@ -398,6 +402,38 @@ _baselines_loaded = False
 _baselines_loading = False
 
 _YF_HDR = {'User-Agent': 'Mozilla/5.0 (compatible; WhaleTracker/1.0)'}  # fallback only
+
+# ── Yahoo Finance crumb session (same pattern as options_fetcher) ────────────
+_yf_sess_state: dict = {'session': None, 'crumb': None, 'ts': 0}
+_YF_SESSION_TTL = 1800  # refresh every 30 min
+
+def _get_yf_session_crumb():
+    """Return (requests.Session, crumb_str) with cookie/crumb auth for Yahoo Finance."""
+    state = _yf_sess_state
+    if state['session'] and state['crumb'] and (time.time() - state['ts']) < _YF_SESSION_TTL:
+        return state['session'], state['crumb']
+    sess = requests.Session()
+    sess.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    try:
+        sess.get('https://fc.yahoo.com', timeout=8)
+    except Exception:
+        pass
+    try:
+        r = sess.get('https://query1.finance.yahoo.com/v1/test/getcrumb', timeout=8)
+        crumb = r.text.strip() if r.status_code == 200 else ''
+    except Exception:
+        crumb = ''
+    state['session'] = sess
+    state['crumb']   = crumb
+    state['ts']      = time.time()
+    logger.info(f'Yahoo Finance session refreshed — crumb={crumb[:8]}…' if crumb else 'YF crumb empty')
+    return sess, crumb
+
 
 def _load_vol_baselines(symbols: list[str]):
     """Spawn a background thread to load volume baselines — never blocks the scan loop."""
