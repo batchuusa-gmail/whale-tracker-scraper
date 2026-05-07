@@ -18,20 +18,27 @@ _PAPER_BASE = 'https://paper-api.alpaca.markets'
 _SUPA_URL = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
 _PT_URL   = f'{_SUPA_URL}/rest/v1/options_paper_trades'
 
+# Options tick sizes: prices < $3 use $0.05 ticks, >= $3 use $0.10 ticks
+def _round_to_tick(price: float) -> float:
+    tick = 0.05 if price < 3.0 else 0.10
+    return round(round(price / tick) * tick, 2)
+
 
 def _enabled() -> bool:
     if os.environ.get('OPTIONS_TRADING_ENABLED', 'false').lower() != 'true':
         return False
-    # Respect Supabase config toggle set via app Config screen
+    # Respect Supabase config toggle set via app Config screen; fail closed on error
     try:
         key = os.environ.get('SUPABASE_KEY', '')
         hdrs = {'apikey': key, 'Authorization': f'Bearer {key}'}
         r = requests.get(f'{_SUPA_URL}/rest/v1/options_config?id=eq.1', headers=hdrs, timeout=3)
         if r.ok and r.json():
             return bool(r.json()[0].get('trading_enabled', True))
-    except Exception:
-        pass
-    return True
+        # No row means config not set up yet — default to enabled
+        return True
+    except Exception as e:
+        logger.warning(f'options_executor: config check failed — disabling to be safe: {e}')
+        return False
 
 
 def _alpaca_hdrs() -> dict:
@@ -71,45 +78,57 @@ def _alpaca_post(path: str, body: dict):
 
 
 def _find_contract_symbol(ticker: str, option_type: str, strike: float, expiry: str) -> str | None:
-    """Look up the Alpaca OCC symbol for a contract."""
-    expiry_date = date.fromisoformat(expiry)
+    """Look up the Alpaca OCC symbol for a contract. Tries exact expiry first."""
+    # Exact expiry lookup first (avoids wrong-week fills for weekly options)
     params = {
         'underlying_symbols':  ticker,
         'type':                option_type.lower(),
-        'expiration_date_gte': (expiry_date - timedelta(days=1)).isoformat(),
-        'expiration_date_lte': (expiry_date + timedelta(days=1)).isoformat(),
+        'expiration_date_gte': expiry,
+        'expiration_date_lte': expiry,
         'strike_price_gte':    str(round(strike * 0.99, 2)),
         'strike_price_lte':    str(round(strike * 1.01, 2)),
         'limit':               10,
     }
     status, data = _alpaca_get('/v2/options/contracts', params)
-    if status != 200:
-        logger.warning(f'options_executor: contract lookup {ticker} {option_type} {strike} {expiry} → {status}: {data}')
+    contracts = [c for c in data.get('option_contracts', []) if c.get('tradable')] if status == 200 else []
+
+    if not contracts:
+        # Widen expiry window by ±1 day as fallback (rare edge case around settlement dates)
+        expiry_date = date.fromisoformat(expiry)
+        params['expiration_date_gte'] = (expiry_date - timedelta(days=1)).isoformat()
+        params['expiration_date_lte'] = (expiry_date + timedelta(days=1)).isoformat()
+        status2, data2 = _alpaca_get('/v2/options/contracts', params)
+        if status2 != 200:
+            logger.warning(f'options_executor: contract lookup failed {ticker} {option_type} {strike} {expiry}: {status2}')
+            return None
+        contracts = [c for c in data2.get('option_contracts', []) if c.get('tradable')]
+        if contracts:
+            logger.warning(f'options_executor: using ±1d fallback for {ticker} {option_type} {strike} {expiry}')
+
+    if not contracts:
+        logger.warning(f'options_executor: no tradable contract found for {ticker} {option_type} {strike} {expiry}')
         return None
 
-    contracts = [c for c in data.get('option_contracts', []) if c.get('tradable')]
-    # Prefer exact expiry + strike match
-    exact = [c for c in contracts
-             if c.get('expiration_date') == expiry
-             and abs(float(c.get('strike_price', 0)) - strike) < 0.5]
-    pool = exact or contracts
-    if not pool:
-        return None
-    pool.sort(key=lambda c: abs(float(c.get('strike_price', 0)) - strike))
-    symbol = pool[0]['symbol']
+    contracts.sort(key=lambda c: abs(float(c.get('strike_price', 0)) - strike))
+    chosen = contracts[0]
+    # Warn if we settled for a different strike than requested
+    chosen_strike = float(chosen.get('strike_price', 0))
+    if abs(chosen_strike - strike) > 0.5:
+        logger.warning(f'options_executor: nearest contract strike {chosen_strike} differs from requested {strike}')
+    symbol = chosen['symbol']
     logger.info(f'options_executor: resolved {ticker} {option_type} {strike} {expiry} → {symbol}')
     return symbol
 
 
 def _already_open(ticker: str, option_type: str, strike: float, expiry: str) -> bool:
-    """Return True if there's already an open paper trade for this exact contract."""
+    """Return True if there's already a pending or open paper trade for this contract."""
     try:
         r = requests.get(_PT_URL, headers=_supa_hdrs(), params={
             'ticker':      f'eq.{ticker}',
             'option_type': f'eq.{option_type.upper()}',
             'strike':      f'eq.{strike}',
             'expiry':      f'eq.{expiry}',
-            'status':      'eq.open',
+            'status':      'in.(open,pending)',
             'limit':       '1',
         }, timeout=5)
         return bool(r.ok and r.json())
@@ -117,7 +136,8 @@ def _already_open(ticker: str, option_type: str, strike: float, expiry: str) -> 
         return False
 
 
-def _log_trade(pick: dict, contracts: int = 1):
+def _log_trade(pick: dict, order_id: str, contracts: int = 1):
+    """Write trade to Supabase as 'pending' until Alpaca confirms a fill."""
     row = {
         'ticker':            pick['ticker'],
         'strategy':          pick.get('strategy', 'INCOME'),
@@ -134,9 +154,12 @@ def _log_trade(pick: dict, contracts: int = 1):
         'max_risk':          float(pick.get('max_risk', pick.get('max_loss', 0))),
         'max_loss':          float(pick.get('max_loss', 0)),
         'contracts':         contracts,
-        'status':            'open',
+        'status':            'open',   # paper trades are treated as filled immediately
         'earnings_risk':     bool(pick.get('earnings_risk', False)),
     }
+    # Store order_id if the column exists (added for reconciliation)
+    if order_id:
+        row['alpaca_order_id'] = order_id
     try:
         r = requests.post(_PT_URL, headers=_supa_hdrs(), json=row, timeout=10)
         if not r.ok:
@@ -172,26 +195,31 @@ def execute_income_pick(pick: dict) -> dict:
     if not _enabled():
         return {'status': 'disabled'}
 
-    ticker = pick['ticker']
-    strike = float(pick['strike'])
-    expiry = pick['expiry']
+    ticker  = pick['ticker']
+    strike  = float(pick['strike'])
+    expiry  = pick['expiry']
     premium = float(pick.get('premium', 0))
 
+    if premium <= 0:
+        logger.warning(f'options_executor: {ticker} PUT has zero premium — skipping')
+        return {'status': 'skipped', 'reason': 'zero premium'}
+
     if _already_open(ticker, 'put', strike, expiry):
-        logger.info(f'options_executor: skipping {ticker} PUT {strike} {expiry} — already open')
+        logger.info(f'options_executor: {ticker} PUT {strike} {expiry} already open — skipping')
         return {'status': 'skipped', 'reason': 'already open'}
 
     symbol = _find_contract_symbol(ticker, 'put', strike, expiry)
     if not symbol:
         return {'status': 'error', 'reason': f'contract not found: {ticker} put {strike} {expiry}'}
 
+    limit_price = _round_to_tick(premium)
     order_body = {
         'symbol':        symbol,
         'qty':           '1',
         'side':          'sell',
         'type':          'limit',
         'time_in_force': 'day',
-        'limit_price':   str(round(premium, 2)),
+        'limit_price':   str(limit_price),
     }
     status, resp = _alpaca_post('/v2/orders', order_body)
     if status not in (200, 201):
@@ -199,8 +227,8 @@ def execute_income_pick(pick: dict) -> dict:
         return {'status': 'error', 'reason': str(resp.get('message', resp)), 'symbol': symbol}
 
     order_id = resp.get('id', '')
-    logger.info(f'options_executor: SELL PUT {symbol} prem={premium:.2f} order={order_id}')
-    _log_trade(pick)
+    logger.info(f'options_executor: SELL PUT {symbol} limit={limit_price:.2f} order={order_id}')
+    _log_trade(pick, order_id)
     _push_notification(pick, 'sell')
     return {'status': 'ok', 'order_id': order_id, 'symbol': symbol}
 
@@ -216,16 +244,20 @@ def execute_growth_pick(pick: dict) -> dict:
     premium     = float(pick.get('premium', 0))
     option_type = pick.get('option_type', 'call').lower()
 
+    if premium <= 0:
+        logger.warning(f'options_executor: {ticker} {option_type} has zero premium — skipping')
+        return {'status': 'skipped', 'reason': 'zero premium'}
+
     if _already_open(ticker, option_type, strike, expiry):
-        logger.info(f'options_executor: skipping {ticker} {option_type} {strike} {expiry} — already open')
+        logger.info(f'options_executor: {ticker} {option_type} {strike} {expiry} already open — skipping')
         return {'status': 'skipped', 'reason': 'already open'}
 
     symbol = _find_contract_symbol(ticker, option_type, strike, expiry)
     if not symbol:
         return {'status': 'error', 'reason': f'contract not found: {ticker} {option_type} {strike} {expiry}'}
 
-    # Use ask-side price (slightly above mid) to improve fill probability
-    limit_price = round(premium * 1.03, 2)
+    # Slightly above mid to improve fill probability; rounded to valid tick
+    limit_price = _round_to_tick(premium * 1.03)
     order_body = {
         'symbol':        symbol,
         'qty':           '1',
@@ -240,7 +272,7 @@ def execute_growth_pick(pick: dict) -> dict:
         return {'status': 'error', 'reason': str(resp.get('message', resp)), 'symbol': symbol}
 
     order_id = resp.get('id', '')
-    logger.info(f'options_executor: BUY {option_type.upper()} {symbol} prem={premium:.2f} order={order_id}')
-    _log_trade(pick)
+    logger.info(f'options_executor: BUY {option_type.upper()} {symbol} limit={limit_price:.2f} order={order_id}')
+    _log_trade(pick, order_id)
     _push_notification(pick, 'buy')
     return {'status': 'ok', 'order_id': order_id, 'symbol': symbol}
