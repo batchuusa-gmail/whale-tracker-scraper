@@ -24,7 +24,7 @@ income:
   enabled:         true
   min_iv_rank:     25       # lowered: calm markets still have tradeable IV
   min_avg_volume:  300000   # lowered: broader ticker coverage
-  min_oi:          200      # lowered: include less liquid but valid contracts
+  min_oi:          0        # OI comes back as 0 from Railway/Yahoo — filter by bid/ask instead
   min_premium:     0.15     # lowered: accept smaller credits
   min_pop:         0.55     # lowered: 55% POP still favourable
   dte_min:         21       # widened: catch 3-week expirations too

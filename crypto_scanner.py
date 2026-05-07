@@ -1,10 +1,11 @@
 """
 crypto_scanner.py — Momentum-based algo scanner for crypto coins.
 
-Scans BTC/USD, ETH/USD, SOL/USD, DOGE/USD using Alpaca crypto data API.
+Scans 18 coins using Alpaca crypto data API.
 Scoring: short-term momentum + volume spike + RSI zone.
 Fires BUY signals to crypto_executor when confidence >= threshold.
 Runs 24/7 (crypto never closes).
+Config persisted in Supabase crypto_settings table.
 """
 import os
 import json
@@ -27,19 +28,99 @@ _PAPER_BASE = 'https://paper-api.alpaca.markets'
 
 SCAN_INTERVAL = 300  # 5 minutes
 
-_ENABLED_COINS_DEFAULT = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'DOGE/USD']
+# Full 18-coin watchlist — all tradeable on Alpaca paper
+ALL_COINS = [
+    'BTC/USD',   # Bitcoin
+    'ETH/USD',   # Ethereum
+    'SOL/USD',   # Solana
+    'DOGE/USD',  # Dogecoin
+    'AVAX/USD',  # Avalanche
+    'LINK/USD',  # Chainlink
+    'DOT/USD',   # Polkadot
+    'XRP/USD',   # Ripple
+    'LTC/USD',   # Litecoin
+    'BCH/USD',   # Bitcoin Cash
+    'AAVE/USD',  # Aave
+    'UNI/USD',   # Uniswap
+    'MATIC/USD', # Polygon
+    'SHIB/USD',  # Shiba Inu
+    'ADA/USD',   # Cardano
+    'ALGO/USD',  # Algorand
+    'CRV/USD',   # Curve
+    'BAT/USD',   # Basic Attention Token
+]
 
 _DEFAULT_CONFIG = {
     'enabled':            True,
-    'enabled_coins':      _ENABLED_COINS_DEFAULT,
+    'enabled_coins':      ALL_COINS,
     'min_confidence':     0.55,
     'max_trades_per_day': 4,
-    'position_size_pct':  0.25,  # 25% of $5k capital pool = $1,250 per trade (4 trades max = $5k)
+    'position_size_pct':  0.25,  # 25% of capital pool per trade (max 4 trades)
     'stop_loss_pct':      0.03,
     'take_profit_pct':    0.06,
     'min_score':          55,
     'scan_interval':      SCAN_INTERVAL,
 }
+
+# ── Supabase config persistence ───────────────────────────────────────────────
+
+_SUPA_URL  = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
+_SUPA_KEY  = os.environ.get('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg')
+_SUPA_HDRS = {
+    'apikey':        _SUPA_KEY,
+    'Authorization': f'Bearer {_SUPA_KEY}',
+    'Content-Type':  'application/json',
+}
+_SUPA_UPSERT_HDRS = {**_SUPA_HDRS, 'Prefer': 'resolution=merge-duplicates,return=representation'}
+
+_CRYPTO_SETTINGS_URL = f'{_SUPA_URL}/rest/v1/crypto_settings'
+
+
+def _load_config_from_supabase() -> dict:
+    try:
+        r = requests.get(f'{_CRYPTO_SETTINGS_URL}?id=eq.1', headers=_SUPA_HDRS, timeout=5)
+        if r.status_code == 200 and r.json():
+            row = r.json()[0]
+            cfg = dict(_DEFAULT_CONFIG)
+            for k in ('enabled', 'min_confidence', 'max_trades_per_day',
+                      'position_size_pct', 'stop_loss_pct', 'take_profit_pct', 'min_score'):
+                if k in row and row[k] is not None:
+                    cfg[k] = row[k]
+            # enabled_coins is JSONB — may come back as list or string
+            coins = row.get('enabled_coins')
+            if isinstance(coins, list) and coins:
+                cfg['enabled_coins'] = coins
+            elif isinstance(coins, str):
+                try:
+                    parsed = json.loads(coins)
+                    if isinstance(parsed, list) and parsed:
+                        cfg['enabled_coins'] = parsed
+                except Exception:
+                    pass
+            return cfg
+    except Exception as e:
+        logger.warning(f'crypto_scanner: Supabase config load failed: {e}')
+    return dict(_DEFAULT_CONFIG)
+
+
+def _save_config_to_supabase(cfg: dict):
+    try:
+        payload = {
+            'id': 1,
+            'enabled':            cfg.get('enabled', True),
+            'enabled_coins':      cfg.get('enabled_coins', ALL_COINS),
+            'min_confidence':     cfg.get('min_confidence', 0.55),
+            'max_trades_per_day': cfg.get('max_trades_per_day', 4),
+            'position_size_pct':  cfg.get('position_size_pct', 0.25),
+            'stop_loss_pct':      cfg.get('stop_loss_pct', 0.03),
+            'take_profit_pct':    cfg.get('take_profit_pct', 0.06),
+            'min_score':          cfg.get('min_score', 55),
+            'updated_at':         datetime.now(timezone.utc).isoformat(),
+        }
+        requests.post(_CRYPTO_SETTINGS_URL, headers=_SUPA_UPSERT_HDRS, json=payload, timeout=10)
+    except Exception as e:
+        logger.warning(f'crypto_scanner: Supabase config save failed: {e}')
+
 
 # In-memory state
 _state = {
@@ -48,10 +129,14 @@ _state = {
     'scan_count':     0,
     'signals_today':  0,
     'top_picks':      [],
+    'skipped_coins':  [],
     'error':          None,
 }
 _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
+
+_config_lock = threading.Lock()
+_live_config: dict = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -144,7 +229,7 @@ def _score_coin(symbol: str, config: dict) -> dict | None:
     elif mom_5m > 0.1:
         score += 10
     elif mom_5m < -1.5:
-        score -= 20  # significant drop — skip
+        score -= 20
     elif mom_5m < -0.5:
         score -= 10
 
@@ -173,11 +258,10 @@ def _score_coin(symbol: str, config: dict) -> dict | None:
         score += 7
 
     # RSI — only penalise extreme reversals, not sustained overbought
-    # Crypto stays RSI 70-85 during bull trends; that's fine
     if rsi < 25:
-        score -= 10  # capitulation / knife-catch risk
+        score -= 10
     elif rsi > 92:
-        score -= 10  # parabolic blow-off, near-term pullback likely
+        score -= 10
 
     score = max(0, min(100, score))
     confidence = round(score / 100, 3)
@@ -199,40 +283,23 @@ def _score_coin(symbol: str, config: dict) -> dict | None:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-_SUPA_URL = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
-_SUPA_KEY = os.environ.get('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg')
-_SUPA_HDRS = {
-    'apikey':        _SUPA_KEY,
-    'Authorization': f'Bearer {_SUPA_KEY}',
-    'Content-Type':  'application/json',
-    'Prefer':        'resolution=merge-duplicates,return=minimal',
-}
-
-_config_lock = threading.Lock()
-_live_config: dict = {}
-
-
 def get_config(redis_get_fn=None) -> dict:
-    """Return current algo config (Redis → memory → defaults)."""
-    if redis_get_fn:
-        cached = redis_get_fn('crypto:config')
-        if cached and isinstance(cached, dict):
-            return {**_DEFAULT_CONFIG, **cached}
+    """Return current crypto config from Supabase (with in-memory override)."""
+    # Check in-memory overrides first (set by update_config within same process)
     with _config_lock:
         if _live_config:
-            return {**_DEFAULT_CONFIG, **_live_config}
-    return dict(_DEFAULT_CONFIG)
+            base = _load_config_from_supabase()
+            return {**base, **_live_config}
+    return _load_config_from_supabase()
 
 
 def update_config(body: dict, redis_set_fn=None):
-    """Persist config changes to memory and Redis."""
+    """Persist config changes to Supabase and in-memory."""
+    current = _load_config_from_supabase()
+    current.update({k: v for k, v in body.items() if k in _DEFAULT_CONFIG})
+    _save_config_to_supabase(current)
     with _config_lock:
-        _live_config.update(body)
-    if redis_set_fn:
-        try:
-            redis_set_fn('crypto:config', {**_DEFAULT_CONFIG, **_live_config}, ttl_seconds=86400)
-        except Exception:
-            pass
+        _live_config.update(current)
     logger.info(f'crypto_scanner: config updated: {body}')
 
 
@@ -245,6 +312,7 @@ def get_status(redis_get_fn=None) -> dict:
             'scan_count':     _state['scan_count'],
             'signals_today':  _state['signals_today'],
             'top_picks':      _state['top_picks'],
+            'skipped_coins':  _state['skipped_coins'],
             'error':          _state['error'],
             'market_open':    True,  # crypto 24/7
             'mode':           'paper',
@@ -255,9 +323,9 @@ def get_status(redis_get_fn=None) -> dict:
 
 def _run_scan(redis_set_fn=None, redis_get_fn=None):
     """Execute one scan cycle across all enabled coins."""
-    config = get_config(redis_get_fn)
-    coins  = config.get('enabled_coins', _ENABLED_COINS_DEFAULT)
-    min_score = config.get('min_score', 65)
+    config    = get_config(redis_get_fn)
+    coins     = config.get('enabled_coins', ALL_COINS)
+    min_score = config.get('min_score', 55)
 
     results = []
     signals = []
@@ -268,7 +336,7 @@ def _run_scan(redis_set_fn=None, redis_get_fn=None):
             if result is None:
                 continue
             results.append(result)
-            if result['signal'] == 'BUY' and result['confidence'] >= config.get('min_confidence', 0.68):
+            if result['signal'] == 'BUY' and result['confidence'] >= config.get('min_confidence', 0.55):
                 signals.append(result)
                 logger.info(
                     f'crypto_scanner: signal {symbol} score={result["score"]} '
@@ -279,17 +347,17 @@ def _run_scan(redis_set_fn=None, redis_get_fn=None):
 
     results.sort(key=lambda x: x['score'], reverse=True)
 
+    scanned_symbols = {r['symbol'] for r in results}
+    skipped = [s for s in coins if s not in scanned_symbols]
+    if skipped:
+        logger.warning(f'crypto_scanner: no data for {skipped}')
+
     with _state_lock:
         _state['last_scan']     = datetime.now(timezone.utc).isoformat()
         _state['scan_count']   += 1
-        _state['top_picks']     = results[:5]
+        _state['top_picks']     = results  # all scanned coins, sorted by score
+        _state['skipped_coins'] = skipped
         _state['signals_today'] += len(signals)
-
-    if redis_set_fn:
-        try:
-            redis_set_fn('crypto:scan:results', results[:10], ttl_seconds=360)
-        except Exception:
-            pass
 
     # Fire signals to executor
     if signals:
@@ -321,7 +389,7 @@ def _fire_signals(signals: list, config: dict):
             'entry':            top['price'],
             'stop_loss_pct':    config.get('stop_loss_pct', 0.03),
             'take_profit_pct':  config.get('take_profit_pct', 0.06),
-            'position_size_pct': config.get('position_size_pct', 0.05),
+            'position_size_pct': config.get('position_size_pct', 0.25),
             'reasoning':        f'Score {top["score"]}/100 | mom5m={top["mom_5m"]}% | RSI={top["rsi"]}',
         })
     except Exception as e:
@@ -332,7 +400,7 @@ def _scan_loop(redis_set_fn=None, redis_get_fn=None):
     with _state_lock:
         _state['running'] = True
 
-    logger.info('crypto_scanner: scan loop started (24/7)')
+    logger.info('crypto_scanner: scan loop started (24/7, 18 coins)')
 
     while True:
         try:
@@ -342,7 +410,7 @@ def _scan_loop(redis_set_fn=None, redis_get_fn=None):
             with _state_lock:
                 _state['error'] = str(e)
 
-        config = get_config(redis_get_fn)
+        config   = get_config(redis_get_fn)
         interval = config.get('scan_interval', SCAN_INTERVAL)
         time.sleep(interval)
 

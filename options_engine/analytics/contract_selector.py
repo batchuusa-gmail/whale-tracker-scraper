@@ -31,9 +31,6 @@ def select_income_contract(puts_df: pd.DataFrame) -> pd.Series | None:
     # Delta filter [-0.30, -0.20]
     df = df[(df['delta'] >= -0.30) & (df['delta'] <= -0.20)]
 
-    # Min open interest
-    df = df[df['openInterest'] >= 100]
-
     # Exclude illiquid
     if 'illiquid' in df.columns:
         df = df[~df['illiquid']]
@@ -78,9 +75,6 @@ def select_growth_contract(
 
     # DTE filter 20-60
     df = df[(df['dte'] >= 20) & (df['dte'] <= 60)]
-
-    # Min open interest
-    df = df[df['openInterest'] >= 50]
 
     # Exclude illiquid
     if 'illiquid' in df.columns:

@@ -160,7 +160,8 @@ def scan_growth(
             if df.empty:
                 continue
 
-            df = df[df['openInterest'] >= min_oi]
+            # Only keep contracts with active market quotes
+            df = df[(df['bid'] > 0) | (df['ask'] > 0)]
             if df.empty:
                 continue
 

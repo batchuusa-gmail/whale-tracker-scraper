@@ -4310,7 +4310,7 @@ def intraday_journal():
             'intraday_trades',
             f'select=id,ticker,side,pnl,pnl_pct,confidence,exit_reason,'
             f'entry_time,date,status,entry_price,exit_price,qty,ai_reasoning'
-            f'&order=entry_time.desc&limit={limit}'
+            f'&order=id.desc&limit={limit}'
         ) or []
         return jsonify({'trades': rows, 'count': len(rows)})
     except Exception as e:
@@ -4847,38 +4847,32 @@ def scanner_all():
 _ALGO_CONFIG_KEY = 'algo:live_config'
 
 _ALGO_CONFIG_DEFAULTS = {
-    'enabled':           True,
-    'aggression':        0.5,
-    'max_trades_per_day': 3,
-    'min_score':         50,
-    'min_confidence':    65,   # stored as 0-100; divide by 100 when using
-    'hold_minutes':      390,  # one full trading session (9:30-4:00 ET)
-    'max_positions':     5,
+    'enabled':                  True,
+    'aggression':               0.5,
+    'max_trades_per_day':       3,
+    'min_score':                50,
+    'min_confidence':           65,
+    'hold_minutes':             390,
+    'max_positions':            5,
+    'circuit_breaker_enabled':  True,
+}
+
+_ALGO_SUPA_URL = f'{SUPABASE_URL}/rest/v1/algo_config'
+_ALGO_SUPA_HDR = {
+    'apikey': SUPABASE_KEY,
+    'Authorization': f'Bearer {SUPABASE_KEY}',
+    'Content-Type': 'application/json',
 }
 
 def _get_live_config() -> dict:
-    """Return merged algo config: Redis overrides Supabase overrides defaults."""
+    """Return algo config from Supabase, falling back to defaults."""
     cfg = dict(_ALGO_CONFIG_DEFAULTS)
-    # Layer 1: Supabase persisted values (min_score, min_confidence, etc.)
     try:
-        supa_url = os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
-        supa_key = os.getenv('SUPABASE_KEY', '')
-        r = requests.get(
-            f'{supa_url}/rest/v1/algo_config?limit=1',
-            headers={'apikey': supa_key, 'Authorization': f'Bearer {supa_key}'},
-            timeout=3,
-        )
+        r = requests.get(f'{_ALGO_SUPA_URL}?id=eq.1', headers=_ALGO_SUPA_HDR, timeout=5)
         if r.status_code == 200 and r.json():
             for k, v in r.json()[0].items():
                 if k in cfg and v is not None:
                     cfg[k] = v
-    except Exception:
-        pass
-    # Layer 2: Redis live overrides (highest priority — set via POST /api/scanner/config)
-    try:
-        cached = redis_get(_ALGO_CONFIG_KEY)
-        if cached and isinstance(cached, dict):
-            cfg.update(cached)
     except Exception:
         pass
     return cfg
@@ -4900,17 +4894,21 @@ def scanner_config():
 
     try:
         body = request.get_json(force=True) or {}
-        current = _get_live_config()
-
         ALLOWED = {'enabled', 'aggression', 'max_trades_per_day', 'min_score',
-                   'min_confidence', 'hold_minutes', 'max_positions'}
-        for k, v in body.items():
-            if k in ALLOWED:
-                current[k] = v
-
-        redis_set(_ALGO_CONFIG_KEY, current, ttl_seconds=86400 * 30)  # 30-day TTL
-        logger.info(f'Algo config updated: {body}')
-        return jsonify({'status': 'ok', 'config': current})
+                   'min_confidence', 'hold_minutes', 'max_positions',
+                   'circuit_breaker_enabled'}
+        update = {k: v for k, v in body.items() if k in ALLOWED}
+        if not update:
+            return jsonify({'error': 'no valid fields'}), 400
+        update['updated_at'] = datetime.now(timezone.utc).isoformat()
+        upsert_hdrs = {**_ALGO_SUPA_HDR, 'Prefer': 'resolution=merge-duplicates,return=representation'}
+        r = requests.post(_ALGO_SUPA_URL, headers=upsert_hdrs,
+                          json={**{'id': 1}, **update}, timeout=10)
+        if r.ok:
+            current = _get_live_config()
+            logger.info(f'Algo config updated: {update}')
+            return jsonify({'status': 'ok', 'config': current})
+        return jsonify({'error': r.text}), 500
     except Exception as e:
         logger.error(f'scanner/config POST error: {e}')
         return jsonify({'error': str(e)}), 500
@@ -7995,26 +7993,17 @@ def crypto_algo_status():
 
 @app.route('/api/crypto/algo/config', methods=['GET', 'POST'])
 def crypto_algo_config():
-    """GET/POST crypto scanner configuration."""
+    """GET/POST crypto scanner configuration — persisted in Supabase crypto_settings."""
     try:
-        from crypto_scanner import get_config, update_config
+        from crypto_scanner import get_config, update_config, ALL_COINS
         if request.method == 'POST':
             body = request.get_json(force=True) or {}
-            update_config(body, redis_set)
-            return jsonify({'status': 'updated'})
-        return jsonify({**get_config(redis_get), 'status': 'ok'})
+            update_config(body)
+            return jsonify({'status': 'ok', 'config': get_config()})
+        return jsonify({**get_config(), 'status': 'ok', 'all_coins': ALL_COINS})
     except Exception as e:
         logger.warning(f'crypto/algo/config error: {e}')
-        return jsonify({
-            'min_confidence': 0.68,
-            'max_trades_per_day': 4,
-            'position_size_pct': 0.05,
-            'stop_loss_pct': 0.03,
-            'take_profit_pct': 0.06,
-            'enabled_coins': ['BTC/USD', 'ETH/USD', 'SOL/USD', 'DOGE/USD'],
-            'status': 'error',
-            'error': str(e),
-        })
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/crypto/order', methods=['POST'])
@@ -8489,9 +8478,15 @@ def _check_drawdown_circuit_breaker():
     If today's realized P&L drops below the configured drawdown limit,
     auto-pause the intraday algo and send an FCM alert.
     Runs every 5 min. Will not re-fire if already triggered today.
+    Skipped if circuit_breaker_enabled=false in algo_config.
     """
     global _circuit_breaker_fired_date
     try:
+        # Respect circuit_breaker_enabled flag in algo_config
+        cb_cfg = _get_live_config()
+        if not cb_cfg.get('circuit_breaker_enabled', True):
+            return
+
         from datetime import date as _date
         today = _date.today().isoformat()
 
@@ -8537,11 +8532,13 @@ def api_circuit_breaker_status():
     today = _date.today().isoformat()
     algo_paused = os.environ.get('INTRADAY_TRADING_ENABLED', 'true').lower() != 'true'
     threshold = float(os.environ.get('DRAWDOWN_LIMIT', '-500'))
+    cb_enabled = _get_live_config().get('circuit_breaker_enabled', True)
     return jsonify({
         'status': 'ok',
         'algo_paused': algo_paused,
         'fired_today': _circuit_breaker_fired_date == today,
         'drawdown_limit': threshold,
+        'circuit_breaker_enabled': cb_enabled,
     })
 
 
@@ -8680,24 +8677,40 @@ def _check_price_alerts():
         logger.warning(f'_check_price_alerts error: {e}')
 
 
-_CAPITAL_KEY = 'settings:capital'
-_CAPITAL_DEFAULTS = {'crypto_capital': 5000, 'options_capital': 5000}
+_CAPITAL_DEFAULTS = {'crypto_capital': 5000, 'options_capital': 5000, 'stocks_capital': 10000}
+_CAPITAL_SUPA_URL = f'{SUPABASE_URL}/rest/v1/capital_settings'
+_CAPITAL_SUPA_HDR = {
+    'apikey': SUPABASE_KEY,
+    'Authorization': f'Bearer {SUPABASE_KEY}',
+    'Content-Type': 'application/json',
+}
 
 @app.route('/api/capital/settings', methods=['GET', 'POST'])
 def capital_settings():
-    """GET/POST capital allocation settings (crypto + options pool sizes)."""
+    """GET/POST capital allocation settings stored in Supabase capital_settings table."""
     if request.method == 'GET':
-        saved = redis_get(_CAPITAL_KEY) or {}
-        return jsonify({**_CAPITAL_DEFAULTS, **saved})
+        try:
+            r = requests.get(f'{_CAPITAL_SUPA_URL}?id=eq.1', headers=_CAPITAL_SUPA_HDR, timeout=10)
+            if r.ok and r.json():
+                row = r.json()[0]
+                return jsonify({k: row.get(k, _CAPITAL_DEFAULTS[k]) for k in _CAPITAL_DEFAULTS})
+        except Exception:
+            pass
+        return jsonify(_CAPITAL_DEFAULTS)
     try:
         body = request.get_json(force=True) or {}
-        current = {**_CAPITAL_DEFAULTS, **(redis_get(_CAPITAL_KEY) or {})}
-        for k in ('crypto_capital', 'options_capital'):
+        update = {'id': 1}
+        for k in ('crypto_capital', 'options_capital', 'stocks_capital'):
             if k in body and isinstance(body[k], (int, float)) and body[k] > 0:
-                current[k] = int(body[k])
-        redis_set(_CAPITAL_KEY, current, ttl_seconds=86400 * 90)
-        logger.info(f'Capital settings updated: {current}')
-        return jsonify({'status': 'ok', 'settings': current})
+                update[k] = int(body[k])
+        update['updated_at'] = datetime.now(timezone.utc).isoformat()
+        upsert_hdrs = {**_CAPITAL_SUPA_HDR, 'Prefer': 'resolution=merge-duplicates,return=representation'}
+        r = requests.post(_CAPITAL_SUPA_URL, headers=upsert_hdrs, json=update, timeout=10)
+        if r.ok:
+            row = r.json()[0] if r.json() else update
+            logger.info(f'Capital settings updated: {update}')
+            return jsonify({'status': 'ok', 'settings': {k: row.get(k, _CAPITAL_DEFAULTS[k]) for k in _CAPITAL_DEFAULTS}})
+        return jsonify({'error': r.text}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

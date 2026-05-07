@@ -104,8 +104,9 @@ def scan_income(
 
             puts = chain['puts'].copy()
 
-            # Filter OI
-            puts = puts[puts['openInterest'] >= min_oi]
+            # Only keep contracts with active market quotes (bid > 0 or ask > 0)
+            # Contracts with bid=ask=0 have stale/unreliable IV, making greeks useless
+            puts = puts[(puts['bid'] > 0) | (puts['ask'] > 0)]
             if puts.empty:
                 continue
 

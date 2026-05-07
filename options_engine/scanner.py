@@ -9,11 +9,18 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import requests
 import yaml
 
 logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.yaml')
+
+_SUPA_URL = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
+_SUPA_KEY = os.environ.get('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg')
+_SUPA_HDR  = {'apikey': _SUPA_KEY, 'Authorization': f'Bearer {_SUPA_KEY}', 'Content-Type': 'application/json'}
+_SUPA_UPSERT_HDR = {**_SUPA_HDR, 'Prefer': 'resolution=merge-duplicates,return=representation'}
+_PICKS_URL = f'{_SUPA_URL}/rest/v1/options_picks_cache'
 
 _state = {
     'running':      False,
@@ -28,6 +35,42 @@ _state_lock = threading.Lock()
 _thread: threading.Thread | None = None
 
 
+def _is_market_open() -> bool:
+    """Returns True if US options market is currently open (Mon-Fri 9:30–16:00 ET)."""
+    import pytz
+    et = pytz.timezone('America/New_York')
+    now = datetime.now(et)
+    if now.weekday() >= 5:  # Sat/Sun
+        return False
+    t = now.hour * 60 + now.minute
+    return 570 <= t <= 960  # 9:30=570, 16:00=960
+
+
+def _save_picks_to_supabase(income: list, growth: list):
+    try:
+        payload = {
+            'id': 1,
+            'income_picks': income,
+            'growth_picks': growth,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        requests.post(_PICKS_URL, headers=_SUPA_UPSERT_HDR, json=payload, timeout=10)
+        logger.info(f'options_scanner: saved {len(income)} income + {len(growth)} growth picks to Supabase')
+    except Exception as e:
+        logger.warning(f'options_scanner: Supabase save failed: {e}')
+
+
+def _load_picks_from_supabase() -> tuple[list, list]:
+    try:
+        r = requests.get(f'{_PICKS_URL}?id=eq.1', headers=_SUPA_HDR, timeout=8)
+        if r.status_code == 200 and r.json():
+            row = r.json()[0]
+            return row.get('income_picks') or [], row.get('growth_picks') or []
+    except Exception as e:
+        logger.warning(f'options_scanner: Supabase load failed: {e}')
+    return [], []
+
+
 def _load_config() -> dict:
     try:
         path = os.environ.get('OPTIONS_CONFIG_PATH', _CONFIG_PATH)
@@ -40,6 +83,12 @@ def _load_config() -> dict:
 
 def _run_scan():
     global _prev_income_tickers
+
+    if not _is_market_open():
+        logger.info('options_scanner: market closed — skipping scan, using cached picks')
+        with _state_lock:
+            _state['scan_count'] += 1
+        return
 
     from options_engine.engines.income_engine import scan_income
     from options_engine.engines.growth_engine import scan_growth
@@ -58,20 +107,23 @@ def _run_scan():
     income_dicts = [t.to_dict() for t in income_results[:10]]
     growth_dicts = [t.to_dict() for t in growth_results[:10]]
 
+    # Only update in-memory + Supabase if we got results (don't wipe good picks with empty scan)
+    if income_dicts or growth_dicts:
+        with _state_lock:
+            _state['income_picks'] = income_dicts
+            _state['growth_picks'] = growth_dicts
+        _save_picks_to_supabase(income_dicts, growth_dicts)
+        _notify_new_picks(income_dicts, growth_dicts)
+
     with _state_lock:
-        _state['last_scan']    = datetime.now(timezone.utc).isoformat()
-        _state['scan_count']  += 1
-        _state['income_picks'] = income_dicts
-        _state['growth_picks'] = growth_dicts
-        _state['error']        = None
+        _state['last_scan']   = datetime.now(timezone.utc).isoformat()
+        _state['scan_count'] += 1
+        _state['error']       = None
 
     logger.info(
         f'options_scanner: scan #{_state["scan_count"]} done — '
         f'{len(income_results)} income, {len(growth_results)} growth candidates'
     )
-
-    # Alert on new high-conviction income picks
-    _notify_new_picks(income_dicts, growth_dicts)
 
 
 def _notify_new_picks(income_dicts: list, growth_dicts: list):
@@ -105,8 +157,14 @@ def _notify_new_picks(income_dicts: list, growth_dicts: list):
 
 
 def _scan_loop():
+    # Restore last good picks from Supabase immediately on startup
+    income_cached, growth_cached = _load_picks_from_supabase()
     with _state_lock:
-        _state['running'] = True
+        _state['running']      = True
+        if income_cached or growth_cached:
+            _state['income_picks'] = income_cached
+            _state['growth_picks'] = growth_cached
+            logger.info(f'options_scanner: restored {len(income_cached)} income + {len(growth_cached)} growth picks from Supabase')
 
     while True:
         try:
@@ -161,10 +219,23 @@ def register_routes(app):
 
     @app.route('/api/options/scan', methods=['POST'])
     def options_scan_now():
-        """Trigger an immediate scan (runs in background thread)."""
-        t = threading.Thread(target=_run_scan, daemon=True)
+        """Trigger an immediate scan. Passes market-hours check unless force=true."""
+        from flask import request as req
+        force = req.args.get('force', '').lower() == 'true'
+        def _forced_scan():
+            # Temporarily bypass market hours check
+            orig = globals().get('_is_market_open')
+            try:
+                import options_engine.scanner as _self
+                _orig = _self._is_market_open
+                _self._is_market_open = lambda: True
+                _run_scan()
+            finally:
+                _self._is_market_open = _orig
+        target = _forced_scan if force else _run_scan
+        t = threading.Thread(target=target, daemon=True)
         t.start()
-        return jsonify({'status': 'ok', 'message': 'scan triggered'})
+        return jsonify({'status': 'ok', 'message': 'scan triggered', 'market_open': _is_market_open(), 'forced': force})
 
     @app.route('/api/options/debug/<ticker>')
     def options_debug_ticker(ticker):
@@ -211,14 +282,15 @@ def register_routes(app):
             return jsonify(result)
         puts = chain['puts'].copy()
         result['puts_total'] = len(puts)
-        puts = puts[puts['openInterest'] >= min_oi]
-        result['puts_after_oi_filter'] = len(puts)
+        puts = puts[(puts['bid'] > 0) | (puts['ask'] > 0)]
+        result['puts_after_bid_filter'] = len(puts)
         if puts.empty:
-            result['fail'] = 'oi_filter'
+            result['fail'] = 'no_active_quotes'
             return jsonify(result)
         enrich_chain_with_greeks(puts, snap['price'])
         enrich_chain_with_pop(puts, mode='income')
-        result['sample_deltas'] = puts[['strike', 'delta', 'openInterest', 'mid', 'pop']].head(10).to_dict(orient='records') if 'delta' in puts.columns else 'no_delta'
+        result['sample_deltas'] = puts[['strike', 'dte', 'impliedVolatility', 'delta', 'openInterest', 'bid', 'ask', 'mid', 'pop']].head(10).to_dict(orient='records') if 'delta' in puts.columns else 'no_delta'
+        result['iv_stats'] = {'median': float(puts['impliedVolatility'].median()), 'max': float(puts['impliedVolatility'].max()), 'min': float(puts['impliedVolatility'].min())} if 'impliedVolatility' in puts.columns else {}
         contract = select_income_contract(puts)
         if contract is None:
             result['fail'] = 'no_contract_selected'
