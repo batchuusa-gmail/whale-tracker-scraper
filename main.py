@@ -8561,10 +8561,9 @@ _SUPA_ALERTS_URL = f"{SUPABASE_URL}/rest/v1/price_alerts"
 
 
 def _alerts_headers(prefer: str = 'return=representation') -> dict:
-    key = os.getenv('SUPABASE_SERVICE_KEY', os.getenv('SUPABASE_KEY', ''))
     return {
-        'apikey':        key,
-        'Authorization': f'Bearer {key}',
+        'apikey':        SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
         'Content-Type':  'application/json',
         'Prefer':        prefer,
     }
