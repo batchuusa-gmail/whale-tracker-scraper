@@ -207,8 +207,16 @@ def place_intraday_order(signal: dict) -> dict:
     if sig_str not in ('BUY', 'SELL'):
         return {'status': 'skipped', 'message': f'Signal {sig_str} is not actionable'}
 
-    if confidence < 0.70:
-        return {'status': 'skipped', 'message': f'Confidence {confidence:.0%} below 70% threshold'}
+    # Read min_confidence from Supabase algo_config (set via app Config screen)
+    _min_conf = 0.55
+    try:
+        rows = _supa_get('algo_config', 'id=eq.1&limit=1')
+        if rows:
+            _min_conf = float(rows[0].get('min_confidence', 55)) / 100
+    except Exception:
+        pass
+    if confidence < _min_conf:
+        return {'status': 'skipped', 'message': f'Confidence {confidence:.0%} below {_min_conf:.0%} threshold'}
 
     # Check position limits (manual orders from Trading Terminal bypass the auto limit)
     is_manual = bool(signal.get('manual'))

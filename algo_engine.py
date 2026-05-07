@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 EVAL_INTERVAL_SECS   = 90       # how often the engine wakes up
 MAX_DAILY_LOSS_PCT   = 0.02     # 2% of portfolio — circuit trips if daily P&L < -2%
 DEFAULT_MIN_SCORE    = 65       # fallback if algo_config not readable
-DEFAULT_MIN_CONF     = 0.70     # fallback confidence threshold
+DEFAULT_MIN_CONF     = 0.55     # fallback confidence threshold
 DEFAULT_MAX_TRADES   = 3        # fallback max trades per day
 
 _ET = pytz.timezone('America/New_York')
@@ -496,7 +496,7 @@ def register_routes(app):
         except Exception:
             rows = _sb_get('algo_config', 'id=eq.1&limit=1')
             return jsonify(rows[0] if rows else {
-                'min_confidence': 0.72,
+                'min_confidence': 55,
                 'max_trades_per_day': 3,
                 'position_size_pct': 0.05,
                 'stop_loss_pct': 0.08,
