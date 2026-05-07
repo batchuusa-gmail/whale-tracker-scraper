@@ -8681,6 +8681,28 @@ def _check_price_alerts():
         logger.warning(f'_check_price_alerts error: {e}')
 
 
+_CAPITAL_KEY = 'settings:capital'
+_CAPITAL_DEFAULTS = {'crypto_capital': 5000, 'options_capital': 5000}
+
+@app.route('/api/capital/settings', methods=['GET', 'POST'])
+def capital_settings():
+    """GET/POST capital allocation settings (crypto + options pool sizes)."""
+    if request.method == 'GET':
+        saved = redis_get(_CAPITAL_KEY) or {}
+        return jsonify({**_CAPITAL_DEFAULTS, **saved})
+    try:
+        body = request.get_json(force=True) or {}
+        current = {**_CAPITAL_DEFAULTS, **(redis_get(_CAPITAL_KEY) or {})}
+        for k in ('crypto_capital', 'options_capital'):
+            if k in body and isinstance(body[k], (int, float)) and body[k] > 0:
+                current[k] = int(body[k])
+        redis_set(_CAPITAL_KEY, current, ttl_seconds=86400 * 90)
+        logger.info(f'Capital settings updated: {current}')
+        return jsonify({'status': 'ok', 'settings': current})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'api':
