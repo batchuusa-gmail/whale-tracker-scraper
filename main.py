@@ -5604,6 +5604,51 @@ def notify_send():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/notify/test', methods=['POST'])
+def notify_test():
+    """Send a test push to all registered devices. Returns full FCM response for debugging."""
+    try:
+        from firebase_push import _get_access_token, send_to_token
+        body_json = request.get_json(silent=True, force=True) or {}
+        title = body_json.get('title', 'ApexTrader Test')
+        body  = body_json.get('body', 'Test notification from ApexTrader')
+
+        hdrs = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
+        r = requests.get(f'{SUPABASE_URL}/rest/v1/user_devices?select=fcm_token', headers=hdrs, timeout=8)
+        raw_rows = r.json() if r.ok else []
+        all_tokens = [row['fcm_token'] for row in raw_rows
+                      if row.get('fcm_token') and 'test_token' not in row['fcm_token']]
+
+        if not all_tokens:
+            return jsonify({'error': 'no valid FCM tokens found', 'total_rows': len(raw_rows),
+                            'supabase_status': r.status_code,
+                            'hint': 'open the app to register a fresh token'})
+
+        access_token = _get_access_token()
+        if not access_token:
+            return jsonify({'error': 'Firebase credentials not configured — check FIREBASE_SERVICE_ACCOUNT_JSON'})
+
+        FCM_URL = 'https://fcm.googleapis.com/v1/projects/whaletracker-79d6a/messages:send'
+        results = []
+        for token in all_tokens:
+            payload = {'message': {
+                'token': token,
+                'notification': {'title': title, 'body': body},
+                'apns': {'payload': {'aps': {'sound': 'default', 'badge': 1}}},
+            }}
+            resp = requests.post(FCM_URL,
+                                 headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
+                                 json=payload, timeout=10)
+            results.append({'token_prefix': token[:25] + '...', 'http_status': resp.status_code, 'fcm_response': resp.json()})
+            logger.info(f'notify/test → {token[:20]}... status={resp.status_code} resp={resp.text[:100]}')
+
+        success = sum(1 for r in results if r['http_status'] == 200)
+        return jsonify({'sent_to': len(all_tokens), 'success': success, 'results': results})
+    except Exception as e:
+        logger.error(f'notify/test error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 # ─── /api/ticker/analyze — WHAL-150 Ticker Explorer: deep AI + day trading ───
 
 @app.route('/api/ticker/analyze/<ticker>', methods=['GET'])
