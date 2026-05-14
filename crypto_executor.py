@@ -198,8 +198,15 @@ def place_crypto_order(signal: dict) -> dict:
     stop_loss_pct   = float(signal.get('stop_loss_pct', 0.03))
     take_profit_pct = float(signal.get('take_profit_pct', 0.06))
 
-    trade_value     = CRYPTO_CAPITAL_USD * position_pct  # fixed $5k pool, not % of total portfolio
-    qty             = round(trade_value / entry_price, 6) if entry_price > 0 else 0
+    # Use actual available buying power from Alpaca, capped at CRYPTO_CAPITAL_USD
+    acct_status, acct = _alpaca('get', '/v2/account')
+    available_cash = float(acct.get('non_marginable_buying_power') or acct.get('cash', 0)) if acct_status == 200 else 0
+    capital = min(available_cash, CRYPTO_CAPITAL_USD)
+    if capital < 10:
+        return {'status': 'error', 'reason': f'insufficient buying power (${available_cash:.2f} available)'}
+
+    trade_value = capital * position_pct
+    qty         = round(trade_value / entry_price, 6) if entry_price > 0 else 0
 
     if qty <= 0 or trade_value < 1.0:
         return {'status': 'error', 'reason': 'qty too small'}

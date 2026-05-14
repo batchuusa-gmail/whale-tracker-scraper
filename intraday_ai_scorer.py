@@ -122,7 +122,7 @@ def _fetch_bars(ticker: str, limit: int = 30) -> list[dict]:
         r = requests.get(
             f'{_ALPACA_DATA}/v2/stocks/{ticker}/bars',
             headers={'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret},
-            params={'timeframe': '1Min', 'limit': limit, 'feed': 'sip'},
+            params={'timeframe': '1Min', 'limit': limit, 'feed': 'iex'},
             timeout=10,
         )
         if r.status_code == 200:
@@ -214,7 +214,7 @@ def _call_claude(ticker: str, indicators: dict, scanner_score: int,
 
     day_gain = indicators.get('day_gain_pct', 0)
 
-    prompt = f"""You are an intraday trading analyst. Make precise, disciplined trade decisions.
+    prompt = f"""You are an intraday trading analyst. Make disciplined but active trade decisions.
 
 Stock: {ticker}
 Price: ${price:.2f} | Day gain so far: {day_gain:+.2f}% | 30-min change: {change_pct:+.2f}%
@@ -223,19 +223,18 @@ RSI: {rsi} | MACD: {macd} | Trend: {trend}
 Insider activity (last 30d): {insider_summary or 'none'}
 S&P 500: {sp500_trend or 'neutral'}
 
-Entry rules (ALL must be true to BUY):
-1. Day gain < 3% — do NOT chase stocks already up big
-2. RSI between 40–70 — momentum without being overbought
-3. Volume > 1.5x average — confirms real interest
-4. Trend is up AND MACD is bullish
-5. Scanner score >= 75
+Entry rules (BUY if most conditions are met):
+1. Day gain < 6% — avoid chasing stocks that already made their big move
+2. RSI between 30–82 — oversold to slightly overbought is fine for momentum trades
+3. Trend is up OR scanner score >= 80 (strong scanner signal overrides short-term dip)
+4. Scanner score >= 60 — scanner already vetted volume, MACD, insider activity
 
 Risk rules:
-- Stop loss: -1.5% from entry (gives room for normal noise)
-- Target 1: +2.5% (partial exit, lock in profit)
-- Target 2: +4.0% (runner — only if strong momentum)
+- Stop loss: -1.5% from entry
+- Target 1: +2.5% (partial exit)
+- Target 2: +4.0% (runner)
 - Hold: 30–120 minutes. NEVER hold overnight.
-- If ANY rule is violated → SKIP
+- SKIP only if stock is clearly overbought (day gain > 6%), RSI > 82, or strong downtrend with no scanner support
 
 Respond ONLY with valid JSON (no markdown):
 {{
@@ -303,14 +302,28 @@ def _technical_fallback(indicators: dict, scanner_score: int) -> dict:
     change    = indicators.get('change_pct', 0)
     day_gain  = indicators.get('day_gain_pct', 0)
 
-    bullish = (
-        scanner_score >= 75 and       # raised threshold
-        trend == 'up' and
-        change > 0.5 and
-        day_gain < 3.0 and            # don't chase
-        (rsi is None or 40 <= rsi <= 70) and
-        'bullish' in macd
-    )
+    # High-conviction picks (≥80): scanner vetted volume/insider/breakout — minimal sanity check only
+    if scanner_score >= 80:
+        bullish = rsi is None or rsi <= 90
+
+    # Good picks (≥60): scanner already verified momentum — just avoid downtrends and extreme RSI
+    elif scanner_score >= 60:
+        bullish = (
+            trend == 'up' and
+            (rsi is None or 25 <= rsi <= 88)
+        )
+
+    # Lower-score fallback: stricter criteria
+    else:
+        macd_ok = ('bullish' in macd) or (macd == 'neutral' and scanner_score >= 75)
+        bullish = (
+            scanner_score >= 50 and
+            trend == 'up' and
+            change > 0.2 and
+            day_gain < 5.0 and
+            (rsi is None or 40 <= rsi <= 75) and
+            macd_ok
+        )
     signal     = 'BUY' if bullish else 'SKIP'
     confidence = min(scanner_score / 100, 0.72)  # cap at 72% without AI
 

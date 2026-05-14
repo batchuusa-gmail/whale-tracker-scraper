@@ -1,18 +1,17 @@
 """
-WHAL-96 — Intraday Trade Executor
-Places and monitors paper trades on Alpaca with tight intraday stop/target rules.
-ALL positions force-closed at 3:45 PM ET — never hold overnight.
+Intraday Trade Executor — Technical Pattern Edition
+Places and monitors paper trades on Alpaca.
+
+Rules:
+  - Stop loss:  1.5× ATR(14) from entry
+  - Target 1:   1× ATR → sell 50% of position
+  - Target 2:   2× ATR → sell remainder
+  - Max 3 simultaneous open positions
+  - Extended hours orders (extended_hours=True, time_in_force='day')
+  - No forced EOD close — hold overnight if stop/target not hit
+  - No circuit breaker
 
 Kill switch: INTRADAY_TRADING_ENABLED=true/false (Railway env var)
-
-Trade Rules:
-  - Max 5 simultaneous open positions
-  - Max 10% of paper portfolio per trade
-  - Stop loss:  -1.5% from entry
-  - Target 1:  +2.5% → sell 50% (partial, or AI-computed)
-  - Target 2:  +4.0% → sell remainder (or AI-computed)
-  - Time stop: close if held > 120 minutes
-  - Hard close: ALL positions closed at 3:45 PM ET
 """
 
 import os
@@ -20,34 +19,28 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import pytz
 import requests
 
 logger = logging.getLogger(__name__)
 
-PAPER_BASE      = 'https://paper-api.alpaca.markets'
-ALPACA_DATA     = 'https://data.alpaca.markets'
-STOP_LOSS_PCT   = 0.015   # -1.5%
-TARGET_1_PCT    = 0.025   # +2.5% → sell 50%  (fallback if AI omits)
-TARGET_2_PCT    = 0.040   # +4.0% → sell remainder (fallback if AI omits)
-MAX_HOLD_MINS   = 120
-MIN_HOLD_MINS   = 3       # don't check stop/target for first 3 minutes
-MAX_POSITIONS   = 5
-MAX_ALLOC_PCT   = 0.10    # 10% of portfolio per trade
-MONITOR_SECS    = 30
-FORCE_CLOSE_H   = 15      # 3 PM ET
-FORCE_CLOSE_M   = 45      # :45
+PAPER_BASE    = 'https://paper-api.alpaca.markets'
+ALPACA_DATA   = 'https://data.alpaca.markets'
+MAX_POSITIONS = 25
+MAX_TRADE_USD = 15_000    # hard cap per trade
+MIN_HOLD_MINS = 3         # don't trigger stop/target in first 3 min
+MONITOR_SECS  = 30
 
 _ET = pytz.timezone('America/New_York')
 
-# ── State ────────────────────────────────────────────────────────
-
-# Tracks partial-sell status per ticker: {ticker: bool}
+# Per-ticker partial-sell state: {ticker: bool}
 _partial_sold: dict[str, bool] = {}
 _state_lock = threading.Lock()
 
+
+# ── Helpers ──────────────────────────────────────────────────────
 
 def _enabled() -> bool:
     return os.environ.get('INTRADAY_TRADING_ENABLED', 'false').lower() == 'true'
@@ -77,7 +70,7 @@ def _alpaca(method: str, path: str, **kwargs):
 
 
 def _latest_price(ticker: str) -> float | None:
-    """Fetch latest trade price from Alpaca data API."""
+    """Fetch latest trade price via Alpaca IEX feed."""
     key    = os.environ.get('ALPACA_KEY', '')
     secret = os.environ.get('ALPACA_SECRET', '')
     if not key or not secret:
@@ -86,6 +79,7 @@ def _latest_price(ticker: str) -> float | None:
         r = requests.get(
             f'{ALPACA_DATA}/v2/stocks/{ticker}/trades/latest',
             headers={'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret},
+            params={'feed': 'iex'},
             timeout=8,
         )
         if r.status_code == 200:
@@ -95,26 +89,38 @@ def _latest_price(ticker: str) -> float | None:
     return None
 
 
-# ── FCM push helper (FCM v1 API via firebase_push.py) ────────────
+# ── FCM push ─────────────────────────────────────────────────────
+
+_SUPA_URL = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
+_SUPA_KEY = os.environ.get(
+    'SUPABASE_KEY',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg'
+)
+_SUPA_HDRS = {
+    'apikey':        _SUPA_KEY,
+    'Authorization': f'Bearer {_SUPA_KEY}',
+    'Content-Type':  'application/json',
+    'Prefer':        'resolution=merge-duplicates,return=minimal',
+}
+
 
 def _send_fcm_to_all(title: str, body: str, data: dict | None = None):
-    """Send FCM push to all stored device tokens using FCM v1 API."""
+    """Send FCM push notification to all registered device tokens."""
     try:
         from firebase_push import send_to_tokens
-        # Fetch all FCM tokens from Supabase user_devices
         r = requests.get(
-            f'{os.environ.get("SUPABASE_URL", "https://bedurjtazsfbnkisoeee.supabase.co")}'
-            '/rest/v1/user_devices?select=fcm_token',
+            f'{_SUPA_URL}/rest/v1/user_devices?select=fcm_token',
             headers={
-                'apikey': os.environ.get('SUPABASE_KEY', ''),
-                'Authorization': f'Bearer {os.environ.get("SUPABASE_KEY", "")}',
+                'apikey':        _SUPA_KEY,
+                'Authorization': f'Bearer {_SUPA_KEY}',
             },
             timeout=10,
         )
-        tokens = [row.get('fcm_token') for row in (r.json() if r.status_code == 200 else [])
-                  if row.get('fcm_token')]
+        tokens = [
+            row.get('fcm_token') for row in (r.json() if r.status_code == 200 else [])
+            if row.get('fcm_token')
+        ]
         if not tokens:
-            logger.info('FCM: no device tokens found')
             return
         sent = send_to_tokens(tokens, title, body, data or {})
         logger.info(f'FCM sent to {sent}/{len(tokens)} devices: {title}')
@@ -123,19 +129,6 @@ def _send_fcm_to_all(title: str, body: str, data: dict | None = None):
 
 
 # ── Supabase helpers ─────────────────────────────────────────────
-
-_SUPA_URL = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
-_SUPA_KEY = os.environ.get(
-    'SUPABASE_KEY',
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg'
-)
-_SUPA_HDRS = {
-    'apikey': _SUPA_KEY,
-    'Authorization': f'Bearer {_SUPA_KEY}',
-    'Content-Type': 'application/json',
-    'Prefer': 'resolution=merge-duplicates,return=minimal',
-}
-
 
 def _supa_upsert(table: str, rows: list):
     if not rows:
@@ -164,7 +157,7 @@ def _supa_get(table: str, query: str = '') -> list:
     return []
 
 
-# ── Market hours helpers ─────────────────────────────────────────
+# ── Market hours ─────────────────────────────────────────────────
 
 def _is_market_open() -> bool:
     now = datetime.now(_ET)
@@ -175,21 +168,57 @@ def _is_market_open() -> bool:
     return mo <= now <= mc
 
 
-def _is_force_close_time() -> bool:
+def _is_active_window() -> bool:
+    """Trading window: 7:00 AM – 3:45 PM ET."""
     now = datetime.now(_ET)
-    fc  = now.replace(hour=FORCE_CLOSE_H, minute=FORCE_CLOSE_M, second=0, microsecond=0)
-    return now >= fc and now.weekday() < 5
+    if now.weekday() >= 5:
+        return False
+    start = now.replace(hour=7,  minute=0,  second=0, microsecond=0)
+    end   = now.replace(hour=15, minute=45, second=0, microsecond=0)
+    return start <= now <= end
 
 
-# ── Core trade execution ─────────────────────────────────────────
+# ── Position sizing ──────────────────────────────────────────────
+
+def _calc_qty(entry: float, position_size_pct: float) -> tuple[int, str]:
+    """
+    Calculate share quantity using non_marginable_buying_power × position_size_pct.
+    Caps at MAX_TRADE_USD per trade.
+    Returns (qty, error_message_or_empty).
+    """
+    if entry <= 0:
+        return 0, 'entry price is 0'
+
+    _, account = _alpaca('get', '/v2/account')
+    if not account:
+        return 0, 'could not fetch account'
+
+    # PDT guard
+    is_pdt = account.get('pattern_day_trader', False)
+    dt_bp  = float(account.get('daytrading_buying_power') or 0)
+    if is_pdt and dt_bp == 0:
+        return 0, 'PDT daytrading_buying_power=0 — reset paper account'
+
+    buying_power = float(account.get('non_marginable_buying_power') or
+                         account.get('buying_power') or 0)
+    if buying_power < entry:
+        return 0, f'insufficient buying_power ${buying_power:.2f}'
+
+    alloc = min(buying_power * position_size_pct, MAX_TRADE_USD)
+    qty   = max(1, int(alloc / entry))
+    return qty, ''
+
+
+# ── Order placement ──────────────────────────────────────────────
 
 def place_intraday_order(signal: dict) -> dict:
     """
-    Place an intraday market order on Alpaca paper account.
+    Place a market order on Alpaca paper account.
 
-    signal must have: ticker, signal ('BUY'/'SELL'), entry, stop_loss,
-                      target, hold_minutes, confidence, reasoning
-    Returns dict with status, order details.
+    Required signal fields: ticker, signal ('BUY'/'SELL'), entry,
+    stop_loss, target_1, target_2, confidence, reasoning
+
+    Optional: position_size_pct (default 0.10), qty_override, manual
     """
     if not _enabled():
         return {'status': 'disabled', 'message': 'INTRADAY_TRADING_ENABLED is not true'}
@@ -201,140 +230,142 @@ def place_intraday_order(signal: dict) -> dict:
     stop_loss  = float(signal.get('stop_loss') or 0)
     target_1   = float(signal.get('target_1') or signal.get('target') or 0)
     target_2   = float(signal.get('target_2') or 0)
-    hold_mins  = int(signal.get('hold_minutes') or 60)
     reasoning  = str(signal.get('reasoning') or '')
+    is_manual  = bool(signal.get('manual'))
+    pos_pct    = float(signal.get('position_size_pct') or 0.10)
 
     if sig_str not in ('BUY', 'SELL'):
-        return {'status': 'skipped', 'message': f'Signal {sig_str} is not actionable'}
+        return {'status': 'skipped', 'message': f'Signal {sig_str!r} not actionable'}
 
-    # Read min_confidence from Supabase algo_config (set via app Config screen)
-    _min_conf = 0.55
-    try:
-        rows = _supa_get('algo_config', 'id=eq.1&limit=1')
-        if rows:
-            _min_conf = float(rows[0].get('min_confidence', 55)) / 100
-    except Exception:
-        pass
-    if confidence < _min_conf:
-        return {'status': 'skipped', 'message': f'Confidence {confidence:.0%} below {_min_conf:.0%} threshold'}
-
-    # Check position limits (manual orders from Trading Terminal bypass the auto limit)
-    is_manual = bool(signal.get('manual'))
+    # Check open positions
     _, positions = _alpaca('get', '/v2/positions')
     open_count   = len(positions) if isinstance(positions, list) else 0
 
-    # Read max_positions from Redis live config (set dynamically by the app)
+    # Read max_positions from Supabase (or use default)
     effective_max = MAX_POSITIONS
     try:
-        import redis as _redis_mod
-        _r = _redis_mod.from_url(os.environ.get('REDIS_URL', ''), decode_responses=False)
-        import json as _json
-        raw = _r.get('algo:live_config')
-        if raw:
-            cfg = _json.loads(raw)
-            effective_max = int(cfg.get('max_positions', MAX_POSITIONS))
+        rows = _supa_get('algo_settings', 'limit=1')
+        if rows and rows[0].get('max_positions'):
+            effective_max = int(rows[0]['max_positions'])
     except Exception:
         pass
 
     if not is_manual and open_count >= effective_max:
-        return {'status': 'skipped', 'message': f'Max {effective_max} open positions reached'}
+        return {'status': 'skipped', 'message': f'Max {effective_max} positions open'}
 
-    # Check if already in this ticker (manual orders from Terminal are allowed to add/reduce)
+    # Prevent duplicate position in same ticker
     if isinstance(positions, list) and not is_manual:
-        existing = [p for p in positions if p.get('symbol') == ticker]
-        if existing:
+        if any(p.get('symbol') == ticker for p in positions):
             return {'status': 'skipped', 'message': f'Already holding {ticker}'}
 
-    # Calculate quantity: use override if provided, else 10% of portfolio
+    # Quantity
     qty_override = signal.get('qty_override')
     if qty_override and int(qty_override) > 0:
         qty = int(qty_override)
+        qty_err = ''
     else:
-        _, account = _alpaca('get', '/v2/account')
-        equity     = float(account.get('equity') or 100_000)
-        alloc      = equity * MAX_ALLOC_PCT
-        qty        = max(1, int(alloc / entry)) if entry > 0 else 1
+        qty, qty_err = _calc_qty(entry, pos_pct)
 
-    # Place market order
+    if qty_err:
+        logger.warning(f'place_order qty error for {ticker}: {qty_err}')
+        return {'status': 'skipped', 'message': qty_err}
+    if qty <= 0:
+        return {'status': 'skipped', 'message': 'qty calculated as 0'}
+
+    # Determine side
     side = 'buy' if sig_str == 'BUY' else 'sell'
+
+    # Place order with extended hours support
     status_code, order = _alpaca('post', '/v2/orders', json={
-        'symbol':        ticker,
-        'qty':           str(qty),
-        'side':          side,
-        'type':          'market',
-        'time_in_force': 'day',
+        'symbol':          ticker,
+        'qty':             str(qty),
+        'side':            side,
+        'type':            'market',
+        'time_in_force':   'day',
+        'extended_hours':  True,
     })
 
-    order_id    = order.get('id', '')
-    order_stat  = order.get('status', 'unknown')
-    now_iso     = datetime.now(timezone.utc).isoformat()
+    order_id   = order.get('id', '')
+    order_stat = order.get('status', 'unknown')
+    now_iso    = datetime.now(timezone.utc).isoformat()
 
     if status_code in (200, 201):
-        logger.info(f'Intraday order placed: {side.upper()} {qty} {ticker} @ ~${entry:.2f}')
+        logger.info(f'Order placed: {side.upper()} {qty} {ticker} @ ~${entry:.2f}')
         with _state_lock:
             _partial_sold[ticker] = False
-        # WHAL-136: push notification to all devices
         _send_fcm_to_all(
             title=f'{side.upper()} {ticker}',
-            body=f'Entry ${entry:.2f} | Conf {confidence:.0%} | Stop ${stop_loss:.2f}',
+            body=f'Entry ${entry:.2f} | Stop ${stop_loss:.2f} | Conf {confidence:.0%}',
             data={'ticker': ticker, 'signal': side.upper(), 'confidence': str(confidence)},
         )
     else:
-        logger.error(f'Intraday order failed: {status_code} {order}')
+        logger.error(f'Order failed: {status_code} {order}')
+
+    # Derive fallback targets if not provided
+    if target_1 <= 0:
+        target_1 = round(entry * 1.01, 2)
+    if target_2 <= 0:
+        target_2 = round(entry * 1.02, 2)
 
     row = {
-        'order_id':      order_id,
-        'ticker':        ticker,
-        'side':          side,
-        'qty':           qty,
-        'entry_price':   round(entry, 2),
-        'exit_price':    None,
-        'stop_loss':     round(stop_loss, 2),
-        'target_1':      round(target_1 if target_1 > 0 else entry * (1 + TARGET_1_PCT), 2),
-        'target_2':      round(target_2 if target_2 > 0 else entry * (1 + TARGET_2_PCT), 2),
-        'hold_minutes':  hold_mins,
-        'confidence':    round(confidence, 3),
-        'ai_reasoning':  reasoning[:500],
-        'status':        order_stat,
-        'pnl':           None,
-        'pnl_pct':       None,
-        'exit_reason':   None,
-        'entry_time':    now_iso,
-        'exit_time':     None,
-        'partial_sold':  False,
-        'date':          datetime.now(_ET).strftime('%Y-%m-%d'),
-    }
-    _supa_upsert('intraday_trades', [row])
-
-    return {
-        'status':       'placed' if status_code in (200, 201) else 'error',
         'order_id':     order_id,
         'ticker':       ticker,
         'side':         side,
         'qty':          qty,
-        'entry':        round(entry, 2),
+        'entry_price':  round(entry, 2),
+        'exit_price':   None,
         'stop_loss':    round(stop_loss, 2),
-        'target_1':     round(target_1 if target_1 > 0 else entry * (1 + TARGET_1_PCT), 2),
-        'target_2':     round(target_2 if target_2 > 0 else entry * (1 + TARGET_2_PCT), 2),
-        'http_status':  status_code,
+        'target_1':     round(target_1, 2),
+        'target_2':     round(target_2, 2),
+        'hold_minutes': 0,
+        'confidence':   round(confidence, 3),
+        'ai_reasoning': reasoning[:500],
+        'status':       order_stat,
+        'pnl':          None,
+        'pnl_pct':      None,
+        'exit_reason':  None,
+        'entry_time':   now_iso,
+        'exit_time':    None,
+        'partial_sold': False,
+        'date':         datetime.now(_ET).strftime('%Y-%m-%d'),
+    }
+    _supa_upsert('intraday_trades', [row])
+
+    return {
+        'status':      'placed' if status_code in (200, 201) else 'error',
+        'order_id':    order_id,
+        'ticker':      ticker,
+        'side':        side,
+        'qty':         qty,
+        'entry':       round(entry, 2),
+        'stop_loss':   round(stop_loss, 2),
+        'target_1':    round(target_1, 2),
+        'target_2':    round(target_2, 2),
+        'http_status': status_code,
     }
 
 
-# ── Position monitor ─────────────────────────────────────────────
+# ── Position monitoring ──────────────────────────────────────────
 
 def _check_positions():
-    """Check each open position against stop/target/time rules."""
+    """Check each open position against stop/target rules every MONITOR_SECS."""
     status_code, positions = _alpaca('get', '/v2/positions')
     if not isinstance(positions, list):
         return
 
-    # Load trade records for stop/target/entry_time
-    # Query by status only — date field unreliable (may be null on older rows)
     trades = _supa_get('intraday_trades', 'status=neq.closed&order=entry_time.desc&limit=100')
     trade_map = {r.get('ticker', ''): r for r in trades}
 
+    _CRYPTO_SUFFIXES = ('USD', 'USDT', 'USDC', 'BTC', 'ETH')
+
     for pos in positions:
-        ticker      = pos.get('symbol', '')
+        ticker = pos.get('symbol', '')
+        if not ticker:
+            continue
+        # Skip crypto — handled by crypto_executor
+        if any(ticker.endswith(s) for s in _CRYPTO_SUFFIXES) and len(ticker) > 4:
+            continue
+
         cur_price   = float(pos.get('current_price') or 0)
         entry_price = float(pos.get('avg_entry_price') or 0)
         qty         = float(pos.get('qty') or 0)
@@ -344,30 +375,28 @@ def _check_positions():
             continue
 
         trade = trade_map.get(ticker, {})
-        stop  = float(trade.get('stop_loss') or (entry_price * (1 - STOP_LOSS_PCT)))
-        t2    = float(trade.get('target_2')  or (entry_price * (1 + TARGET_2_PCT)))
-        t1    = float(trade.get('target_1')  or (entry_price * (1 + TARGET_1_PCT)))
+        stop  = float(trade.get('stop_loss') or (
+            entry_price * 0.985 if side == 'long' else entry_price * 1.015))
+        t1    = float(trade.get('target_1') or entry_price * 1.01)
+        t2    = float(trade.get('target_2') or entry_price * 1.02)
 
         # Minutes held
+        mins_held = 0
         entry_time_str = trade.get('entry_time')
-        mins_held      = 0
         if entry_time_str:
             try:
-                et  = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+                et = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
                 mins_held = (datetime.now(timezone.utc) - et).total_seconds() / 60
             except Exception:
                 pass
 
-        pnl_pct = (cur_price - entry_price) / entry_price if entry_price > 0 else 0
-
-        # Skip stop/target checks for the first MIN_HOLD_MINS minutes
+        # Don't check exits in first MIN_HOLD_MINS
         if mins_held < MIN_HOLD_MINS:
             continue
 
         with _state_lock:
             already_partial = _partial_sold.get(ticker, False)
 
-        # Determine exit action
         exit_reason = None
         if side == 'long':
             if cur_price <= stop:
@@ -376,15 +405,13 @@ def _check_positions():
                 exit_reason = 'target_2'
             elif cur_price >= t1 and not already_partial:
                 exit_reason = 'target_1_partial'
-            elif mins_held >= MAX_HOLD_MINS:
-                exit_reason = 'time_stop'
         elif side == 'short':
             if cur_price >= stop:
                 exit_reason = 'stop_loss'
             elif cur_price <= t2:
                 exit_reason = 'target_2'
-            elif mins_held >= MAX_HOLD_MINS:
-                exit_reason = 'time_stop'
+            elif cur_price <= t1 and not already_partial:
+                exit_reason = 'target_1_partial'
 
         if exit_reason == 'target_1_partial':
             _sell_partial(ticker, pos, trade, cur_price, qty)
@@ -396,40 +423,38 @@ def _sell_partial(ticker: str, pos: dict, trade: dict, cur_price: float, qty: fl
     """Sell 50% of position at Target 1."""
     partial_qty = max(1, int(qty / 2))
     side        = 'sell' if pos.get('side', 'long') == 'long' else 'buy'
-    status_code, order = _alpaca('post', '/v2/orders', json={
-        'symbol':        ticker,
-        'qty':           str(partial_qty),
-        'side':          side,
-        'type':          'market',
-        'time_in_force': 'day',
+    sc, order   = _alpaca('post', '/v2/orders', json={
+        'symbol':         ticker,
+        'qty':            str(partial_qty),
+        'side':           side,
+        'type':           'market',
+        'time_in_force':  'day',
+        'extended_hours': True,
     })
-    if status_code in (200, 201):
-        logger.info(f'Intraday partial sell: {partial_qty} {ticker} @ ~${cur_price:.2f} (target_1)')
+    if sc in (200, 201):
+        logger.info(f'Partial sell: {partial_qty} {ticker} @ ~${cur_price:.2f} (target_1)')
         with _state_lock:
             _partial_sold[ticker] = True
-        # Update Supabase
-        order_id = trade.get('order_id', '')
         _supa_upsert('intraday_trades', [{
-            'order_id':     order_id,
+            'order_id':     trade.get('order_id', ''),
             'ticker':       ticker,
             'partial_sold': True,
             'status':       'partial',
         }])
     else:
-        logger.error(f'Intraday partial sell failed: {status_code}')
+        logger.error(f'Partial sell failed: {sc} {order}')
 
 
 def _close_position(ticker: str, pos: dict, trade: dict, reason: str, exit_price: float):
-    """Fully close a position."""
-    status_code, order = _alpaca('delete', f'/v2/positions/{ticker}')
-    if status_code in (200, 201, 204):
-        entry  = float(pos.get('avg_entry_price') or 0)
-        qty    = float(pos.get('qty') or 0)
-        side   = pos.get('side', 'long')
-        pnl    = (exit_price - entry) * qty if side == 'long' else (entry - exit_price) * qty
-        pnl_pct = (exit_price - entry) / entry if entry > 0 else 0
-        now    = datetime.now(timezone.utc).isoformat()
-        # Compute hold_minutes
+    """Fully close a position via Alpaca."""
+    sc, order = _alpaca('delete', f'/v2/positions/{ticker}')
+    if sc in (200, 201, 204):
+        entry    = float(pos.get('avg_entry_price') or 0)
+        qty      = float(pos.get('qty') or 0)
+        side     = pos.get('side', 'long')
+        pnl      = (exit_price - entry) * qty if side == 'long' else (entry - exit_price) * qty
+        pnl_pct  = (exit_price - entry) / entry if entry > 0 else 0
+
         hold_mins = 0
         entry_time_str = trade.get('entry_time')
         if entry_time_str:
@@ -438,14 +463,19 @@ def _close_position(ticker: str, pos: dict, trade: dict, reason: str, exit_price
                 hold_mins = int((datetime.now(timezone.utc) - et).total_seconds() / 60)
             except Exception:
                 pass
-        logger.info(f'Intraday close: {ticker} | reason={reason} | hold={hold_mins}m | pnl=${pnl:.2f} ({pnl_pct:.1%})')
+
+        now = datetime.now(timezone.utc).isoformat()
+        logger.info(
+            f'Close: {ticker} | reason={reason} | '
+            f'hold={hold_mins}m | pnl=${pnl:.2f} ({pnl_pct:.1%})'
+        )
         with _state_lock:
             _partial_sold.pop(ticker, None)
-        # WHAL-136: push notification on sell
+
         pnl_sign = '+' if pnl >= 0 else ''
         _send_fcm_to_all(
             title=f'SELL {ticker} — {pnl_sign}${pnl:.2f}',
-            body=f'P&L: {pnl_sign}{pnl_pct:.1%} | Reason: {reason} | Held {hold_mins}m',
+            body=f'P&L: {pnl_sign}{pnl_pct:.1%} | {reason} | Held {hold_mins}m',
             data={'ticker': ticker, 'signal': 'SELL', 'pnl': str(round(pnl, 2))},
         )
         _supa_upsert('intraday_trades', [{
@@ -460,17 +490,17 @@ def _close_position(ticker: str, pos: dict, trade: dict, reason: str, exit_price
             'hold_minutes': hold_mins,
         }])
     else:
-        logger.error(f'Intraday close failed: {ticker} {status_code}')
+        logger.error(f'Close failed: {ticker} {sc}')
 
 
 def force_close_all() -> dict:
     """Emergency: close ALL open intraday positions immediately."""
     logger.warning('Intraday executor: FORCE CLOSING ALL POSITIONS')
-    status_code, positions = _alpaca('get', '/v2/positions')
+    _, positions = _alpaca('get', '/v2/positions')
     closed = []
     errors = []
 
-    trades = _supa_get('intraday_trades', 'status=neq.closed&order=entry_time.desc&limit=100')
+    trades    = _supa_get('intraday_trades', 'status=neq.closed&order=entry_time.desc&limit=100')
     trade_map = {r.get('ticker', ''): r for r in trades}
 
     if isinstance(positions, list):
@@ -483,13 +513,12 @@ def force_close_all() -> dict:
                 closed.append(ticker)
                 with _state_lock:
                     _partial_sold.pop(ticker, None)
-                # Update Supabase with closed status + hold_minutes
-                trade = trade_map.get(ticker, {})
-                entry  = float(pos.get('avg_entry_price') or 0)
-                cur    = float(pos.get('current_price') or 0)
-                qty    = float(pos.get('qty') or 0)
-                side   = pos.get('side', 'long')
-                pnl    = (cur - entry) * qty if side == 'long' else (entry - cur) * qty
+                trade   = trade_map.get(ticker, {})
+                entry   = float(pos.get('avg_entry_price') or 0)
+                cur     = float(pos.get('current_price') or 0)
+                qty     = float(pos.get('qty') or 0)
+                side    = pos.get('side', 'long')
+                pnl     = (cur - entry) * qty if side == 'long' else (entry - cur) * qty
                 pnl_pct = (cur - entry) / entry if entry > 0 else 0
                 hold_mins = 0
                 entry_time_str = trade.get('entry_time')
@@ -513,55 +542,23 @@ def force_close_all() -> dict:
             else:
                 errors.append(ticker)
 
-    # Also try Alpaca's close-all endpoint as a safety net
+    # Alpaca's bulk close as safety net
     _alpaca('delete', '/v2/positions')
-
-    _log_event('force_close_all', {'closed': closed, 'errors': errors})
-    logger.info(f'Force close complete: {closed}')
+    logger.info(f'Force close: closed={closed} errors={errors}')
     return {'closed': closed, 'errors': errors, 'total': len(closed)}
-
-
-def _log_event(event: str, data: dict = None):
-    """Log a system event to Supabase."""
-    _supa_upsert('intraday_events', [{
-        'event':      event,
-        'data':       json.dumps(data or {}),
-        'created_at': datetime.now(timezone.utc).isoformat(),
-    }])
 
 
 # ── Monitor loop ─────────────────────────────────────────────────
 
-_force_closed_today = False
-_force_close_date   = ''
-
-
 def _monitor_loop():
-    global _force_closed_today, _force_close_date
+    """Background thread: checks positions every MONITOR_SECS seconds."""
     logger.info('Intraday executor: monitor thread started')
-
     while True:
         try:
-            today = datetime.now(_ET).strftime('%Y-%m-%d')
-
-            # Reset daily force-close flag on new day
-            if today != _force_close_date:
-                _force_close_date   = today
-                _force_closed_today = False
-
-            if _enabled() and _is_market_open():
-                # Force close at 3:45 PM ET
-                if _is_force_close_time() and not _force_closed_today:
-                    force_close_all()
-                    _log_event('force_close_3_45pm', {'date': today})
-                    _force_closed_today = True
-                elif not _is_force_close_time():
-                    _check_positions()
-            else:
-                pass  # market closed or disabled
+            if _enabled():
+                _check_positions()
         except Exception as e:
             logger.error(f'Intraday monitor error: {e}')
-
         time.sleep(MONITOR_SECS)
 
 
@@ -572,34 +569,34 @@ def start():
     logger.info('Intraday executor: monitor thread launched')
 
 
-# ── Public read APIs (used by Flask endpoints) ───────────────────
+# ── Public read APIs (called by Flask routes in main.py) ─────────
 
 def get_open_positions() -> list:
-    """Return current open intraday positions from Alpaca."""
+    """Return current open intraday positions from Alpaca + Supabase metadata."""
     _, positions = _alpaca('get', '/v2/positions')
     if not isinstance(positions, list):
         return []
 
-    today = datetime.now(_ET).strftime('%Y-%m-%d')
-    trades = _supa_get('intraday_trades', f'date=eq.{today}&status=neq.closed')
+    today     = datetime.now(_ET).strftime('%Y-%m-%d')
+    trades    = _supa_get('intraday_trades', f'date=eq.{today}&status=neq.closed')
     trade_map = {r.get('ticker', ''): r for r in trades}
 
     _CRYPTO_SUFFIXES = ('USD', 'USDT', 'USDC', 'BTC', 'ETH')
     result = []
     for p in positions:
-        ticker      = p.get('symbol', '')
-        # Skip crypto positions — they belong to crypto_executor / /api/crypto/positions
+        ticker = p.get('symbol', '')
         if any(ticker.endswith(s) for s in _CRYPTO_SUFFIXES) and len(ticker) > 4:
             continue
-        entry       = float(p.get('avg_entry_price') or 0)
-        cur         = float(p.get('current_price') or 0)
-        qty         = float(p.get('qty') or 0)
-        pnl         = float(p.get('unrealized_pl') or 0)
-        pnl_pct     = (cur - entry) / entry if entry > 0 else 0
-        trade       = trade_map.get(ticker, {})
 
+        entry   = float(p.get('avg_entry_price') or 0)
+        cur     = float(p.get('current_price') or 0)
+        qty     = float(p.get('qty') or 0)
+        pnl     = float(p.get('unrealized_pl') or 0)
+        pnl_pct = (cur - entry) / entry if entry > 0 else 0
+        trade   = trade_map.get(ticker, {})
+
+        mins_held = 0
         entry_time_str = trade.get('entry_time')
-        mins_held      = 0
         if entry_time_str:
             try:
                 et = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))

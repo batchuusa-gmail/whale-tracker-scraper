@@ -82,7 +82,10 @@ def send_to_token(token: str, title: str, body: str, data: dict = None) -> bool:
                 'notification': {'title': title, 'body': body},
                 'data': {k: str(v) for k, v in (data or {}).items()},
                 'android': {'priority': 'high'},
-                'apns': {'payload': {'aps': {'sound': 'default'}}},
+                'apns': {
+                    'headers': {'apns-push-type': 'alert', 'apns-priority': '10'},
+                    'payload': {'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default', 'badge': 1}},
+                },
             }
         }
         r = requests.post(
@@ -97,6 +100,18 @@ def send_to_token(token: str, title: str, body: str, data: dict = None) -> bool:
         if r.status_code == 200:
             return True
         logger.warning(f'FCM send failed {r.status_code}: {r.text[:200]}')
+        # Auto-clean unregistered tokens from Supabase
+        if r.status_code in (400, 404):
+            try:
+                err_status = (r.json().get('error') or {}).get('status', '')
+                if err_status in ('NOT_FOUND', 'INVALID_ARGUMENT'):
+                    supa_url = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
+                    supa_key = os.environ.get('SUPABASE_SERVICE_KEY', os.environ.get('SUPABASE_KEY', ''))
+                    if supa_key:
+                        requests.delete(f'{supa_url}/rest/v1/user_devices?fcm_token=eq.{token}',
+                                        headers={'apikey': supa_key, 'Authorization': f'Bearer {supa_key}'}, timeout=5)
+            except Exception:
+                pass
         return False
     except Exception as e:
         logger.warning(f'FCM send error: {e}')

@@ -1901,6 +1901,8 @@ def _run_data_warmer():
     _spawn(_warm_pead,         delay=40)
     _spawn(_warm_ofi,          delay=50)
     _spawn(_warm_nlp,          delay=60)
+    # Options auto-executor: run after scanner has warmed up (90s delay)
+    _spawn(_options_auto_execute, delay=90)
 
     # Recurring schedule — each job still runs in its own thread via _spawn
     schedule.every(60).minutes.do(lambda: _spawn(_warm_smart_money))
@@ -1909,6 +1911,8 @@ def _run_data_warmer():
     schedule.every(4).hours.do(lambda: _spawn(_warm_pead))
     schedule.every(30).minutes.do(lambda: _spawn(_warm_ofi))
     schedule.every(2).hours.do(lambda: _spawn(_warm_nlp))
+    # Run options auto-executor every 10 minutes during market hours
+    schedule.every(10).minutes.do(lambda: _spawn(_options_auto_execute))
 
     while True:
         schedule.run_pending()
@@ -4794,6 +4798,60 @@ def premarket_scan_now():
         return jsonify({'error': str(e)}), 500
 
 
+# ─── /api/debug/alpaca-nuke — close ALL Alpaca positions + cancel orders ──────
+@app.route('/api/debug/alpaca-nuke', methods=['POST'])
+def debug_alpaca_nuke():
+    """Close every open Alpaca position and cancel all pending orders."""
+    try:
+        from intraday_executor import _alpaca
+        # Cancel ALL open orders via bulk endpoint
+        _alpaca('delete', '/v2/orders')
+        import time as _t; _t.sleep(1)
+        # Use Alpaca's built-in close-all-positions endpoint
+        sc_all, resp_all = _alpaca('delete', '/v2/positions?cancel_orders=true')
+        import time as _t2; _t2.sleep(2)
+        # Check remaining positions
+        _, remaining = _alpaca('get', '/v2/positions')
+        _, acct2 = _alpaca('get', '/v2/account')
+        return jsonify({
+            'close_all_status': sc_all,
+            'close_all_response': resp_all,
+            'remaining_positions': len(remaining) if isinstance(remaining, list) else '?',
+            'buying_power': acct2.get('buying_power'),
+            'non_marginable_buying_power': acct2.get('non_marginable_buying_power'),
+            'ok': True,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+# ─── /api/debug/alpaca-order — test if order placement works ─────────────────
+@app.route('/api/debug/alpaca-order')
+def debug_alpaca_order():
+    """Test placing a tiny order to see raw Alpaca error."""
+    try:
+        from intraday_executor import _alpaca, _headers
+        # Fetch account to check all flags
+        sc, acct = _alpaca('get', '/v2/account')
+        order_fields = {k: acct.get(k) for k in [
+            'equity', 'buying_power', 'non_marginable_buying_power',
+            'daytrading_buying_power', 'regt_buying_power',
+            'trading_blocked', 'account_blocked', 'trade_suspended_by_user',
+            'pattern_day_trader', 'status', 'crypto_status',
+            'initial_margin', 'maintenance_margin', 'last_equity',
+        ]}
+        # Attempt a 1-share test order for a liquid stock
+        osc, odata = _alpaca('post', '/v2/orders', json={
+            'symbol': 'SPY', 'qty': '1', 'side': 'buy',
+            'type': 'market', 'time_in_force': 'gtc',
+        })
+        return jsonify({'account': order_fields, 'order_status': osc, 'order_response': odata})
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
 # ─── /api/debug/market — diagnose market-open check ─────────────────────────
 @app.route('/api/debug/market')
 def debug_market():
@@ -4896,7 +4954,7 @@ def scanner_config():
         body = request.get_json(force=True) or {}
         ALLOWED = {'enabled', 'aggression', 'max_trades_per_day', 'min_score',
                    'min_confidence', 'hold_minutes', 'max_positions',
-                   'circuit_breaker_enabled'}
+                   'circuit_breaker_enabled', 'position_size_pct'}
         update = {k: v for k, v in body.items() if k in ALLOWED}
         if not update:
             return jsonify({'error': 'no valid fields'}), 400
@@ -5550,22 +5608,23 @@ def filings_backfill():
 
 @app.route('/api/notify/register', methods=['POST'])
 def notify_register():
-    """POST {fcm_token, user_id?} — store FCM token in Supabase user_devices."""
+    """POST {fcm_token, platform?} — upsert FCM token into Supabase user_devices."""
     try:
         body = request.get_json(silent=True) or {}
         token = (body.get('fcm_token') or '').strip()
         if not token:
             return jsonify({'error': 'fcm_token required'}), 400
-        if _supabase:
-            row = {
-                'fcm_token': token,
-                'platform':  body.get('platform', 'unknown'),
-                'updated_at': __import__('datetime').datetime.utcnow().isoformat(),
-            }
-            uid = body.get('user_id')
-            if uid:
-                row['user_id'] = uid
-            _supabase.table('user_devices').upsert(row, on_conflict='fcm_token').execute()
+        import datetime
+        row = {
+            'fcm_token': token,
+            'platform':  body.get('platform', 'unknown'),
+            'updated_at': datetime.datetime.utcnow().isoformat(),
+        }
+        url = f'{SUPABASE_URL}/rest/v1/user_devices'
+        headers = {**SUPABASE_HEADERS, 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'}
+        r = requests.post(url, headers=headers, json=row, timeout=10)
+        if not r.ok:
+            logger.warning(f'notify/register supabase error: {r.status_code} {r.text[:200]}')
         return jsonify({'status': 'registered'})
     except Exception as e:
         logger.error(f'notify/register error: {e}')
@@ -5588,7 +5647,7 @@ def notify_send():
         insider = body.get('insider')
         value   = float(body.get('value') or 0)
         if ticker and insider and value > 0:
-            sent = notify_watchlist_activity(ticker, insider, value, _supabase)
+            sent = notify_watchlist_activity(ticker, insider, value, None)
             return jsonify({'status': 'sent', 'count': sent, 'mode': 'watchlist'})
 
         # Direct token notification
@@ -5601,6 +5660,27 @@ def notify_send():
         return jsonify({'status': 'sent' if ok else 'failed', 'mode': 'direct'})
     except Exception as e:
         logger.error(f'notify/send error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/notify/debug', methods=['GET'])
+def notify_debug():
+    """Show what Firebase credentials the server has loaded."""
+    try:
+        import json as _json
+        sa_raw = os.getenv('FIREBASE_SERVICE_ACCOUNT_JSON', '')
+        if not sa_raw:
+            return jsonify({'error': 'FIREBASE_SERVICE_ACCOUNT_JSON not set'})
+        info = _json.loads(sa_raw)
+        from firebase_push import _get_access_token
+        token = _get_access_token()
+        return jsonify({
+            'project_id':   info.get('project_id'),
+            'client_email': info.get('client_email'),
+            'token_ok':     bool(token),
+            'token_prefix': token[:20] + '...' if token else None,
+        })
+    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
@@ -5634,13 +5714,23 @@ def notify_test():
             payload = {'message': {
                 'token': token,
                 'notification': {'title': title, 'body': body},
-                'apns': {'payload': {'aps': {'sound': 'default', 'badge': 1}}},
+                'apns': {
+                    'headers': {'apns-push-type': 'alert', 'apns-priority': '10'},
+                    'payload': {'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default', 'badge': 1}},
+                },
             }}
             resp = requests.post(FCM_URL,
                                  headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
                                  json=payload, timeout=10)
-            results.append({'token_prefix': token[:25] + '...', 'http_status': resp.status_code, 'fcm_response': resp.json()})
+            fcm_resp = resp.json()
+            results.append({'token_prefix': token[:25] + '...', 'http_status': resp.status_code, 'fcm_response': fcm_resp})
             logger.info(f'notify/test → {token[:20]}... status={resp.status_code} resp={resp.text[:100]}')
+            # Auto-clean tokens FCM says are no longer valid
+            if resp.status_code in (400, 404):
+                err_code = (fcm_resp.get('error') or {}).get('status', '')
+                if err_code in ('NOT_FOUND', 'INVALID_ARGUMENT'):
+                    requests.delete(f'{SUPABASE_URL}/rest/v1/user_devices?fcm_token=eq.{token}',
+                                    headers={**SUPABASE_HEADERS, 'Content-Type': 'application/json'}, timeout=5)
 
         success = sum(1 for r in results if r['http_status'] == 200)
         return jsonify({'sent_to': len(all_tokens), 'success': success, 'results': results})
@@ -6411,6 +6501,16 @@ def intraday_equity_curve():
         resp = requests.get(url, headers=SUPABASE_HEADERS, timeout=15)
         rows = resp.json() if resp.status_code == 200 else []
 
+        # Filter to stocks only (exclude options = has digit in ticker, crypto = ends USD len>4)
+        def _is_stock(t):
+            t = t or ''
+            if any(c.isdigit() for c in t):
+                return False
+            if t.upper().endswith('USD') and len(t) > 4:
+                return False
+            return True
+        rows = [r for r in rows if _is_stock(r.get('ticker', ''))]
+
         if not rows:
             return jsonify({'points': [], 'stats': {}, 'total': 0})
 
@@ -6483,6 +6583,60 @@ def intraday_equity_curve():
 
     except Exception as e:
         logger.error(f'equity-curve error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/options/equity-curve')
+def options_equity_curve():
+    """Cumulative P&L curve from closed options paper trades."""
+    try:
+        r = requests.get(_SUPA_PT_URL, headers=_supa_headers(),
+                         params={'status': 'eq.closed', 'select': 'ticker,pnl,closed_at',
+                                 'order': 'closed_at.asc', 'limit': '500'}, timeout=10)
+        rows = r.json() if r.ok else []
+        if not rows:
+            return jsonify({'points': [], 'total': 0})
+        cumulative = 0.0
+        points = []
+        for i, row in enumerate(rows):
+            pnl = float(row.get('pnl') or 0)
+            cumulative += pnl
+            points.append({
+                'n': i + 1,
+                'ticker': row.get('ticker', ''),
+                'pnl': round(pnl, 2),
+                'cumulative': round(cumulative, 2),
+                'entry_time': (row.get('closed_at') or '')[:10],
+            })
+        return jsonify({'points': points, 'total': len(points)})
+    except Exception as e:
+        logger.error(f'options/equity-curve error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/crypto/equity-curve')
+def crypto_equity_curve():
+    """Cumulative P&L curve from closed crypto trades."""
+    try:
+        from crypto_executor import _supa_get
+        rows = _supa_get('crypto_trades', 'status=eq.closed&select=symbol,pnl,exit_time&order=exit_time.asc&limit=500') or []
+        if not rows:
+            return jsonify({'points': [], 'total': 0})
+        cumulative = 0.0
+        points = []
+        for i, row in enumerate(rows):
+            pnl = float(row.get('pnl') or 0)
+            cumulative += pnl
+            points.append({
+                'n': i + 1,
+                'ticker': row.get('symbol', ''),
+                'pnl': round(pnl, 2),
+                'cumulative': round(cumulative, 2),
+                'entry_time': (row.get('exit_time') or '')[:10],
+            })
+        return jsonify({'points': points, 'total': len(points)})
+    except Exception as e:
+        logger.error(f'crypto/equity-curve error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
@@ -7667,15 +7821,14 @@ def _generate_morning_briefing() -> dict:
     except Exception:
         pass
 
-    # Build summary text
+    # Build summary text — consumer facing, no trading P&L
     regime_emoji = '🟢' if 'BULL' in regime else '🔴' if 'BEAR' in regime else '🟡'
-    pnl_emoji    = '📈' if today_pnl >= 0 else '📉'
-    picks_text = ', '.join(p.get('ticker', '') for p in top_picks if p.get('ticker')) or 'Scanning…'
+    picks_text = ', '.join(p.get('ticker', '') for p in top_picks if p.get('ticker')) or 'monitoring markets'
 
     summary = (
         f"{regime_emoji} Market regime: {regime}. "
-        f"Top scanner picks: {picks_text}. "
-        f"{pnl_emoji} Today's P&L so far: ${today_pnl:+.2f}."
+        f"Whale activity detected in: {picks_text}. "
+        f"Track insider filings and unusual options flow below."
     )
 
     briefing = {
@@ -8036,6 +8189,7 @@ def crypto_algo_status():
         return jsonify({'running': False, 'status': 'error', 'error': str(e)})
 
 
+
 @app.route('/api/crypto/algo/config', methods=['GET', 'POST'])
 def crypto_algo_config():
     """GET/POST crypto scanner configuration — persisted in Supabase crypto_settings."""
@@ -8292,7 +8446,7 @@ def backtest_run():
 # ─── APEX-77: Options Paper Trade Journal ─────────────────────────────────────
 
 _SUPA_PT_URL = f"{os.getenv('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')}/rest/v1/options_paper_trades"
-_SUPA_PT_KEY = os.getenv('SUPABASE_SERVICE_KEY', os.getenv('SUPABASE_KEY', ''))
+_SUPA_PT_KEY = os.getenv('SUPABASE_SERVICE_KEY', os.getenv('SUPABASE_KEY', SUPABASE_KEY))
 
 
 def _supa_headers(prefer: str = 'return=representation') -> dict:
@@ -8460,6 +8614,253 @@ def options_algo_config():
     except Exception as e:
         logger.error(f'options/algo/config error: {e}')
         return jsonify({'error': str(e)}), 500
+
+
+# ─── Options Auto-Executor ─────────────────────────────────────────────────────
+
+def _options_auto_execute() -> dict:
+    """
+    Scan income_picks and auto-place paper trades for quality setups.
+    Runs on a background schedule. Returns summary dict.
+    """
+    summary = {'placed': 0, 'skipped': 0, 'reason': []}
+    try:
+        hdrs = _supa_headers('return=representation')
+
+        # 1. Load config
+        try:
+            r = requests.get(f'{_SUPA_OPT_CFG_URL}?id=eq.1', headers=hdrs, timeout=5)
+            cfg = r.json()[0] if r.ok and r.json() else {}
+        except Exception:
+            cfg = {}
+        enabled        = cfg.get('trading_enabled', True)
+        max_contracts  = int(cfg.get('max_contracts', 1))
+        capital        = float(cfg.get('capital_per_trade', 5000))
+
+        if not enabled:
+            summary['reason'].append('trading_enabled=false')
+            return summary
+
+        # 2. Get income picks — read from Supabase cache (works across gunicorn workers)
+        # Use module-level SUPABASE_URL/SUPABASE_KEY which have hardcoded fallbacks
+        try:
+            supa_hdrs = {
+                'apikey': SUPABASE_KEY,
+                'Authorization': f'Bearer {SUPABASE_KEY}',
+                'Content-Type': 'application/json',
+            }
+            picks_url = f'{SUPABASE_URL}/rest/v1/options_picks_cache'
+            r = requests.get(f'{picks_url}?id=eq.1', headers=supa_hdrs, timeout=8)
+            if r.ok and r.json():
+                picks = r.json()[0].get('income_picks') or []
+            else:
+                picks = []
+                summary['reason'].append(f'Supabase picks fetch: {r.status_code}')
+        except Exception as e:
+            summary['reason'].append(f'Supabase picks load error: {e}')
+            return summary
+
+        if not picks:
+            summary['reason'].append('no income_picks available')
+            return summary
+
+        # 3. Load open paper trades to avoid duplicates (same ticker+strike+expiry)
+        try:
+            r = requests.get(f'{_SUPA_PT_URL}?status=eq.open&select=ticker,strike,expiry',
+                             headers=supa_hdrs, timeout=5)
+            open_keys = {
+                (t['ticker'], str(t['strike']), t['expiry'])
+                for t in (r.json() if r.ok else [])
+            }
+        except Exception:
+            open_keys = set()
+
+        # 4. Count today's placed trades
+        today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        try:
+            r = requests.get(
+                f'{_SUPA_PT_URL}?opened_at=gte.{today_str}T00:00:00Z&select=id',
+                headers=supa_hdrs, timeout=5,
+            )
+            trades_today = len(r.json()) if r.ok else 0
+        except Exception:
+            trades_today = 0
+
+        MAX_TRADES_PER_DAY = 3
+
+        for pick in picks:
+            if trades_today >= MAX_TRADES_PER_DAY:
+                summary['reason'].append(f'daily cap {MAX_TRADES_PER_DAY} reached')
+                break
+
+            ticker  = (pick.get('ticker') or '').upper()
+            strike  = pick.get('strike', 0)
+            expiry  = pick.get('expiry', '')
+            pop     = float(pick.get('pop', 0))
+            exp_ret = float(pick.get('expected_return', 0))
+            dte     = int(pick.get('dte', 0))
+            risk    = float(pick.get('max_risk', 0))
+            spread  = float(pick.get('spread_pct', 1))
+            earnings = bool(pick.get('earnings_risk', False))
+
+            # Quality gate
+            if pop < 0.68:
+                summary['skipped'] += 1; continue
+            if exp_ret < 0.02:
+                summary['skipped'] += 1; continue
+            if dte < 14:
+                summary['skipped'] += 1; continue
+            if earnings:
+                summary['skipped'] += 1; continue
+            if spread > 0.06:
+                summary['skipped'] += 1; continue
+
+            # Duplicate check
+            key = (ticker, str(strike), expiry)
+            if key in open_keys:
+                summary['skipped'] += 1; continue
+
+            # Contracts sizing
+            risk_per_contract = risk * 100  # max_risk is per share
+            if risk_per_contract > 0:
+                contracts = min(max_contracts, max(1, int(capital / risk_per_contract)))
+            else:
+                contracts = 1
+            contracts = min(contracts, max_contracts)
+
+            # Place paper trade
+            row = {
+                'ticker':            ticker,
+                'strategy':          pick.get('strategy', 'INCOME'),
+                'direction':         pick.get('direction', 'short'),
+                'option_type':       pick.get('option_type', 'PUT'),
+                'strike':            float(strike),
+                'expiry':            expiry,
+                'dte_at_entry':      dte,
+                'premium_entry':     float(pick.get('premium', 0)),
+                'delta':             float(pick.get('delta', 0)),
+                'pop':               pop,
+                'iv_rank':           int(pick.get('iv_rank_proxy', 0)),
+                'stock_price_entry': float(pick.get('stock_price', 0)),
+                'max_risk':          float(risk),
+                'max_loss':          float(risk_per_contract * contracts),
+                'contracts':         contracts,
+                'status':            'open',
+                'earnings_risk':     earnings,
+            }
+            try:
+                insert_hdrs = {**supa_hdrs, 'Prefer': 'return=representation'}
+                r = requests.post(_SUPA_PT_URL, headers=insert_hdrs, json=row, timeout=10)
+                if r.ok:
+                    summary['placed'] += 1
+                    trades_today += 1
+                    open_keys.add(key)
+                    logger.info(f'Options auto-trade: {ticker} {pick.get("option_type")} '
+                                f'${strike} exp={expiry} pop={pop:.0%} premium=${pick.get("premium")}')
+                    _fcm_push_all(
+                        title=f'Options Trade: {ticker}',
+                        body=f'Short {pick.get("option_type")} ${strike} | '
+                             f'POP {pop:.0%} | Premium ${pick.get("premium"):.2f}',
+                        data={'type': 'options_trade', 'ticker': ticker},
+                    )
+                else:
+                    summary['reason'].append(f'{ticker} insert error: {r.status_code}')
+            except Exception as e:
+                summary['reason'].append(f'{ticker} exception: {e}')
+
+    except Exception as e:
+        logger.error(f'_options_auto_execute error: {e}')
+        summary['reason'].append(str(e))
+    return summary
+
+
+@app.route('/api/options/algo/eval', methods=['POST'])
+def options_algo_eval():
+    """Manually trigger the options auto-executor."""
+    result = _options_auto_execute()
+    return jsonify({'ok': True, **result})
+
+
+@app.route('/api/options/algo/debug', methods=['GET'])
+def options_algo_debug():
+    """Debug what the auto-executor can see."""
+    supa_hdrs = {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json',
+    }
+    picks_url = f'{SUPABASE_URL}/rest/v1/options_picks_cache'
+    cfg_url   = f'{SUPABASE_URL}/rest/v1/options_config?id=eq.1'
+    try:
+        r1 = requests.get(f'{picks_url}?id=eq.1', headers=supa_hdrs, timeout=8)
+        r2 = requests.get(cfg_url, headers=supa_hdrs, timeout=5)
+        picks_raw = r1.json() if r1.ok else []
+        income = picks_raw[0].get('income_picks', []) if picks_raw else []
+        return jsonify({
+            'supa_key_prefix': SUPABASE_KEY[:12] + '...',
+            'picks_status': r1.status_code,
+            'picks_count': len(income),
+            'first_pick': income[0] if income else None,
+            'cfg_status': r2.status_code,
+            'cfg': r2.json()[0] if r2.ok and r2.json() else {},
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/options/stats')
+def options_stats():
+    """GET options paper trading summary: total P&L, open/closed counts, win rate."""
+    try:
+        r = requests.get(_SUPA_PT_URL, headers=_supa_headers(),
+                         params={'order': 'opened_at.desc', 'limit': '500'}, timeout=10)
+        trades = r.json() if r.ok else []
+        closed = [t for t in trades if t.get('status') == 'closed']
+        open_  = [t for t in trades if t.get('status') == 'open']
+        pnls   = [float(t.get('pnl') or 0) for t in closed]
+        wins   = sum(1 for p in pnls if p > 0)
+        total  = len(pnls)
+        return jsonify({
+            'total_pnl':    round(sum(pnls), 2),
+            'open_count':   len(open_),
+            'closed_count': total,
+            'wins':         wins,
+            'win_rate':     round(wins / total * 100, 1) if total else 0,
+            'status': 'ok',
+        })
+    except Exception as e:
+        logger.error(f'options/stats error: {e}')
+        return jsonify({'total_pnl': 0, 'open_count': 0, 'closed_count': 0,
+                        'wins': 0, 'win_rate': 0, 'status': 'error'}), 500
+
+
+@app.route('/api/crypto/stats')
+def crypto_stats():
+    """GET crypto trading summary: today P&L, total P&L, open/closed counts."""
+    try:
+        from crypto_executor import _supa_get
+        today = datetime.utcnow().strftime('%Y-%m-%d')
+        rows  = _supa_get('crypto_trades', 'order=entry_time.desc&limit=500') or []
+        closed = [r for r in rows if r.get('status') == 'closed']
+        open_  = [r for r in rows if r.get('status') == 'open']
+        all_pnls   = [float(r.get('pnl') or 0) for r in closed]
+        today_pnls = [float(r.get('pnl') or 0) for r in closed
+                      if (r.get('exit_time') or r.get('entry_time') or '')[:10] == today]
+        wins = sum(1 for p in all_pnls if p > 0)
+        total = len(all_pnls)
+        return jsonify({
+            'today_pnl':    round(sum(today_pnls), 2),
+            'total_pnl':    round(sum(all_pnls), 2),
+            'open_count':   len(open_),
+            'closed_count': total,
+            'wins':         wins,
+            'win_rate':     round(wins / total * 100, 1) if total else 0,
+            'status': 'ok',
+        })
+    except Exception as e:
+        logger.error(f'crypto/stats error: {e}')
+        return jsonify({'today_pnl': 0, 'total_pnl': 0, 'open_count': 0,
+                        'closed_count': 0, 'wins': 0, 'win_rate': 0, 'status': 'error'}), 500
 
 
 # ─── APEX-78: Signal History Persistence ──────────────────────────────────────
@@ -8673,6 +9074,23 @@ def api_alerts_create():
         direction    = body.get('direction', 'above')
         if not ticker or target_price <= 0 or direction not in ('above', 'below'):
             return jsonify({'error': 'ticker, target_price, and direction (above|below) required'}), 400
+
+        # Check current price — warn if condition is already met
+        current_price = 0.0
+        try:
+            quotes = alpaca_quotes_batch([ticker])
+            current_price = float((quotes.get(ticker) or {}).get('last') or 0)
+        except Exception:
+            pass
+        if current_price > 0:
+            already_met = (direction == 'above' and current_price >= target_price) or \
+                          (direction == 'below' and current_price <= target_price)
+            if already_met:
+                return jsonify({
+                    'error': f'{ticker} is already at ${current_price:.2f} — condition "{direction} ${target_price:.2f}" is already met. Set a different target.',
+                    'current_price': current_price,
+                }), 400
+
         row = {'ticker': ticker, 'target_price': target_price, 'direction': direction, 'triggered': False}
         r = requests.post(_SUPA_ALERTS_URL, headers=_alerts_headers(), json=row, timeout=10)
         if r.ok:
@@ -8795,6 +9213,256 @@ def capital_settings():
             logger.info(f'Capital settings updated: {update}')
             return jsonify({'status': 'ok', 'settings': {k: row.get(k, _CAPITAL_DEFAULTS[k]) for k in _CAPITAL_DEFAULTS}})
         return jsonify({'error': r.text}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ── WHAL-168: Whale Vector Score History ─────────────────────────────────────
+@app.route('/api/vector-score-history')
+def api_vector_score_history():
+    try:
+        tickers = request.args.get('tickers', 'AAPL,MSFT,NVDA,TSLA,META,AMZN,GOOGL').split(',')
+        tickers = [t.strip().upper() for t in tickers[:7]]
+        result = {}
+        for ticker in tickers:
+            try:
+                rows = requests.get(
+                    f'{SUPABASE_URL}/rest/v1/filings'
+                    f'?ticker=eq.{ticker}&order=filed_at.desc&limit=90'
+                    f'&select=filed_at,transaction_date,transaction_type,value',
+                    headers=SUPABASE_HEADERS, timeout=5
+                ).json()
+                if not isinstance(rows, list):
+                    rows = []
+                by_day = {}
+                for r in rows:
+                    d = ((r.get('transaction_date') or r.get('filed_at') or '') or '')[:10]
+                    if not d:
+                        continue
+                    if d not in by_day:
+                        by_day[d] = {'buys': 0, 'sells': 0, 'value': 0}
+                    t = (r.get('transaction_type') or '').lower()
+                    v = float(r.get('value') or 0)
+                    if t in ('buy', 'p', 'purchase', 'a'):
+                        by_day[d]['buys'] += 1
+                    else:
+                        by_day[d]['sells'] += 1
+                    by_day[d]['value'] += v
+                history = []
+                for d in sorted(by_day.keys())[-30:]:
+                    b = by_day[d]
+                    total = b['buys'] + b['sells']
+                    score = round((b['buys'] / total * 100) if total > 0 else 50, 1)
+                    history.append({'date': d, 'score': score, 'buys': b['buys'], 'sells': b['sells'], 'value': b['value']})
+                if history:
+                    result[ticker] = history
+            except Exception:
+                pass
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── WHAL-170: Congressional Trading Calendar ──────────────────────────────────
+@app.route('/api/congress-calendar')
+def api_congress_calendar():
+    try:
+        rows = requests.get(
+            f'{SUPABASE_URL}/rest/v1/congress_trades'
+            f'?order=date.desc&limit=200'
+            f'&select=member,ticker,type,amount,date',
+            headers=SUPABASE_HEADERS, timeout=8
+        ).json()
+        if not isinstance(rows, list):
+            rows = []
+        by_date = {}
+        for r in rows:
+            d = (r.get('date') or '')[:10]
+            if not d:
+                continue
+            if d not in by_date:
+                by_date[d] = []
+            by_date[d].append({
+                'senator': r.get('member', ''),
+                'ticker': r.get('ticker', ''),
+                'type': r.get('type', ''),
+                'amount': r.get('amount', ''),
+                'asset': '',
+            })
+        calendar = [{'date': d, 'trades': trades} for d, trades in sorted(by_date.items(), reverse=True)]
+        return jsonify({'calendar': calendar[:60]})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── WHAL-171: Ticker Activity Bubble Chart ───────────────────────────────────
+@app.route('/api/sector-rotation')
+def api_sector_rotation():
+    try:
+        rows = requests.get(
+            f'{SUPABASE_URL}/rest/v1/filings'
+            f'?order=filed_at.desc&limit=1000'
+            f'&select=ticker,transaction_type,value',
+            headers=SUPABASE_HEADERS, timeout=8
+        ).json()
+        if not isinstance(rows, list):
+            rows = []
+        BUY_TYPES = {'buy', 'p', 'purchase', 'a'}
+        ticker_map = {}
+        for r in rows:
+            tk = (r.get('ticker') or '').upper().strip()
+            if not tk or len(tk) > 6:
+                continue
+            if tk not in ticker_map:
+                ticker_map[tk] = {'buys': 0, 'sells': 0, 'value': 0, 'count': 0}
+            t = (r.get('transaction_type') or '').lower()
+            v = float(r.get('value') or 0)
+            if t in BUY_TYPES:
+                ticker_map[tk]['buys'] += 1
+            else:
+                ticker_map[tk]['sells'] += 1
+            ticker_map[tk]['value'] += v
+            ticker_map[tk]['count'] += 1
+        bubbles = []
+        for tk, d in ticker_map.items():
+            if d['count'] < 2:
+                continue
+            total = d['buys'] + d['sells']
+            buy_ratio = d['buys'] / total if total > 0 else 0.5
+            momentum = round((buy_ratio - 0.5) * 200, 1)
+            bubbles.append({
+                'sector': tk,
+                'momentum': momentum,
+                'volume': d['value'],
+                'count': d['count'],
+                'buy_ratio': round(buy_ratio, 3),
+                'buys': d['buys'],
+                'sells': d['sells'],
+            })
+        bubbles.sort(key=lambda x: -x['volume'])
+        return jsonify({'bubbles': bubbles[:20]})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── WHAL-172: Options Flow Sentiment Gauge ────────────────────────────────────
+@app.route('/api/options-gauge')
+def api_options_gauge():
+    try:
+        rows = requests.get(
+            f'{SUPABASE_URL}/rest/v1/options_flow_daily'
+            f'?order=trade_date.desc&limit=200'
+            f'&select=option_type,premium,ticker',
+            headers=SUPABASE_HEADERS, timeout=8
+        ).json()
+        if not isinstance(rows, list):
+            rows = []
+        call_prem = sum(float(r.get('premium') or 0) for r in rows if (r.get('option_type') or '').upper() == 'CALL')
+        put_prem  = sum(float(r.get('premium') or 0) for r in rows if (r.get('option_type') or '').upper() == 'PUT')
+        total = call_prem + put_prem
+        call_pct = round(call_prem / total * 100, 1) if total > 0 else 50.0
+        put_pct  = round(100 - call_pct, 1)
+        pc_ratio = round(put_prem / call_prem, 3) if call_prem > 0 else 1.0
+        label = 'EXTREME GREED' if call_pct > 70 else 'GREED' if call_pct > 58 else 'FEAR' if call_pct < 42 else 'EXTREME FEAR' if call_pct < 30 else 'NEUTRAL'
+        by_ticker = {}
+        for r in rows[:50]:
+            tk = r.get('ticker', '')
+            ct = (r.get('option_type') or '').upper()
+            if tk not in by_ticker:
+                by_ticker[tk] = {'calls': 0, 'puts': 0}
+            if ct == 'CALL':
+                by_ticker[tk]['calls'] += 1
+            elif ct == 'PUT':
+                by_ticker[tk]['puts'] += 1
+        top = sorted(by_ticker.items(), key=lambda x: -(x[1]['calls'] + x[1]['puts']))[:8]
+        return jsonify({
+            'call_pct': call_pct, 'put_pct': put_pct, 'pc_ratio': pc_ratio,
+            'label': label, 'total_premium': total,
+            'top_tickers': [{'ticker': t, **d} for t, d in top],
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── WHAL-173: Sentiment vs Price Overlay ─────────────────────────────────────
+@app.route('/api/sentiment-price/<ticker>')
+def api_sentiment_price(ticker):
+    try:
+        ticker = ticker.upper()
+        sent_rows = requests.get(
+            f'{SUPABASE_URL}/rest/v1/reddit_sentiment'
+            f'?ticker=eq.{ticker}&order=scraped_at.desc&limit=30'
+            f'&select=scraped_at,bullish_pct,bearish_pct,mention_count',
+            headers=SUPABASE_HEADERS, timeout=5
+        ).json()
+        if not isinstance(sent_rows, list):
+            sent_rows = []
+        from datetime import datetime, timedelta
+        price_rows = []
+        try:
+            if ALPACA_KEY and ALPACA_SECRET:
+                hdrs = {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+                pr = requests.get(
+                    f'https://data.alpaca.markets/v2/stocks/{ticker}/bars',
+                    headers=hdrs,
+                    params={'timeframe': '1Day', 'limit': 30, 'feed': 'iex', 'sort': 'asc'},
+                    timeout=8,
+                )
+                if pr.status_code == 200:
+                    bars = pr.json().get('bars', [])
+                    price_rows = [{'date': (b.get('t') or '')[:10], 'price': float(b.get('c') or 0)} for b in bars]
+        except Exception:
+            pass
+        sentiment_series = []
+        for r in reversed(sent_rows):
+            d = (r.get('scraped_at') or '')[:10]
+            if d:
+                sentiment_series.append({
+                    'date': d,
+                    'bullish': float(r.get('bullish_pct') or 0),
+                    'bearish': float(r.get('bearish_pct') or 0),
+                    'mentions': int(r.get('mention_count') or 0),
+                })
+        return jsonify({'ticker': ticker, 'sentiment': sentiment_series, 'price': price_rows})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── WHAL-174: Alert Activity Heatmap ─────────────────────────────────────────
+@app.route('/api/activity-heatmap')
+def api_activity_heatmap():
+    try:
+        from datetime import datetime, timedelta
+        since = (datetime.utcnow() - timedelta(days=365)).date().isoformat()
+        rows = requests.get(
+            f'{SUPABASE_URL}/rest/v1/filings'
+            f'?filed_at=gte.{since}'
+            f'&select=filed_at,transaction_date,transaction_type,value',
+            headers=SUPABASE_HEADERS, timeout=8
+        ).json()
+        if not isinstance(rows, list):
+            rows = []
+        BUY_TYPES = {'buy', 'p', 'purchase', 'a'}
+        by_day = {}
+        for r in rows:
+            t = (r.get('transaction_type') or '').lower().strip()
+            if t not in BUY_TYPES:
+                continue
+            d = ((r.get('transaction_date') or r.get('filed_at') or '') or '')[:10]
+            if d:
+                by_day[d] = by_day.get(d, 0) + 1
+        weeks = []
+        today = datetime.utcnow().date()
+        # Align to Sunday start
+        start = today - timedelta(days=today.weekday() + 1 + 52 * 7)
+        cur = start
+        week = []
+        while cur <= today:
+            ds = cur.isoformat()
+            week.append({'date': ds, 'count': by_day.get(ds, 0)})
+            if len(week) == 7:
+                weeks.append(week)
+                week = []
+            cur += timedelta(days=1)
+        if week:
+            weeks.append(week)
+        max_count = max((d['count'] for w in weeks for d in w), default=1)
+        return jsonify({'weeks': weeks, 'max_count': max_count, 'total': sum(by_day.values())})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
