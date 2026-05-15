@@ -31,8 +31,11 @@ logger = logging.getLogger(__name__)
 FAANG        = ['META', 'AAPL', 'AMZN', 'NFLX', 'GOOGL']
 SIGNAL_THRESHOLD = 60   # minimum score to surface a signal
 MONITOR_SECS = 300      # check time every 5 min
-SCAN_HOUR_ET = 9
-SCAN_MIN_ET  = 35
+# Two daily scans: pre-market (8:00 AM ET) and post-market (4:30 PM ET)
+SCAN_WINDOWS_ET = [
+    (8,  0),   # pre-market — uses prior day's completed daily bars
+    (16, 30),  # post-market — uses today's completed daily bars
+]
 
 ALPACA_KEY    = os.environ.get('ALPACA_KEY', '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET', '')
@@ -386,22 +389,27 @@ def _run_scan():
 
 
 def _scanner_loop():
-    last_scan_date = ''
+    last_scan_key = ''  # 'YYYY-MM-DD_HH' prevents double-firing same window
     while True:
         try:
             now = datetime.now(_ET)
             today = now.strftime('%Y-%m-%d')
             is_weekday = now.weekday() < 5
-            after_open = now.hour > SCAN_HOUR_ET or (now.hour == SCAN_HOUR_ET and now.minute >= SCAN_MIN_ET)
             not_holiday = today not in _US_HOLIDAYS
 
-            if is_weekday and after_open and not_holiday and last_scan_date != today:
-                with _state_lock:
-                    _state['running'] = True
-                _run_scan()
-                last_scan_date = today
-                with _state_lock:
-                    _state['running'] = False
+            if is_weekday and not_holiday:
+                for scan_h, scan_m in SCAN_WINDOWS_ET:
+                    in_window = (now.hour == scan_h and now.minute >= scan_m) or \
+                                (now.hour == scan_h + 1 and now.minute < scan_m)  # 1-hr grace
+                    scan_key = f'{today}_{scan_h:02d}'
+                    if in_window and last_scan_key != scan_key:
+                        with _state_lock:
+                            _state['running'] = True
+                        _run_scan()
+                        last_scan_key = scan_key
+                        with _state_lock:
+                            _state['running'] = False
+                        break
         except Exception as e:
             logger.error(f'Swing scan loop error: {e}')
             with _state_lock:
