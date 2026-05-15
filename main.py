@@ -4325,7 +4325,7 @@ def intraday_journal():
         rows = _supa_get(
             'intraday_trades',
             f'select=id,ticker,side,pnl,pnl_pct,confidence,exit_reason,'
-            f'entry_time,date,status,entry_price,exit_price,qty,ai_reasoning'
+            f'entry_time,exit_time,date,status,entry_price,exit_price,qty,ai_reasoning'
             f'&order=id.desc&limit={limit}'
         ) or []
         return jsonify({'trades': rows, 'count': len(rows)})
