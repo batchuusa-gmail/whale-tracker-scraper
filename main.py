@@ -1804,6 +1804,18 @@ def _start_background_services():
     except Exception as e:
         logger.warning(f'Options scanner failed to start: {e}')
 
+    # FAANG Swing engine — daily 4-layer signal scanner + position monitor
+    try:
+        from swing_scanner import start as _start_swing_scanner
+        _start_swing_scanner()
+    except Exception as e:
+        logger.warning(f'Swing scanner failed to start: {e}')
+    try:
+        from swing_executor import start as _start_swing_executor
+        _start_swing_executor()
+    except Exception as e:
+        logger.warning(f'Swing executor failed to start: {e}')
+
 threading.Thread(target=_start_background_services, daemon=True, name='svc-starter').start()
 
 
@@ -6637,6 +6649,76 @@ def crypto_equity_curve():
         return jsonify({'points': points, 'total': len(points)})
     except Exception as e:
         logger.error(f'crypto/equity-curve error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+
+# ─── FAANG Swing Scanner ──────────────────────────────────────────────────────
+
+@app.route('/api/swing/status')
+def swing_status():
+    """GET — swing scanner status: signals, scores, open positions."""
+    try:
+        from swing_scanner import get_status, get_all_scores, get_signals
+        from swing_executor import get_open_positions
+        status    = get_status()
+        signals   = get_signals()
+        all_scores = get_all_scores()
+        positions = get_open_positions()
+        unrealized_pnl = sum(p.get('unrealized_pnl', 0) for p in positions)
+        return jsonify({
+            'signals':         signals,
+            'all_scores':      all_scores,
+            'signal_count':    len(signals),
+            'positions':       positions,
+            'position_count':  len(positions),
+            'unrealized_pnl':  round(unrealized_pnl, 2),
+            'scan_count':      status.get('scan_count', 0),
+            'last_scan':       status.get('last_scan'),
+            'scan_date':       status.get('scan_date'),
+            'running':         status.get('running', False),
+            'enabled':         os.environ.get('SWING_SCANNER_ENABLED', 'false').lower() == 'true',
+            'trading_enabled': os.environ.get('SWING_TRADING_ENABLED', 'false').lower() == 'true',
+        })
+    except Exception as e:
+        logger.error(f'swing/status error: {e}')
+        return jsonify({'signals': [], 'positions': [], 'signal_count': 0,
+                        'position_count': 0, 'unrealized_pnl': 0, 'error': str(e)}), 500
+
+
+@app.route('/api/swing/positions')
+def swing_positions_route():
+    """GET — open swing positions with current Alpaca data."""
+    try:
+        from swing_executor import get_open_positions
+        return jsonify({'positions': get_open_positions()})
+    except Exception as e:
+        logger.error(f'swing/positions error: {e}')
+        return jsonify({'positions': [], 'error': str(e)}), 500
+
+
+@app.route('/api/swing/journal')
+def swing_journal():
+    """GET — all swing trades from Supabase."""
+    try:
+        from swing_executor import _supa_get
+        limit = int(request.args.get('limit', 100))
+        rows = _supa_get('swing_trades', f'select=*&order=entry_time.desc&limit={limit}')
+        return jsonify({'trades': rows or [], 'count': len(rows or [])})
+    except Exception as e:
+        logger.error(f'swing/journal error: {e}')
+        return jsonify({'trades': [], 'error': str(e)}), 500
+
+
+@app.route('/api/swing/scan', methods=['POST'])
+def swing_scan_now():
+    """POST — trigger an immediate swing scan (for testing outside market hours)."""
+    try:
+        from swing_scanner import _run_scan, get_status
+        _run_scan()
+        return jsonify({'status': 'ok', **get_status()})
+    except Exception as e:
+        logger.error(f'swing/scan error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
