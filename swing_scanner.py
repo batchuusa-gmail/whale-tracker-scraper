@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 FAANG        = ['META', 'AAPL', 'AMZN', 'NFLX', 'GOOGL']
 SIGNAL_THRESHOLD = 60   # minimum score to surface a signal
 MONITOR_SECS = 300      # check time every 5 min
-# Two daily scans: pre-market (8:00 AM ET) and post-market (4:30 PM ET)
+# Two daily scans: pre-market (7:00 AM ET) and post-market (4:30 PM ET)
 SCAN_WINDOWS_ET = [
-    (8,  0),   # pre-market — uses prior day's completed daily bars
+    (7,  0),   # pre-market open — uses prior day's completed daily bars
     (16, 30),  # post-market — uses today's completed daily bars
 ]
 
