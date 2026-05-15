@@ -76,11 +76,13 @@ def _fetch_daily_bars(symbol: str, limit: int = 210) -> list:
         r = requests.get(
             f'{ALPACA_DATA}/v2/stocks/{symbol}/bars',
             headers={'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret},
-            params={'timeframe': '1Day', 'limit': limit, 'adjustment': 'split', 'sort': 'asc'},
+            params={'timeframe': '1Day', 'limit': limit, 'adjustment': 'split',
+                    'sort': 'asc', 'feed': 'iex'},
             timeout=15,
         )
         if r.status_code == 200:
             return r.json().get('bars', [])
+        logger.warning(f'daily bars {symbol}: HTTP {r.status_code} {r.text[:120]}')
     except Exception as e:
         logger.warning(f'daily bars {symbol}: {e}')
     return []
