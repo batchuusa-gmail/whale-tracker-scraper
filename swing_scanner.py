@@ -21,7 +21,7 @@ import logging
 import math
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pytz
 import requests
@@ -77,11 +77,15 @@ def _fetch_daily_bars(symbol: str, limit: int = 210) -> list:
             f'{ALPACA_DATA}/v2/stocks/{symbol}/bars',
             headers={'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret},
             params={'timeframe': '1Day', 'limit': limit, 'adjustment': 'split',
-                    'sort': 'asc', 'feed': 'iex'},
+                    'sort': 'desc',
+                    'start': (datetime.now(timezone.utc) - timedelta(days=400)).strftime('%Y-%m-%d')},
             timeout=15,
         )
         if r.status_code == 200:
-            return r.json().get('bars', [])
+            bars = r.json().get('bars') or []
+            if not bars:
+                logger.warning(f'daily bars {symbol}: 200 but empty — {r.text[:200]}')
+            return list(reversed(bars))  # desc → asc for indicator math
         logger.warning(f'daily bars {symbol}: HTTP {r.status_code} {r.text[:120]}')
     except Exception as e:
         logger.warning(f'daily bars {symbol}: {e}')
@@ -233,6 +237,8 @@ def _score_symbol(symbol: str) -> dict | None:
     if len(bars) < 60:
         logger.warning(f'{symbol}: only {len(bars)} bars, skipping')
         return None
+
+    logger.info(f'{symbol}: {len(bars)} bars | last bar date={bars[-1].get("t","?")} close={bars[-1].get("c")} open={bars[-1].get("o")}')
 
     # Exclude today's partial bar for indicator calculation
     hist   = bars[:-1]

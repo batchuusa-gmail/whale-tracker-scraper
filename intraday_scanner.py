@@ -515,14 +515,15 @@ def _score_symbol(
         confidence = 0.0
 
     # ── Compute levels ───────────────────────────────────────────
+    # 1.0× ATR stop, 3.0× ATR target → 3:1 R:R, break-even win rate = 25%
     if direction == 'LONG':
-        stop_loss = round(cur_price - 1.5 * atr14, 2)
-        target_1  = round(cur_price + 1.0 * atr14, 2)
-        target_2  = round(cur_price + 2.0 * atr14, 2)
+        stop_loss = round(cur_price - 1.0 * atr14, 2)
+        target_1  = round(cur_price + 1.5 * atr14, 2)
+        target_2  = round(cur_price + 3.0 * atr14, 2)
     else:
-        stop_loss = round(cur_price + 1.5 * atr14, 2)
-        target_1  = round(cur_price - 1.0 * atr14, 2)
-        target_2  = round(cur_price - 2.0 * atr14, 2)
+        stop_loss = round(cur_price + 1.0 * atr14, 2)
+        target_1  = round(cur_price - 1.5 * atr14, 2)
+        target_2  = round(cur_price - 3.0 * atr14, 2)
 
     return {
         'ticker':     symbol,
@@ -659,29 +660,32 @@ def _auto_trade_top_picks(
         logger.error(f'Auto-trade import error: {e}')
         return
 
-    # Load config from Supabase algo_config
+    # Load config — try algo_settings first, fall back to algo_config
     cfg = {
         'min_score':          AUTO_TRADE_MIN_SCORE,
         'min_confidence':     0.65,
         'max_trades_per_day': AUTO_TRADE_MAX_PER_SCAN,
         'max_positions':      3,
-        'position_size_pct':  0.15,
+        'position_size_pct':  0.03,
     }
-    try:
+    def _load_cfg_table(table):
         r = requests.get(
-            f'{_SUPA_URL}/rest/v1/algo_settings?limit=1',
+            f'{_SUPA_URL}/rest/v1/{table}?limit=1',
             headers={'apikey': _SUPA_KEY, 'Authorization': f'Bearer {_SUPA_KEY}'},
             timeout=3,
         )
         if r.status_code == 200 and r.json():
-            row = r.json()[0]
-            for k in ('min_score', 'max_trades_per_day', 'max_positions', 'position_size_pct'):
-                if row.get(k) is not None:
-                    cfg[k] = row[k]
-            if row.get('min_confidence') is not None:
-                cfg['min_confidence'] = float(row['min_confidence']) / 100
+            return r.json()[0]
+        return None
+    try:
+        row = _load_cfg_table('algo_settings') or _load_cfg_table('algo_config') or {}
+        for k in ('min_score', 'max_trades_per_day', 'max_positions', 'position_size_pct'):
+            if row.get(k) is not None:
+                cfg[k] = row[k]
+        if row.get('min_confidence') is not None:
+            cfg['min_confidence'] = float(row['min_confidence']) / 100
     except Exception as e:
-        logger.warning(f'algo_settings fetch failed: {e}')
+        logger.warning(f'algo config fetch failed: {e}')
 
     min_score   = int(cfg['min_score'])
     min_conf    = float(cfg['min_confidence'])

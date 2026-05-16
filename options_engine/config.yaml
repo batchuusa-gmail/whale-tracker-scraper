@@ -18,6 +18,16 @@ tickers:
   - NFLX
   - CRM
   - PLTR
+  - AVGO
+  - MU
+  - COIN
+  - CRWD
+  - UBER
+  - MSTR
+  - SOFI
+  - HOOD
+  - SNOW
+  - DDOG
 
 # Income Engine (Engine A — Options Selling)
 income:
@@ -35,8 +45,8 @@ income:
 # Growth Engine (Engine B — Options Buying)
 growth:
   enabled:         true
-  max_iv_rank:     70       # raised: allow buying even at moderate IV
-  min_vol_spike:   1.0      # lowered: any volume is fine
+  max_iv_rank:     95       # high threshold — direction (RSI+MA) is the real filter
+  min_vol_spike:   0.5      # just ensure some activity; direction is what matters
   min_avg_volume:  200000
   min_oi:          20
   min_premium:     0.10

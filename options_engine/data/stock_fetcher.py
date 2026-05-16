@@ -142,6 +142,23 @@ def fetch_stock_snapshot(ticker: str) -> dict | None:
         avg_vol_20 = float(np.mean(volumes[-20:]))
         vol_today  = float(volumes[-1])
 
+        # 14-period RSI from Alpaca closes (so growth_engine never calls yfinance)
+        def _rsi14(c):
+            if len(c) < 15:
+                return 50.0
+            gains = np.maximum(np.diff(c[-15:]), 0)
+            losses = np.maximum(-np.diff(c[-15:]), 0)
+            avg_g = gains.mean()
+            avg_l = losses.mean()
+            if avg_l == 0:
+                return 100.0
+            return round(100 - 100 / (1 + avg_g / avg_l), 1)
+
+        rsi_14 = _rsi14(closes)
+
+        # Detect 20-day breakout (price > highest close of prior 20 bars)
+        breakout_20d = bool(price > float(np.max(closes[-21:-1]))) if len(closes) >= 21 else False
+
         return {
             'ticker':        ticker,
             'price':         round(price, 4),
@@ -156,6 +173,9 @@ def fetch_stock_snapshot(ticker: str) -> dict | None:
             'iv_rank_proxy': iv_rank_proxy,
             'above_ma50':    price > ma_50  if ma_50  else None,
             'above_ma200':   price > ma_200 if ma_200 else None,
+            'rsi_14':        rsi_14,
+            'breakout_20d':  breakout_20d,
+            'closes':        list(closes[-60:]),   # last 60 bars for growth_engine use
         }
 
     return _cached(f'snap:{ticker}', _fetch)

@@ -232,7 +232,7 @@ def place_intraday_order(signal: dict) -> dict:
     target_2   = float(signal.get('target_2') or 0)
     reasoning  = str(signal.get('reasoning') or '')
     is_manual  = bool(signal.get('manual'))
-    pos_pct    = float(signal.get('position_size_pct') or 0.10)
+    pos_pct    = float(signal.get('position_size_pct') or 0.03)
 
     if sig_str not in ('BUY', 'SELL'):
         return {'status': 'skipped', 'message': f'Signal {sig_str!r} not actionable'}

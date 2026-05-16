@@ -32,7 +32,7 @@ MAX_POSITIONS = 5
 MONITOR_SECS  = 300   # 5 minutes
 
 _SUPA_URL = os.environ.get('SUPABASE_URL', 'https://bedurjtazsfbnkisoeee.supabase.co')
-_SUPA_KEY = os.environ.get('SUPABASE_KEY', '')
+_SUPA_KEY = os.environ.get('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJlZHVyanRhenNmYm5raXNvZWVlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NDcxOTUsImV4cCI6MjA4OTIyMzE5NX0.MK4N9dxAIHlXkGP4rLJPq5tHh9UU8L75EB1b8Q7CVmg')
 _SUPA_HDRS = {
     'apikey':        _SUPA_KEY,
     'Authorization': f'Bearer {_SUPA_KEY}',
@@ -119,10 +119,17 @@ def _send_fcm(title: str, body: str):
 # ── Position sizing ──────────────────────────────────────────────────────────
 
 def _calc_qty(entry: float) -> int:
-    _, account = _alpaca('get', '/v2/account')
-    bp = float(account.get('non_marginable_buying_power') or account.get('buying_power') or 0)
+    sc, account = _alpaca('get', '/v2/account')
+    logger.info(f'_calc_qty account keys: {list(account.keys()) if isinstance(account, dict) else account}')
+    bp = float(
+        account.get('non_marginable_buying_power') or
+        account.get('buying_power') or
+        account.get('cash') or 0
+    )
     alloc = min(bp * 0.20, MAX_TRADE_USD)
-    return max(1, int(alloc / entry))
+    qty = int(alloc / entry) if entry > 0 else 0
+    logger.info(f'_calc_qty: sc={sc} bp={bp:.2f} alloc={alloc:.2f} entry={entry} qty={qty}')
+    return max(1, qty)
 
 
 # ── Open a swing trade ───────────────────────────────────────────────────────
@@ -304,11 +311,28 @@ def _close_position(ticker: str, trade: dict, reason: str, cur_price: float, qty
         )
 
 
+def _auto_trade_signals():
+    """Pull signals from swing_scanner and execute any new ones."""
+    try:
+        import pytz
+        from swing_scanner import get_signals, get_status
+        status = get_status()
+        et_today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
+        if status.get('scan_date') != et_today:
+            return  # stale scan — skip
+        for signal in get_signals():
+            result = execute_swing_signal(signal)
+            logger.info(f'Auto-trade {signal.get("ticker")}: {result.get("status")} — {result.get("reason", "")}')
+    except Exception as e:
+        logger.error(f'Auto-trade check error: {e}')
+
+
 def _monitor_loop():
     while True:
         try:
             if _enabled():
                 _check_positions()
+                _auto_trade_signals()
         except Exception as e:
             logger.error(f'Swing monitor error: {e}')
         time.sleep(MONITOR_SECS)
@@ -334,16 +358,20 @@ def get_open_positions() -> list:
     for trade in open_trades:
         ticker    = trade.get('ticker', '')
         pos       = alpaca_map.get(ticker, {})
-        cur_price = float(pos.get('current_price') or trade.get('entry_price') or 0)
-        entry     = float(trade.get('entry_price') or 0)
-        qty       = float(pos.get('qty') or trade.get('qty') or 0)
-        unrealized = round((cur_price - entry) * qty, 2) if cur_price and entry else 0
+        cur_price  = float(pos.get('current_price') or trade.get('entry_price') or 0)
+        entry      = float(trade.get('entry_price') or 0)
+        # Use Supabase qty (what the swing executor actually bought), not Alpaca position
+        # qty — Alpaca position may include shares from intraday scanner on same ticker
+        swing_qty  = float(trade.get('qty') or 0)
+        alpaca_qty = float(pos.get('qty') or swing_qty)
+        unrealized = round((cur_price - entry) * swing_qty, 2) if cur_price and entry else 0
 
         result.append({
             **trade,
             'current_price':   cur_price,
             'unrealized_pnl':  unrealized,
             'unrealized_pct':  round((cur_price - entry) / entry * 100, 2) if entry else 0,
-            'qty':             qty,
+            'qty':             swing_qty,
+            'alpaca_qty':      alpaca_qty,
         })
     return result

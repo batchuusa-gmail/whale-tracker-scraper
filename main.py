@@ -1703,6 +1703,8 @@ def _startup():
     schedule.every(5).minutes.do(_check_price_alerts)
     # APEX-82: Drawdown circuit breaker — check every 5 min
     schedule.every(5).minutes.do(_check_drawdown_circuit_breaker)
+    # APEX-32: EOD daily statement push — 20:05 UTC (4:05 PM ET, Mon–Fri)
+    schedule.every().day.at("20:05").do(_send_eod_statement)
     logger.info("Scheduler started — daily cron registered at 21:05 UTC")
 
     # Run Reddit scraper on startup (in background thread already)
@@ -4917,6 +4919,7 @@ def scanner_all():
 _ALGO_CONFIG_KEY = 'algo:live_config'
 
 _ALGO_CONFIG_DEFAULTS = {
+    'position_size_pct':        0.03,
     'enabled':                  True,
     'aggression':               0.5,
     'max_trades_per_day':       3,
@@ -4935,16 +4938,27 @@ _ALGO_SUPA_HDR = {
 }
 
 def _get_live_config() -> dict:
-    """Return algo config from Supabase, falling back to defaults."""
+    """Return algo config from Supabase (algo_settings first, then algo_config), falling back to defaults."""
     cfg = dict(_ALGO_CONFIG_DEFAULTS)
-    try:
-        r = requests.get(f'{_ALGO_SUPA_URL}?id=eq.1', headers=_ALGO_SUPA_HDR, timeout=5)
-        if r.status_code == 200 and r.json():
-            for k, v in r.json()[0].items():
-                if k in cfg and v is not None:
-                    cfg[k] = v
-    except Exception:
-        pass
+    def _fetch_table(table):
+        try:
+            r = requests.get(
+                f'{SUPABASE_URL}/rest/v1/{table}?limit=1',
+                headers=_ALGO_SUPA_HDR, timeout=5,
+            )
+            if r.status_code == 200 and r.json():
+                return r.json()[0]
+        except Exception:
+            pass
+        return None
+    row = _fetch_table('algo_settings') or _fetch_table('algo_config') or {}
+    for k, v in row.items():
+        if k in cfg and v is not None:
+            cfg[k] = v
+    # min_confidence in algo_config is stored as 0-100 int; normalize to 0.0-1.0 if needed
+    mc = cfg.get('min_confidence', 65)
+    if isinstance(mc, (int, float)) and mc > 1:
+        cfg['min_confidence'] = mc  # keep as 0-100 for API; scanner divides itself
     return cfg
 
 
@@ -4972,8 +4986,18 @@ def scanner_config():
             return jsonify({'error': 'no valid fields'}), 400
         update['updated_at'] = datetime.now(timezone.utc).isoformat()
         upsert_hdrs = {**_ALGO_SUPA_HDR, 'Prefer': 'resolution=merge-duplicates,return=representation'}
-        r = requests.post(_ALGO_SUPA_URL, headers=upsert_hdrs,
+        # Try algo_settings first; fall back to algo_config (which lacks position_size_pct column)
+        settings_url = f'{SUPABASE_URL}/rest/v1/algo_settings'
+        r = requests.post(settings_url, headers=upsert_hdrs,
                           json={**{'id': 1}, **update}, timeout=10)
+        if not r.ok:
+            # algo_settings table doesn't exist yet — write to algo_config, excluding unknown columns
+            algo_config_fields = {'enabled', 'aggression', 'max_trades_per_day', 'min_score',
+                                  'min_confidence', 'hold_minutes', 'max_positions',
+                                  'circuit_breaker_enabled', 'updated_at'}
+            cfg_update = {k: v for k, v in update.items() if k in algo_config_fields}
+            r = requests.post(_ALGO_SUPA_URL, headers=upsert_hdrs,
+                              json={**{'id': 1}, **cfg_update}, timeout=10)
         if r.ok:
             current = _get_live_config()
             logger.info(f'Algo config updated: {update}')
@@ -9038,6 +9062,46 @@ def api_signals_history():
 # ── APEX-82: Drawdown Circuit Breaker ─────────────────────────────────────────
 
 _circuit_breaker_fired_date: str = ''  # tracks which date the breaker last fired
+
+
+def _send_eod_statement():
+    """APEX-32: Send end-of-day P&L summary push at market close (20:05 UTC = 4:05 PM ET).
+    Aggregates realized P&L from intraday, swing, and crypto tables for today.
+    """
+    import pytz
+    try:
+        today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
+
+        def _supa_pnl(table: str, date_field: str, date_filter: str) -> float:
+            r = requests.get(
+                f'{SUPABASE_URL}/rest/v1/{table}?{date_filter}&select=pnl',
+                headers=SUPABASE_HEADERS, timeout=10,
+            )
+            rows = r.json() if r.ok else []
+            return sum(float(row.get('pnl') or 0) for row in (rows or []) if row.get('pnl') is not None)
+
+        stock_pnl  = _supa_pnl('intraday_trades', 'date', f'date=eq.{today}&status=eq.closed')
+        swing_pnl  = _supa_pnl('swing_trades',    'exit_time', f'exit_time=gte.{today}T00:00:00&status=eq.closed')
+        crypto_pnl = _supa_pnl('crypto_trades',   'exit_time', f'exit_time=gte.{today}T00:00:00&status=eq.closed')
+        total_pnl  = stock_pnl + swing_pnl + crypto_pnl
+
+        sign  = '+' if total_pnl >= 0 else ''
+        emoji = '📈' if total_pnl >= 0 else '📉'
+
+        lines = [f'Stocks {"+$" if stock_pnl >= 0 else "-$"}{abs(stock_pnl):.2f}']
+        if swing_pnl != 0:
+            lines.append(f'Swing {"+$" if swing_pnl >= 0 else "-$"}{abs(swing_pnl):.2f}')
+        if crypto_pnl != 0:
+            lines.append(f'Crypto {"+$" if crypto_pnl >= 0 else "-$"}{abs(crypto_pnl):.2f}')
+
+        _fcm_push_all(
+            title=f'{emoji} EOD Statement — {sign}${abs(total_pnl):.2f}',
+            body=' · '.join(lines),
+            data={'type': 'eod_statement', 'date': today, 'total_pnl': str(round(total_pnl, 2))},
+        )
+        logger.info(f'EOD statement push sent — total={total_pnl:.2f} stocks={stock_pnl:.2f} swing={swing_pnl:.2f} crypto={crypto_pnl:.2f}')
+    except Exception as e:
+        logger.error(f'EOD statement push error: {e}')
 
 
 def _check_drawdown_circuit_breaker():

@@ -48,9 +48,9 @@ class GrowthTrade:
 
 # ── Filters ───────────────────────────────────────────────────────────────────
 
-_MAX_IV_RANK    = 40    # buy options when IV is cheap
-_MIN_VOL_SPIKE  = 1.3   # volume at least 1.3x average
-_MIN_AVG_VOL    = 300_000
+_MAX_IV_RANK    = 95    # direction (RSI+MA50) is primary filter; IV rank secondary
+_MIN_VOL_SPIKE  = 0.5   # any reasonable activity; not a breakout filter
+_MIN_AVG_VOL    = 200_000
 _MIN_PREMIUM    = 0.20
 _MAX_SPREAD_PCT = 0.12  # 12% max bid-ask spread
 _MIN_OI         = 50
@@ -79,32 +79,21 @@ def _detect_breakout(closes: list, lookback: int = 20) -> bool:
     return closes[-1] > resistance
 
 
-def _determine_direction(snap: dict, closes: list, min_vol_spike: float = _MIN_VOL_SPIKE) -> str | None:
+def _determine_direction(snap: dict) -> str | None:
     """
-    Returns 'bullish' or 'bearish' based on:
-    - RSI > 55 + above MA50 + volume spike → bullish
-    - RSI < 45 + below MA50 + volume spike → bearish
-    - Otherwise None (no clear signal)
+    Returns 'bullish' or 'bearish' using RSI and MA50 from the Alpaca-backed snapshot.
+    Bullish: RSI > 52 and price above MA50.
+    Bearish: RSI < 48 and price below MA50.
+    Neutral zone (48-52) → None.
     """
-    rsi       = _calc_rsi(closes)
+    rsi       = snap.get('rsi_14', 50.0)
     above_ma50 = snap.get('above_ma50')
-    vol_spike  = snap.get('volume_spike', 1.0)
 
-    if rsi > 55 and above_ma50 is True and vol_spike >= min_vol_spike:
+    if rsi > 52 and above_ma50 is True:
         return 'bullish'
-    if rsi < 45 and above_ma50 is False and vol_spike >= min_vol_spike:
+    if rsi < 48 and above_ma50 is False:
         return 'bearish'
     return None
-
-
-def _fetch_closes(ticker: str) -> list:
-    """Get recent closing prices for RSI/breakout calculation."""
-    try:
-        import yfinance as yf
-        hist = yf.Ticker(ticker).history(period='3mo', auto_adjust=True)
-        return list(hist['Close'].values.astype(float))
-    except Exception:
-        return []
 
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
@@ -142,14 +131,15 @@ def scan_growth(
             if snap['volume_spike'] < min_vol_spike:
                 continue
 
-            closes = _fetch_closes(ticker)
-            if not closes:
+            direction = _determine_direction(snap)
+            if not direction:
+                logger.debug(
+                    f'growth_engine: {ticker} no direction '
+                    f'(RSI={snap.get("rsi_14", "?")} above_ma50={snap.get("above_ma50")})'
+                )
                 continue
 
-            direction = _determine_direction(snap, closes, min_vol_spike=min_vol_spike)
-            if not direction:
-                logger.debug(f'growth_engine: {ticker} no clear directional signal')
-                continue
+            closes = snap.get('closes', [])
 
             chain = fetch_options_chain(ticker, min_dte=dte_min, max_dte=dte_max)
             if not chain:
@@ -182,8 +172,8 @@ def scan_growth(
             if premium < min_premium:
                 continue
 
-            rsi      = _calc_rsi(closes)
-            breakout = _detect_breakout(closes)
+            rsi      = snap.get('rsi_14', _calc_rsi(closes) if closes else 50.0)
+            breakout = snap.get('breakout_20d', _detect_breakout(closes) if closes else False)
             expiry_date   = date.fromisoformat(contract['expiry'])
             earnings_risk = has_earnings_within(ticker, expiry_date)
 

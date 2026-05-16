@@ -323,6 +323,95 @@ def register_routes(app):
         return jsonify(result)
 
 
+    @app.route('/api/options/debug/growth/<ticker>')
+    def options_debug_growth_ticker(ticker):
+        """Debug growth scan for a single ticker — shows per-step filter results."""
+        from options_engine.data.stock_fetcher import fetch_stock_snapshot
+        from options_engine.data.options_fetcher import fetch_options_chain
+        from options_engine.analytics.greeks import enrich_chain_with_greeks
+        from options_engine.analytics.pop import enrich_chain_with_pop
+        from options_engine.analytics.contract_selector import select_growth_contract
+
+        config = _load_config()
+        cfg = config.get('growth', {})
+        result = {'ticker': ticker.upper(), 'config': cfg}
+
+        snap = fetch_stock_snapshot(ticker.upper())
+        result['snapshot'] = {k: v for k, v in (snap or {}).items() if k != 'closes'}
+        if not snap:
+            result['fail'] = 'snapshot_failed'
+            return jsonify(result)
+
+        result['rsi_14']      = snap.get('rsi_14')
+        result['above_ma50']  = snap.get('above_ma50')
+        result['iv_rank']     = snap.get('iv_rank_proxy')
+        result['vol_spike']   = snap.get('volume_spike')
+        result['avg_vol']     = snap.get('avg_volume_20d')
+        result['breakout_20d'] = snap.get('breakout_20d')
+
+        max_iv_rank  = int(cfg.get('max_iv_rank', 70))
+        min_vol_spike = float(cfg.get('min_vol_spike', 1.0))
+        min_avg_vol  = int(cfg.get('min_avg_volume', 200000))
+
+        result['passes_avg_vol']   = snap.get('avg_volume_20d', 0) >= min_avg_vol
+        result['passes_iv_rank']   = snap.get('iv_rank_proxy', 999) <= max_iv_rank
+        result['passes_vol_spike'] = snap.get('volume_spike', 0) >= min_vol_spike
+
+        rsi = snap.get('rsi_14', 50.0)
+        above_ma50 = snap.get('above_ma50')
+        if rsi > 52 and above_ma50 is True:
+            direction = 'bullish'
+        elif rsi < 48 and above_ma50 is False:
+            direction = 'bearish'
+        else:
+            direction = None
+        result['direction'] = direction
+        if not direction:
+            result['fail'] = f'no_direction (RSI={rsi}, above_ma50={above_ma50})'
+            return jsonify(result)
+
+        dte_min = int(cfg.get('dte_min', 14))
+        dte_max = int(cfg.get('dte_max', 60))
+        chain = fetch_options_chain(ticker.upper(), min_dte=dte_min, max_dte=dte_max)
+        if not chain:
+            result['fail'] = 'no_chain'
+            return jsonify(result)
+
+        df = chain['calls'].copy() if direction == 'bullish' else chain['puts'].copy()
+        result['contracts_raw'] = len(df)
+        if df.empty:
+            result['fail'] = 'empty_chain'
+            return jsonify(result)
+
+        df = df[(df['bid'] > 0) | (df['ask'] > 0)]
+        result['contracts_after_bid_filter'] = len(df)
+        if df.empty:
+            result['fail'] = 'no_active_quotes'
+            return jsonify(result)
+
+        enrich_chain_with_greeks(df, snap['price'])
+        enrich_chain_with_pop(df, mode='growth')
+
+        max_spread = float(cfg.get('max_spread_pct', 0.20))
+        if 'spread_pct' in df.columns:
+            df = df[df['spread_pct'] <= max_spread]
+        result['contracts_after_spread_filter'] = len(df)
+        if df.empty:
+            result['fail'] = 'all_spread_too_wide'
+            return jsonify(result)
+
+        result['sample_contracts'] = df[['strike', 'dte', 'delta', 'bid', 'ask', 'mid']].head(5).to_dict(orient='records') if 'delta' in df.columns else []
+
+        contract = select_growth_contract(df, direction)
+        if contract is None:
+            result['fail'] = 'no_contract_selected'
+            return jsonify(result)
+
+        result['selected_contract'] = {k: float(v) if hasattr(v, 'item') else v for k, v in contract.items() if k not in ('contractSymbol',)}
+        result['pass'] = True
+        return jsonify(result)
+
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     logger.info('options_scanner: running one-shot scan…')
